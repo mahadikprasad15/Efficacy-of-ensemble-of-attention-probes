@@ -319,16 +319,4 @@ If you use this codebase, please cite the original ACT-ViT and Orgad et al. pape
 ### Cache not found
 - Run `cache_activations.py` first for all datasets
 - Check paths: `ls data/activations/{model_id}/{dataset}/{split}/`
-
 ---
-
-## Contributing
-
-This is research code for reproducibility. For bugs or improvements:
-1. Open an issue with details
-2. Include error logs and command used
-3. PRs welcome for fixes (not new features unless discussed)
-
----
-
-**Questions?** Open an issue or check the spec document in the repo.
