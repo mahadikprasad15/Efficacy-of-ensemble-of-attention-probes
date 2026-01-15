@@ -8,17 +8,21 @@ import torch.nn.functional as F
 def resample_activations(tensor: torch.Tensor, target_L: int = 16, target_T: int = 64) -> torch.Tensor:
     """
     Resample activation tensor (L, T, D) to (target_L, target_T, D).
-    
+
     Args:
         tensor: (L, T, D)
         target_L: Number of layers to keep/interpolate.
         target_T: Number of token bins.
-        
+
     Returns:
-        (target_L, target_T, D)
+        (target_L, target_T, D) or None if T=0 (no tokens generated)
     """
     L, T, D = tensor.shape
-    
+
+    # Handle edge case: zero-length generation
+    if T == 0:
+        return None  # Signal to skip this sample
+
     # 1. Layer Axis
     # If L == target_L, correct
     # If L != target_L, we might need to pick specific layers (e.g. evenly spaced)
