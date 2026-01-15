@@ -137,8 +137,18 @@ def main():
                     # 2. Resample Activations
                     # raw_tensor is (L, T, D)
                     original_gen_length = raw_tensor.shape[1]  # Token count before resampling
+
+                    # Skip if zero-length generation
+                    if original_gen_length == 0:
+                        logger.warning(f"Skipping sample {batch_ids[j]}: zero-length generation")
+                        continue
+
                     resampled = resample_activations(raw_tensor, target_L=args.L_prime, target_T=args.T_prime)
-                    # (L', T', D)
+
+                    # Skip if resampling failed
+                    if resampled is None:
+                        logger.warning(f"Skipping sample {batch_ids[j]}: resampling returned None")
+                        continue
 
                     eid = batch_ids[j]
                     buffer_tensors[eid] = resampled

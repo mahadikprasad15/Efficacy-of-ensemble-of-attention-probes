@@ -224,10 +224,17 @@ def train_lodo(args):
                         val_preds.extend(torch.sigmoid(logits).cpu().numpy())
                         val_targets.extend(by.numpy())
 
-            try:
-                current_val_auc = roc_auc_score(val_targets, val_preds)
-            except:
+            # Check class balance
+            unique_classes = len(set(val_targets))
+            if unique_classes < 2:
+                logger.warning(f"Layer {l_idx}, Epoch {epoch+1}: Only {unique_classes} class in validation (need at least 100+ samples per dataset)")
                 current_val_auc = 0.5
+            else:
+                try:
+                    current_val_auc = roc_auc_score(val_targets, val_preds)
+                except Exception as e:
+                    logger.warning(f"Layer {l_idx}: AUC computation failed: {e}")
+                    current_val_auc = 0.5
 
             if current_val_auc > best_val_auc_for_layer:
                 best_val_auc_for_layer = current_val_auc
@@ -263,9 +270,17 @@ def train_lodo(args):
                     logits = probe(bx)
                     preds.extend(torch.sigmoid(logits).cpu().numpy())
                     targets.extend(by.numpy())
-            try:
-                auc = roc_auc_score(targets, preds)
-            except: auc = 0.5
+
+            # Handle single-class case
+            if len(set(targets)) < 2:
+                auc = 0.5
+                logger.warning(f"Dataset {d} has only one class - using AUC=0.5")
+            else:
+                try:
+                    auc = roc_auc_score(targets, preds)
+                except Exception as e:
+                    logger.warning(f"AUC failed for {d}: {e}")
+                    auc = 0.5
             val_aucs[d] = auc
             
         min_val_auc = min(val_aucs.values()) if val_aucs else 0
@@ -281,9 +296,17 @@ def train_lodo(args):
                     logits = probe(bx)
                     preds.extend(torch.sigmoid(logits).cpu().numpy())
                     targets.extend(by.numpy())
-            try:
-                ood_auc = roc_auc_score(targets, preds)
-            except: ood_auc = 0.5
+
+            # Handle single-class case
+            if len(set(targets)) < 2:
+                ood_auc = 0.5
+                logger.warning(f"OOD dataset {test_ood_dataset} has only one class - using AUC=0.5")
+            else:
+                try:
+                    ood_auc = roc_auc_score(targets, preds)
+                except Exception as e:
+                    logger.warning(f"OOD AUC failed: {e}")
+                    ood_auc = 0.5
             
         logger.info(f"Layer {l_idx}: Min Val AUC={min_val_auc:.4f}, OOD AUC={ood_auc:.4f}")
         
