@@ -5,10 +5,15 @@ Runs a small sanity check on dataset loading and scoring.
 
 import logging
 import sys
-from src.data.loaders import MoviesDataset, IMDBDataset
-from src.pipeline.generation import LocalGenerator
-from src.pipeline.extractors import RegexExtractor
-from src.pipeline.scoring import ExactMatchEvaluator, ClassificationEvaluator
+import os
+
+# Add actprobe to path
+sys.path.append(os.path.join(os.getcwd(), 'actprobe', 'src'))
+
+from actprobe.datasets.loaders import MoviesDataset, IMDBDataset
+from actprobe.llm.generate import CerebrasGenerator
+from actprobe.evaluation.answer_extraction import RegexExtractor
+from actprobe.evaluation.scoring import ExactMatchEvaluator, ClassificationEvaluator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
