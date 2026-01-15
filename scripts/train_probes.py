@@ -96,14 +96,15 @@ def evaluate(model, dataloader, device):
 def train_lodo(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.output_dir, exist_ok=True)
-    
+
     # 1. Select Datasets
     train_datasets = [d for d in ALL_DATASETS if d != args.held_out_dataset]
     val_id_datasets = train_datasets # Use validation split of train datasets as ID Val
     test_ood_dataset = args.held_out_dataset
-    
+
     logger.info(f"Heterogeneous Training on: {train_datasets}")
     logger.info(f"Target OOD: {test_ood_dataset}")
+    logger.info(f"Training Config: {args.epochs} epochs, lr={args.lr}, wd={args.wd}, patience={args.patience}")
     
     # 2. Load Data
     # TRAIN: (dataset, 'train') usually but for this demo we might only have 'validation'. 
@@ -187,25 +188,63 @@ def train_lodo(args):
     
     for l_idx in range(num_layers):
         logger.info(f"Training Layer {l_idx}...")
-        
+
         # Init fresh probe for this layer
         probe = LayerProbe(input_dim=d_model, pooling_type=args.pooling).to(device)
         optimizer = optim.AdamW(probe.parameters(), lr=args.lr, weight_decay=args.wd)
-        
-        # Train
+
+        # Early stopping tracking
+        best_val_auc_for_layer = -1
+        patience_counter = 0
+        best_probe_state = None
+
+        # Train with early stopping
         for epoch in range(args.epochs):
             probe.train()
+            epoch_loss = 0
             for x, y in train_loader:
                 x_layer = x[:, l_idx, :, :].to(device) # Select layer
                 y = y.to(device).unsqueeze(1)
-                
+
                 optimizer.zero_grad()
                 logits = probe(x_layer)
                 loss = criterion(logits, y)
                 loss.backward()
                 optimizer.step()
-        
-        # Eval
+                epoch_loss += loss.item()
+
+            # Validation check for early stopping
+            probe.eval()
+            val_preds, val_targets = [], []
+            with torch.no_grad():
+                for val_dataset, val_loader in val_loaders.items():
+                    for bx, by in val_loader:
+                        bx = bx[:, l_idx, :, :].to(device)
+                        logits = probe(bx)
+                        val_preds.extend(torch.sigmoid(logits).cpu().numpy())
+                        val_targets.extend(by.numpy())
+
+            try:
+                current_val_auc = roc_auc_score(val_targets, val_preds)
+            except:
+                current_val_auc = 0.5
+
+            if current_val_auc > best_val_auc_for_layer:
+                best_val_auc_for_layer = current_val_auc
+                best_probe_state = probe.state_dict()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= args.patience:
+                logger.info(f"Layer {l_idx}: Early stopping at epoch {epoch+1} (best val AUC: {best_val_auc_for_layer:.4f})")
+                break
+
+        # Restore best weights
+        if best_probe_state is not None:
+            probe.load_state_dict(best_probe_state)
+
+        # Final Eval
         val_aucs = {}
         for d, loader in val_loaders.items():
             # Create wrapper loader that yields layer specific? 
@@ -277,17 +316,18 @@ def train_lodo(args):
     logger.info(f"OOD Performance: {best_layer['ood_auc']:.4f}")
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--held_out_dataset", type=str, default="Movies")
-    parser.add_argument("--pooling", type=str, default="mean")
-    parser.add_argument("--data_dir", type=str, default="data/activations")
-    parser.add_argument("--output_dir", type=str, default="data/probes")
+    parser = argparse.ArgumentParser(description="Train per-layer probes using LODO (Leave-One-Dataset-Out)")
+    parser.add_argument("--model", type=str, required=True, help="Model ID (e.g., meta-llama/Llama-3.2-1B-Instruct)")
+    parser.add_argument("--held_out_dataset", type=str, default="Movies", help="Dataset to hold out for OOD evaluation")
+    parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "max", "last", "attn"], help="Token pooling method")
+    parser.add_argument("--data_dir", type=str, default="data/activations", help="Directory containing cached activations")
+    parser.add_argument("--output_dir", type=str, default="data/probes", help="Directory to save trained probes")
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--wd", type=float, default=0.0)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--train_split", type=str, default="validation") # Using val as train for verify
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--wd", type=float, default=1e-4, help="Weight decay (L2 regularization)")
+    parser.add_argument("--epochs", type=int, default=10, help="Maximum training epochs")
+    parser.add_argument("--patience", type=int, default=3, help="Early stopping patience (epochs without improvement)")
+    parser.add_argument("--train_split", type=str, default="train", help="Split to use for training (use 'validation' for quick testing)")
     args = parser.parse_args()
 
     train_lodo(args)

@@ -133,22 +133,24 @@ def main():
                     golds = batch_golds[j]
                     is_correct = evaluator.evaluate(predicted_answer, golds)
                     label = 1 if is_correct else 0
-                    
+
                     # 2. Resample Activations
                     # raw_tensor is (L, T, D)
+                    original_gen_length = raw_tensor.shape[1]  # Token count before resampling
                     resampled = resample_activations(raw_tensor, target_L=args.L_prime, target_T=args.T_prime)
                     # (L', T', D)
-                    
+
                     eid = batch_ids[j]
                     buffer_tensors[eid] = resampled
-                    
-                    # 3. Write Manifest
+
+                    # 3. Write Manifest (with generation length for analysis)
                     meta = {
                         "id": eid,
                         "gold_answers": golds,
                         "generated_text": completion,
                         "predicted_answer": predicted_answer,
                         "label": label,
+                        "generation_length": original_gen_length,  # Spec requirement: log gen lengths
                         "shard": shard_idx
                     }
                     manifest_file.write(json.dumps(meta) + "\n")
