@@ -95,20 +95,24 @@ def main():
     
     # 5. Processing Loop
     logger.info("Starting processing...")
-    
+
     manifest_file = open(manifest_path, "w")
-    
+
     batch_prompts = []
     batch_ids = []
     batch_golds = []
-    
+
     shard_idx = 0
     buffer_tensors = {} # id -> tensor
-    
+    processed_samples = 0
+
     # Simple sharding: save every N examples
     SHARD_SIZE = 100
-    
-    for i, item in enumerate(tqdm(ds)):
+
+    # Create progress bar with informative description
+    pbar = tqdm(total=len(ds), desc=f"Processing {args.dataset}", unit="sample")
+
+    for i, item in enumerate(ds):
         batch_prompts.append(item['prompt'])
         batch_ids.append(item['metadata']['id'])
         batch_golds.append(item['gold_answers'])
@@ -164,11 +168,17 @@ def main():
                         "shard": shard_idx
                     }
                     manifest_file.write(json.dumps(meta) + "\n")
-                    
+                    processed_samples += 1
+
+                # Update progress bar after processing batch
+                pbar.update(len(raw_list))
+                pbar.set_postfix({"correct": f"{label}", "shards": shard_idx, "buffered": len(buffer_tensors)})
+
             except Exception as e:
                 logger.error(f"Error processing batch {batch_ids}: {e}")
                 import traceback
                 traceback.print_exc()
+                pbar.update(len(batch_ids))
             
             # Flush Check
             if len(buffer_tensors) >= SHARD_SIZE or i == len(ds) - 1:
@@ -190,8 +200,9 @@ def main():
             batch_ids = []
             batch_golds = []
 
+    pbar.close()
     manifest_file.close()
-    logger.info("Done.")
+    logger.info(f"Done. Processed {processed_samples} samples into {shard_idx} shards.")
 
 if __name__ == "__main__":
     main()

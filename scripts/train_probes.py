@@ -185,9 +185,12 @@ def train_lodo(args):
     
     num_layers = sample.shape[0]
     results = []
-    
+
+    # Progress bar for layer-wise training
+    layer_pbar = tqdm(total=num_layers, desc=f"Training Layers (LODO: {test_ood_dataset})", unit="layer")
+
     for l_idx in range(num_layers):
-        logger.info(f"Training Layer {l_idx}...")
+        layer_pbar.set_postfix({"layer": f"{l_idx}/{num_layers}"})
 
         # Init fresh probe for this layer
         probe = LayerProbe(input_dim=d_model, pooling_type=args.pooling).to(device)
@@ -199,10 +202,12 @@ def train_lodo(args):
         best_probe_state = None
 
         # Train with early stopping
-        for epoch in range(args.epochs):
+        epoch_pbar = tqdm(range(args.epochs), desc=f"  Layer {l_idx} Epochs", leave=False, unit="epoch")
+        for epoch in epoch_pbar:
             probe.train()
             epoch_loss = 0
-            for x, y in train_loader:
+            batch_pbar = tqdm(train_loader, desc=f"    Training", leave=False, unit="batch")
+            for x, y in batch_pbar:
                 x_layer = x[:, l_idx, :, :].to(device) # Select layer
                 y = y.to(device).unsqueeze(1)
 
@@ -212,6 +217,9 @@ def train_lodo(args):
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item()
+                batch_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+            batch_pbar.close()
 
             # Validation check for early stopping
             probe.eval()
@@ -236,6 +244,9 @@ def train_lodo(args):
                     logger.warning(f"Layer {l_idx}: AUC computation failed: {e}")
                     current_val_auc = 0.5
 
+            # Update epoch progress bar
+            epoch_pbar.set_postfix({"val_auc": f"{current_val_auc:.4f}", "best": f"{best_val_auc_for_layer:.4f}"})
+
             if current_val_auc > best_val_auc_for_layer:
                 best_val_auc_for_layer = current_val_auc
                 best_probe_state = probe.state_dict()
@@ -244,8 +255,11 @@ def train_lodo(args):
                 patience_counter += 1
 
             if patience_counter >= args.patience:
+                epoch_pbar.close()
                 logger.info(f"Layer {l_idx}: Early stopping at epoch {epoch+1} (best val AUC: {best_val_auc_for_layer:.4f})")
                 break
+
+        epoch_pbar.close()
 
         # Restore best weights
         if best_probe_state is not None:
@@ -327,6 +341,12 @@ def train_lodo(args):
             # Let's keep best_ naming for existing compatibility or update eval_matrix?
             # Creating a copy is safer for now to avoid breaking existing runs if any.
             torch.save(probe.state_dict(), os.path.join(args.output_dir, f"best_probe_layer_{l_idx}.pt"))
+
+        # Update layer progress bar
+        layer_pbar.update(1)
+        layer_pbar.set_postfix({"min_val_auc": f"{min_val_auc:.4f}", "ood_auc": f"{ood_auc:.4f}"})
+
+    layer_pbar.close()
 
     # Save results
     with open(os.path.join(args.output_dir, "results.jsonl"), "w") as f:

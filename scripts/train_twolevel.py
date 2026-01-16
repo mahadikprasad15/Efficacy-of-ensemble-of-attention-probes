@@ -155,11 +155,13 @@ def train_twolevel(args):
     best_model_state = None
     patience_counter = 0
 
-    for epoch in range(args.epochs):
+    epoch_pbar = tqdm(range(args.epochs), desc="Training Two-Level Attention", unit="epoch")
+    for epoch in epoch_pbar:
         model.train()
         epoch_loss = 0
 
-        for x, y in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
+        batch_pbar = tqdm(train_loader, desc=f"  Epoch {epoch+1}/{args.epochs}", leave=False, unit="batch")
+        for x, y in batch_pbar:
             x, y = x.to(device), y.to(device).unsqueeze(1)  # (B, L, T, D), (B, 1)
 
             optimizer.zero_grad()
@@ -169,17 +171,30 @@ def train_twolevel(args):
             optimizer.step()
 
             epoch_loss += loss.item()
+            batch_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
+        batch_pbar.close()
         avg_loss = epoch_loss / len(train_loader)
 
         # Validation on all train datasets
         val_aucs = {}
-        for dataset, loader in val_loaders.items():
+        val_pbar = tqdm(val_loaders.items(), desc="  Validating", leave=False, unit="dataset")
+        for dataset, loader in val_pbar:
+            val_pbar.set_description(f"  Validating {dataset}")
             auc, _ = evaluate(model, loader, device)
             val_aucs[dataset] = auc
+        val_pbar.close()
 
         min_val_auc = min(val_aucs.values()) if val_aucs else 0
         mean_val_auc = np.mean(list(val_aucs.values())) if val_aucs else 0
+
+        # Update epoch progress bar
+        epoch_pbar.set_postfix({
+            "loss": f"{avg_loss:.4f}",
+            "min_auc": f"{min_val_auc:.4f}",
+            "mean_auc": f"{mean_val_auc:.4f}",
+            "best": f"{best_min_val_auc:.4f}"
+        })
 
         logger.info(f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Min Val AUC={min_val_auc:.4f}, Mean Val AUC={mean_val_auc:.4f}")
         logger.info(f"  Per-dataset Val AUCs: {val_aucs}")
@@ -193,8 +208,11 @@ def train_twolevel(args):
             patience_counter += 1
 
         if patience_counter >= args.patience:
+            epoch_pbar.close()
             logger.info(f"Early stopping at epoch {epoch+1}")
             break
+
+    epoch_pbar.close()
 
     # 7. Restore best model
     if best_model_state is not None:

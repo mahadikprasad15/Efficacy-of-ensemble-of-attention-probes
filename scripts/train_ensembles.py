@@ -260,8 +260,9 @@ def train_ensembles(args):
     k_pct_list = [int(k) for k in args.k_pct_list.split(",")]
     results = []
 
-    for k_pct in k_pct_list:
-        logger.info(f"\n=== Evaluating K={k_pct}% ===")
+    k_pbar = tqdm(k_pct_list, desc="Evaluating K% values", unit="K%")
+    for k_pct in k_pbar:
+        k_pbar.set_postfix({"K": f"{k_pct}%"})
 
         # Select top-K layers
         selected_layers, layer_aucs = select_top_k_layers(
@@ -307,7 +308,8 @@ def train_ensembles(args):
         patience = 3
         patience_counter = 0
 
-        for epoch in range(args.gating_epochs):
+        gated_pbar = tqdm(range(args.gating_epochs), desc=f"    Training Gated (K={k_pct}%)", leave=False, unit="epoch")
+        for epoch in gated_pbar:
             ensemble_gated.train()
             epoch_loss = 0
 
@@ -324,6 +326,7 @@ def train_ensembles(args):
                 epoch_loss += loss.item()
 
             avg_loss = epoch_loss / len(loader)
+            gated_pbar.set_postfix({"loss": f"{avg_loss:.4f}", "best": f"{best_val_loss:.4f}"})
 
             if avg_loss < best_val_loss:
                 best_val_loss = avg_loss
@@ -332,8 +335,11 @@ def train_ensembles(args):
                 patience_counter += 1
 
             if patience_counter >= patience:
+                gated_pbar.close()
                 logger.info(f"    Gated: Early stopping at epoch {epoch+1}")
                 break
+
+        gated_pbar.close()
 
         # Evaluate gated ensemble
         ensemble_gated.eval()
@@ -354,6 +360,15 @@ def train_ensembles(args):
             "gated": {"auc": float(auc_gated), "acc": float(acc_gated)},
             "layer_aucs": {d: layer_aucs[d][selected_layers].tolist() for d in train_datasets}
         })
+
+        # Update K% progress bar
+        k_pbar.set_postfix({
+            "mean": f"{auc_mean:.3f}",
+            "weighted": f"{auc_weighted:.3f}",
+            "gated": f"{auc_gated:.3f}"
+        })
+
+    k_pbar.close()
 
     # 9. Save results
     output_file = os.path.join(args.output_dir, f"ensemble_results_{args.held_out_dataset}.json")
