@@ -12,23 +12,29 @@ class BaseExtractor:
 
 class RegexExtractor(BaseExtractor):
     """
-    Heuristic extraction. 
-    STRATEGY: 
+    Heuristic extraction.
+    STRATEGY:
     1. If "Answer:" matches, take everything after.
-    2. Else take the whole text.
+    2. Take only the first line/sentence (before newline or period with space).
+    3. This handles cases where model gives correct answer then continues explaining.
     """
     def extract(self, text: str) -> str:
         # Simple split on "Answer:" pattern common in our prompts
         # Our prompts end with "Answer:", so model usually outputs just the answer
         # But sometimes it might repeat "Answer:".
-        
+
         # If the generation starts with "Answer:", strip it.
         pattern = r"^\s*Answer:\s*"
         clean = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
-        
-        # ACT-ViT often just treats the whole generation as the prediction 
-        # because the prompt ends with "Answer:". 
-        # So we just strip whitespace.
+
+        # Take only the first line (before newline)
+        # This handles cases like "Keanu Reeves.\nThe Matrix is..."
+        if '\n' in clean:
+            clean = clean.split('\n')[0].strip()
+
+        # Remove trailing period if present (for cleaner matching)
+        clean = clean.rstrip('.')
+
         return clean
 
 class LLMExtractor(BaseExtractor):
