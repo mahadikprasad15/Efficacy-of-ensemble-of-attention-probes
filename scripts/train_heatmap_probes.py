@@ -89,8 +89,14 @@ def train_heatmap_probes(X_train, y_train, X_val, y_val, C=1.0):
 
     logger.info(f"Training probes for {L} layers x {T} tokens = {L*T} positions...")
 
-    for l in tqdm(range(L), desc="Layers"):
+    # Progress bar for overall progress
+    pbar = tqdm(total=L * T, desc="Training Heatmap Probes", unit="probe")
+
+    for l in range(L):
         for t in range(T):
+            # Update progress with current position
+            pbar.set_postfix({"layer": f"{l}/{L}", "token": f"{t}/{T}"})
+
             # Extract features at (layer=l, token=t)
             X_train_lt = X_train[:, l, t, :].numpy()  # (N, D)
             X_val_lt = X_val[:, l, t, :].numpy()
@@ -98,6 +104,7 @@ def train_heatmap_probes(X_train, y_train, X_val, y_val, C=1.0):
             # Skip if no variance
             if X_train_lt.std() < 1e-6:
                 auc_heatmap[l, t] = 0.5
+                pbar.update(1)
                 continue
 
             try:
@@ -116,6 +123,9 @@ def train_heatmap_probes(X_train, y_train, X_val, y_val, C=1.0):
                 logger.warning(f"Failed at layer={l}, token={t}: {e}")
                 auc_heatmap[l, t] = 0.5
 
+            pbar.update(1)
+
+    pbar.close()
     return auc_heatmap
 
 
