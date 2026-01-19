@@ -292,7 +292,8 @@ def train_ensembles(args):
         val_labels_concat = np.hstack([val_labels[d] for d in train_datasets])
 
         # Train gated ensemble
-        ensemble_gated = GatedEnsemble(num_layers=len(selected_layers), input_dim=len(selected_layers), hidden_dim=64).to(device)
+        # GatedEnsemble(input_dim, num_layers) - using logits as features for gating
+        ensemble_gated = GatedEnsemble(input_dim=len(selected_layers), num_layers=len(selected_layers)).to(device)
         optimizer = optim.AdamW(ensemble_gated.parameters(), lr=1e-3, weight_decay=1e-4)
         criterion = nn.BCEWithLogitsLoss()
 
@@ -318,7 +319,10 @@ def train_ensembles(args):
                 batch_labels = batch_labels.to(device)
 
                 optimizer.zero_grad()
-                output = ensemble_gated(batch_logits)
+                # GatedEnsemble.forward(layer_features, layer_logits)
+                # Use logits as features for input-dependent gating
+                batch_logits_expanded = batch_logits.unsqueeze(-1)  # (B, L) -> (B, L, 1)
+                output = ensemble_gated(batch_logits, batch_logits_expanded)
                 loss = criterion(output, batch_labels)
                 loss.backward()
                 optimizer.step()
@@ -345,7 +349,8 @@ def train_ensembles(args):
         ensemble_gated.eval()
         with torch.no_grad():
             test_logits_tensor = torch.tensor(test_logits_k, dtype=torch.float32).to(device)
-            probs_gated = torch.sigmoid(ensemble_gated(test_logits_tensor)).cpu().numpy()
+            test_logits_expanded = test_logits_tensor.unsqueeze(-1)  # (N, L) -> (N, L, 1)
+            probs_gated = torch.sigmoid(ensemble_gated(test_logits_tensor, test_logits_expanded)).cpu().numpy()
 
         auc_gated = roc_auc_score(test_labels, probs_gated)
         acc_gated = accuracy_score(test_labels, (probs_gated > 0.5).astype(int))

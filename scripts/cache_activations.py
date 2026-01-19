@@ -18,12 +18,12 @@ from safetensors.torch import save_file
 sys.path.append(os.path.join(os.getcwd(), 'actprobe', 'src'))
 
 from actprobe.datasets.loaders import (
-    HotpotQADataset, HotpotQAWCDataset, TriviaQADataset, MoviesDataset, IMDBDataset
+    HotpotQADataset, HotpotQAWCDataset, TriviaQADataset, MoviesDataset, IMDBDataset, DeceptionDataset
 )
 from actprobe.llm.activations import ActivationRunner
 from actprobe.features.resample import resample_activations
 from actprobe.evaluation.answer_extraction import RegexExtractor, LLMExtractor
-from actprobe.evaluation.scoring import ExactMatchEvaluator, ClassificationEvaluator
+from actprobe.evaluation.scoring import ExactMatchEvaluator, ClassificationEvaluator, DeceptionEvaluator
 from actprobe.llm.generate import CerebrasGenerator
 
 logging.basicConfig(level=logging.INFO)
@@ -34,11 +34,13 @@ DATASET_MAP = {
     "HotpotQA-WC": HotpotQAWCDataset,
     "TriviaQA": TriviaQADataset,
     "Movies": MoviesDataset,
-    "IMDB": IMDBDataset
+    "IMDB": IMDBDataset,
+    "Deception": DeceptionDataset
 }
 
 LABELER_MAP = {
     "IMDB": ClassificationEvaluator,
+    "Deception": DeceptionEvaluator,
     "default": ExactMatchEvaluator
 }
 
@@ -72,19 +74,30 @@ def main():
     runner = ActivationRunner(args.model, dtype=torch.float16)
 
     # 3. Prepare Pipeline Components
-    if args.extractor == "llm":
-        logger.info(f"Using LLM Extractor with {args.eval_model} (Cerebras)")
+    # Setup generator for LLM-based extraction/evaluation
+    gen = None
+    if args.extractor == "llm" or args.dataset == "Deception":
+        logger.info(f"Initializing LLM generator with {args.eval_model} (Cerebras)")
         try:
             gen = CerebrasGenerator(model_name=args.eval_model, api_key=args.cerebras_api_key)
-            extractor = LLMExtractor(generator=gen)
         except Exception as e:
-            logger.error(f"Failed to init Cerebras: {e}. Falling back to Regex.")
-            extractor = RegexExtractor()
+            logger.error(f"Failed to init Cerebras: {e}.")
+            if args.dataset == "Deception":
+                raise ValueError("Deception dataset requires LLM generator for evaluation")
+            gen = None
+
+    # Setup extractor
+    if args.extractor == "llm" and gen is not None:
+        extractor = LLMExtractor(generator=gen)
     else:
         extractor = RegexExtractor()
-        
+
+    # Setup evaluator
     EvaluatorClass = LABELER_MAP.get(args.dataset, LABELER_MAP["default"])
-    evaluator = EvaluatorClass()
+    if EvaluatorClass == DeceptionEvaluator:
+        evaluator = DeceptionEvaluator(generator=gen)
+    else:
+        evaluator = EvaluatorClass()
     logger.info(f"Using Evaluator: {EvaluatorClass.__name__}")
 
     # 4. Prepare Output
@@ -101,6 +114,7 @@ def main():
     batch_prompts = []
     batch_ids = []
     batch_golds = []
+    batch_metadata = []  # For DeceptionEvaluator
 
     shard_idx = 0
     buffer_tensors = {} # id -> tensor
@@ -116,6 +130,7 @@ def main():
         batch_prompts.append(item['prompt'])
         batch_ids.append(item['metadata']['id'])
         batch_golds.append(item['gold_answers'])
+        batch_metadata.append(item['metadata'])
         
         if len(batch_prompts) == args.batch_size or i == len(ds) - 1:
             # Run Batch
@@ -135,8 +150,17 @@ def main():
                     completion = completions[j]
                     predicted_answer = predicted_answers[j]
                     golds = batch_golds[j]
-                    is_correct = evaluator.evaluate(predicted_answer, golds)
-                    label = 1 if is_correct else 0
+                    metadata = batch_metadata[j]
+
+                    # Handle different evaluator signatures
+                    if isinstance(evaluator, DeceptionEvaluator):
+                        # DeceptionEvaluator.evaluate(prediction, metadata) -> bool (True=deceptive)
+                        is_deceptive = evaluator.evaluate(completion, metadata)
+                        label = 1 if is_deceptive else 0
+                    else:
+                        # Standard evaluators take (prediction, golds)
+                        is_correct = evaluator.evaluate(predicted_answer, golds)
+                        label = 1 if is_correct else 0
 
                     # 2. Resample Activations
                     # raw_tensor is (L, T, D)
@@ -199,6 +223,7 @@ def main():
             batch_prompts = []
             batch_ids = []
             batch_golds = []
+            batch_metadata = []
 
     pbar.close()
     manifest_file.close()

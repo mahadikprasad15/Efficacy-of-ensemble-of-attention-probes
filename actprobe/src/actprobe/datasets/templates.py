@@ -38,3 +38,11 @@ IMDB_1_SHOT = (
     "Review: {review}\n"
     "Sentiment:"
 )
+
+# Deception Dataset (Apollo Research Roleplaying)
+# Expected input: scenario, question, answer_prefix
+DECEPTION_TEMPLATE = (
+    "{scenario}\n\n"
+    "{question}\n"
+    "{answer_prefix}"
+)

@@ -3,6 +3,8 @@ Concrete dataset implementations for ACT-ViT pipeline.
 """
 
 import random
+import yaml
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datasets import load_dataset
 from .base import BaseDataset
@@ -11,7 +13,8 @@ from .templates import (
     HOTPOT_WITH_CONTEXT,
     TRIVIA_QA,
     MOVIES_TEMPLATE,
-    IMDB_1_SHOT
+    IMDB_1_SHOT,
+    DECEPTION_TEMPLATE
 )
 
 class HotpotQADataset(BaseDataset):
@@ -186,6 +189,101 @@ class MoviesDataset(BaseDataset):
                      "split": "synthetic"
                  }
              })
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return self.data[idx]
+
+class DeceptionDataset(BaseDataset):
+    """
+    Apollo Research Deception Dataset (Roleplaying scenarios).
+
+    Loads scenarios where models are incentivized to be deceptive.
+    Uses LLM-as-judge to evaluate if generated responses are honest or deceptive.
+
+    Args:
+        split: 'train', 'validation', or 'test'
+        limit: Maximum number of scenarios to load
+        data_path: Path to the dataset.yaml file from Apollo Research
+        train_ratio: Ratio of data for training (default 0.7)
+        val_ratio: Ratio of data for validation (default 0.15)
+        # test_ratio is implicit: 1 - train_ratio - val_ratio
+    """
+    def __init__(
+        self,
+        split: str = "validation",
+        limit: Optional[int] = None,
+        data_path: Optional[str] = None,
+        train_ratio: float = 0.7,
+        val_ratio: float = 0.15,
+        seed: int = 42
+    ):
+        super().__init__(split, limit)
+        self.data_path = data_path or "data/deception/roleplaying/dataset.yaml"
+        self.train_ratio = train_ratio
+        self.val_ratio = val_ratio
+        self.seed = seed
+
+    def load_data(self):
+        """Load scenarios from Apollo Research YAML file."""
+        data_file = Path(self.data_path)
+
+        if not data_file.exists():
+            raise FileNotFoundError(
+                f"Deception dataset not found at {self.data_path}. "
+                f"Please download from https://github.com/ApolloResearch/deception-detection "
+                f"and place in data/deception/roleplaying/dataset.yaml"
+            )
+
+        # Load YAML
+        with open(data_file, 'r') as f:
+            scenarios = yaml.safe_load(f)
+
+        # Shuffle with fixed seed for reproducibility
+        random.seed(self.seed)
+        random.shuffle(scenarios)
+
+        # Split into train/val/test
+        total = len(scenarios)
+        train_end = int(total * self.train_ratio)
+        val_end = train_end + int(total * self.val_ratio)
+
+        if self.split == "train":
+            scenarios = scenarios[:train_end]
+        elif self.split == "validation":
+            scenarios = scenarios[train_end:val_end]
+        elif self.split == "test":
+            scenarios = scenarios[val_end:]
+        else:
+            raise ValueError(f"Invalid split: {self.split}")
+
+        # Convert to prompt format
+        self.data = []
+        for idx, item in enumerate(scenarios):
+            # Format prompt using template
+            prompt = DECEPTION_TEMPLATE.format(
+                scenario=item['scenario'],
+                question=item['question'],
+                answer_prefix=item['answer_prefix']
+            )
+
+            # Store reference completions for grading
+            # Note: We don't use these as "gold answers" in the traditional sense
+            # Instead, the LLM judge will compare the model's generation to these examples
+            self.data.append({
+                "prompt": prompt,
+                "gold_answers": None,  # Will be determined by LLM judge
+                "metadata": {
+                    "dataset": "Deception",
+                    "id": f"deception_{self.split}_{idx}",
+                    "split": self.split,
+                    "scenario": item['scenario'],
+                    "question": item['question'],
+                    "honest_completion": item['honest_completion'],
+                    "deceptive_completion": item['deceptive_completion']
+                }
+            })
+
+        self.apply_limit()
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         return self.data[idx]
