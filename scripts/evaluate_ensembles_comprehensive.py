@@ -536,8 +536,35 @@ def main():
     if not layer_results:
         return 1
 
+    # Check if ensemble evaluation already exists (skip if so)
+    val_results_path = os.path.join(args.output_dir, "ensemble_k_sweep_validation.json")
+    ood_results_path = os.path.join(args.output_dir, "ensemble_k_sweep_ood.json")
+
+    skip_validation = False
+    skip_ood = False
+
+    if args.eval_mode in ['validation', 'both'] and os.path.exists(val_results_path):
+        print(f"⚠️  Validation ensemble results already exist: {val_results_path}")
+        print("   Skipping validation evaluation.")
+        skip_validation = True
+
+    if args.eval_mode in ['ood', 'both'] and os.path.exists(ood_results_path):
+        print(f"⚠️  OOD ensemble results already exist: {ood_results_path}")
+        print("   Skipping OOD evaluation.")
+        skip_ood = True
+
+    if (args.eval_mode == 'validation' and skip_validation) or \
+       (args.eval_mode == 'ood' and skip_ood) or \
+       (args.eval_mode == 'both' and skip_validation and skip_ood):
+        print("=" * 90)
+        print("✓ ALL REQUESTED EVALUATIONS ALREADY EXIST")
+        print("=" * 90)
+        print("To re-run, delete the results files and run again.")
+        print("=" * 90)
+        return 0
+
     # Validation evaluation
-    if args.eval_mode in ['validation', 'both']:
+    if args.eval_mode in ['validation', 'both'] and not skip_validation:
         if not args.val_activations_dir:
             print("❌ --val_activations_dir required for validation evaluation")
             return 1
@@ -577,7 +604,7 @@ def main():
             f.write(val_summary)
 
     # OOD evaluation
-    if args.eval_mode in ['ood', 'both']:
+    if args.eval_mode in ['ood', 'both'] and not skip_ood:
         if not args.ood_logits_path or not args.ood_labels_path:
             print("❌ --ood_logits_path and --ood_labels_path required for OOD evaluation")
             return 1
