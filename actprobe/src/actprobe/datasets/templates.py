@@ -38,3 +38,11 @@ IMDB_1_SHOT = (
     "Review: {review}\n"
     "Sentiment:"
 )
+
+# Deception Detection - Roleplaying
+# Neutral prompt - model generates freely, then LLM judge labels as honest/deceptive
+DECEPTION_ROLEPLAYING = (
+    "{scenario}\n\n"
+    "{question}\n"
+    "{answer_prefix} "
+)
