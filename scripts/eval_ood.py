@@ -327,8 +327,7 @@ def main():
     # Create model
     model = LayerProbe(
         input_dim=D,
-        pooling=pooling,
-        num_tokens=T
+        pooling_type=pooling
     ).to(device)
 
     # Load weights

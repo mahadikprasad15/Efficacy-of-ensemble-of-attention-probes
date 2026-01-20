@@ -121,7 +121,8 @@ def generate_report(results: List[Dict], probes_dir: str, output_path: str = Non
     report.append(f"Layer: {best['layer']}")
     report.append(f"Validation AUC: {best['val_auc']:.4f}")
     report.append(f"Training Epoch: {best['epoch']}")
-    report.append(f"Probe Path: {os.path.join(probes_dir, f'probe_layer_{best[\"layer\"]}.pt')}")
+    probe_path = os.path.join(probes_dir, f"probe_layer_{best['layer']}.pt")
+    report.append(f"Probe Path: {probe_path}")
     report.append("")
 
     # Statistics
