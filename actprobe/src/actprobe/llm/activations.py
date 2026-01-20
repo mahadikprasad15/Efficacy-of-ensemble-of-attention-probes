@@ -18,12 +18,12 @@ class ActivationRunner:
     Runs forward passes to extract hidden states.
     Optimized for batch processing.
     """
-    def __init__(self, model_name: str, device: str = None, dtype=torch.float16):
+    def __init__(self, model_name: str, device: str = None, dtype=torch.float16, hf_token: str = None):
         self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
 
         print(f"Loading ActivationRunner: {model_name} on {self.device}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -32,11 +32,12 @@ class ActivationRunner:
         # get mixed into the generated sequence. Left-padding ensures all prompts
         # align at the right edge, and generation appends correctly.
         self.tokenizer.padding_side = 'left'
-            
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=self.dtype,
-            device_map=self.device
+            device_map=self.device,
+            token=hf_token
         )
         self.model.eval()
 

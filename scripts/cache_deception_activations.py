@@ -296,6 +296,14 @@ def main():
         help="Rate limit for Cerebras API (max 30)"
     )
 
+    # HuggingFace token for gated models (Llama 3.2)
+    parser.add_argument(
+        "--hf_token",
+        type=str,
+        default=None,
+        help="HuggingFace token for gated models (or set HF_TOKEN env var)"
+    )
+
     args = parser.parse_args()
 
     logger.info(f"{'='*70}")
@@ -325,7 +333,7 @@ def main():
     # ========================================================================
 
     logger.info(f"[2/6] Loading generation model: {args.model}...")
-    runner = ActivationRunner(args.model, dtype=torch.float16)
+    runner = ActivationRunner(args.model, dtype=torch.float16, hf_token=args.hf_token)
     logger.info(f"✓ Model loaded\n")
 
     # ========================================================================
