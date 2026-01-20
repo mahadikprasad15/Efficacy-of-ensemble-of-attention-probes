@@ -46,3 +46,10 @@ DECEPTION_ROLEPLAYING = (
     "{question}\n"
     "{answer_prefix} "
 )
+
+# Deception Detection - Insider Trading
+# Report creation task - model generates trading report, LLM judge labels as honest/deceptive
+DECEPTION_INSIDER_TRADING = (
+    "{scenario}\n\n"
+    "Report: "
+)

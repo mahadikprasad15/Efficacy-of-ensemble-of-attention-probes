@@ -18,8 +18,8 @@ APOLLO_BASE_URL = "https://raw.githubusercontent.com/ApolloResearch/deception-de
 
 DATASET_FILES = {
     "roleplaying": f"{APOLLO_BASE_URL}/data/roleplaying/dataset.yaml",
-    # Add more datasets here as needed:
-    # "insider_trading": f"{APOLLO_BASE_URL}/data/insider_trading/llama-70b-3.3-generations.json",
+    "insider_trading": f"{APOLLO_BASE_URL}/data/insider_trading/llama-70b-3.3-generations.json",
+    # Note: insider_trading may use pre-generated data or you can create scenarios
 }
 
 def download_file(url: str, output_path: str, max_retries: int = 3) -> bool:
