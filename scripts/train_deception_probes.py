@@ -430,6 +430,22 @@ def main():
     )
     os.makedirs(output_dir, exist_ok=True)
 
+    # Check if probes already exist (skip if so, unless training single layer)
+    results_path = os.path.join(output_dir, "layer_results.json")
+    if args.layer is None and os.path.exists(results_path):
+        # Check if we have results for all layers
+        try:
+            with open(results_path, 'r') as f:
+                existing_results = json.load(f)
+            if len(existing_results) == L:
+                logger.info(f"⚠️  Probes already trained in {output_dir}")
+                logger.info(f"   Found layer_results.json with {len(existing_results)} layers")
+                logger.info(f"   Skipping training to avoid overwriting existing probes.")
+                logger.info(f"   To retrain, delete the directory or train specific layer with --layer flag.")
+                return 0
+        except Exception as e:
+            logger.warning(f"Could not load existing results: {e}, will retrain")
+
     if args.layer is not None:
         # Train single layer
         logger.info(f"Training probe for layer {args.layer}...")

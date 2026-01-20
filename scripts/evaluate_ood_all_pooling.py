@@ -434,6 +434,23 @@ def main():
     device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Check if OOD evaluation already exists (skip if so)
+    results_path = os.path.join(args.output_dir, "ood_results_all_pooling.json")
+    logits_dir = os.path.join(args.output_dir, "logits")
+    if os.path.exists(results_path) and os.path.exists(logits_dir):
+        import glob
+        existing_logits = glob.glob(os.path.join(logits_dir, "*_logits.npy"))
+        if existing_logits:
+            print("=" * 90)
+            print("⚠️  OOD EVALUATION RESULTS ALREADY EXIST")
+            print("=" * 90)
+            print(f"Found: {results_path}")
+            print(f"Found: {len(existing_logits)} logit files in {logits_dir}")
+            print("Skipping evaluation to avoid overwriting existing results.")
+            print("To re-evaluate, delete the output directory and run again.")
+            print("=" * 90)
+            return 0
+
     print("=" * 90)
     print("OOD EVALUATION - ALL POOLING STRATEGIES")
     print("=" * 90)
@@ -468,11 +485,20 @@ def main():
     print(f"Loading OOD activations from: {args.ood_activations_dir}")
     ood_dataset = CachedOODDataset(args.ood_activations_dir)
     ood_dataloader = DataLoader(ood_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+    # Extract and save labels for ensemble evaluation
+    ood_labels = np.array([label for _, label in ood_dataset])
     print()
 
     # Evaluate each pooling strategy
     all_results = {}
     logits_dir = os.path.join(args.output_dir, "logits")
+
+    # Save labels for ensemble evaluation
+    os.makedirs(logits_dir, exist_ok=True)
+    labels_path = os.path.join(logits_dir, "labels.npy")
+    np.save(labels_path, ood_labels)
+    print(f"✓ Saved OOD labels: {labels_path} ({len(ood_labels)} samples)\n")
 
     for pooling, probes_dir in probe_dirs.items():
         results = evaluate_all_layers(
