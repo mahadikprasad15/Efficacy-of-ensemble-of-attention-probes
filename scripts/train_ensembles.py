@@ -274,7 +274,7 @@ def train_ensembles(args):
         test_logits_k = test_logits[:, selected_layers]
 
         # --- Static Mean Ensemble ---
-        ensemble_mean = StaticMeanEnsemble(num_layers=len(selected_layers))
+        ensemble_mean = StaticMeanEnsemble()  # FIX: No parameters needed
         auc_mean, acc_mean = evaluate_ensemble(ensemble_mean, test_logits_k, test_labels, "static_mean")
         logger.info(f"  StaticMean: AUC={auc_mean:.4f}, Acc={acc_mean:.4f}")
 
@@ -292,7 +292,8 @@ def train_ensembles(args):
         val_labels_concat = np.hstack([val_labels[d] for d in train_datasets])
 
         # Train gated ensemble
-        ensemble_gated = GatedEnsemble(num_layers=len(selected_layers), input_dim=len(selected_layers), hidden_dim=64).to(device)
+        # FIX: Remove hidden_dim parameter (not in __init__)
+        ensemble_gated = GatedEnsemble(input_dim=len(selected_layers), num_layers=len(selected_layers)).to(device)
         optimizer = optim.AdamW(ensemble_gated.parameters(), lr=1e-3, weight_decay=1e-4)
         criterion = nn.BCEWithLogitsLoss()
 
@@ -318,7 +319,9 @@ def train_ensembles(args):
                 batch_labels = batch_labels.to(device)
 
                 optimizer.zero_grad()
-                output = ensemble_gated(batch_logits)
+                # FIX: GatedEnsemble.forward expects (layer_features, layer_logits)
+                # Use logits as features (simplified approach - logits contain layer info)
+                output = ensemble_gated(batch_logits, batch_logits)
                 loss = criterion(output, batch_labels)
                 loss.backward()
                 optimizer.step()
@@ -345,7 +348,8 @@ def train_ensembles(args):
         ensemble_gated.eval()
         with torch.no_grad():
             test_logits_tensor = torch.tensor(test_logits_k, dtype=torch.float32).to(device)
-            probs_gated = torch.sigmoid(ensemble_gated(test_logits_tensor)).cpu().numpy()
+            # FIX: GatedEnsemble needs both features and logits
+            probs_gated = torch.sigmoid(ensemble_gated(test_logits_tensor, test_logits_tensor)).cpu().numpy()
 
         auc_gated = roc_auc_score(test_labels, probs_gated)
         acc_gated = accuracy_score(test_labels, (probs_gated > 0.5).astype(int))
