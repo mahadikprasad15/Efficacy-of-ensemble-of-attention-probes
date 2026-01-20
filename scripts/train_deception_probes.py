@@ -507,9 +507,14 @@ def main():
                 model, layer_train_loader, layer_val_loader, device, args
             )
 
+            # Load best model and get final validation accuracy
+            model.load_state_dict(torch.load(args.output_model_path))
+            _, best_val_acc, _, _ = evaluate(model, layer_val_loader, device)
+
             results.append({
                 'layer': layer_idx,
                 'val_auc': best_val_auc,
+                'val_acc': best_val_acc,
                 'epoch': best_epoch
             })
 

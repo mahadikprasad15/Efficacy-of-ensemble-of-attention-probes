@@ -208,6 +208,138 @@ def plot_dataset_comparison(experiments: List[Dict], save_path: str = None):
 
     plt.close()
 
+def plot_layerwise_comparison(experiments: List[Dict], save_path: str = None):
+    """
+    Plot layer-wise AUC and accuracy trends for all pooling strategies in one chart.
+    
+    Creates a combined plot showing how validation metrics change across layers
+    for each pooling strategy (mean, max, last, attn).
+    
+    Args:
+        experiments: List of experiment dicts from find_all_experiments()
+        save_path: Optional path to save plot
+    """
+    # Group experiments by model/dataset to find comparable ones
+    grouped = {}
+    for exp in experiments:
+        key = (exp['model'], exp['dataset'])
+        if key not in grouped:
+            grouped[key] = {}
+        pooling = exp['pooling']
+        grouped[key][pooling] = exp['results_file']
+    
+    # Process each model/dataset group
+    for (model, dataset), pooling_files in grouped.items():
+        if len(pooling_files) < 2:
+            print(f"⚠️  Only one pooling strategy for {model}/{dataset}, need ≥2 for comparison")
+            continue
+        
+        print(f"\n📊 Creating layerwise comparison for {model}/{dataset}")
+        
+        # Load all pooling results
+        all_results = {}
+        has_accuracy = False
+        
+        for pooling, results_file in pooling_files.items():
+            try:
+                with open(results_file, 'r') as f:
+                    layer_results = json.load(f)
+                all_results[pooling] = layer_results
+                # Check if accuracy data exists
+                if layer_results and 'val_acc' in layer_results[0]:
+                    has_accuracy = True
+            except Exception as e:
+                print(f"⚠️  Error loading {results_file}: {e}")
+                continue
+        
+        if len(all_results) < 2:
+            print(f"⚠️  Could not load enough pooling results for comparison")
+            continue
+        
+        # Colors for pooling strategies
+        colors = {
+            'mean': '#2E86AB',  # Blue
+            'max': '#A23B72',   # Purple
+            'last': '#F18F01',  # Orange
+            'attn': '#06A77D'   # Green
+        }
+        
+        # Create figure - 2 subplots if we have accuracy, 1 otherwise
+        if has_accuracy:
+            fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+            ax_auc = axes[0]
+            ax_acc = axes[1]
+        else:
+            fig, ax_auc = plt.subplots(figsize=(14, 6))
+            ax_acc = None
+        
+        # Plot each pooling strategy
+        for pooling, layer_results in all_results.items():
+            layers = [r['layer'] for r in layer_results]
+            aucs = [r['val_auc'] for r in layer_results]
+            color = colors.get(pooling, '#666666')
+            
+            # Plot AUC line
+            ax_auc.plot(layers, aucs, marker='o', linewidth=2, markersize=5,
+                       color=color, label=f'{pooling.upper()}', alpha=0.8)
+            
+            # Mark best layer
+            best = max(layer_results, key=lambda x: x['val_auc'])
+            ax_auc.scatter([best['layer']], [best['val_auc']], 
+                          color=color, s=150, zorder=5, edgecolors='black', linewidths=2)
+            ax_auc.annotate(f"L{best['layer']}", 
+                           (best['layer'], best['val_auc']),
+                           textcoords="offset points", xytext=(0, 10),
+                           ha='center', fontsize=8, fontweight='bold')
+            
+            # Plot accuracy if available
+            if ax_acc is not None and 'val_acc' in layer_results[0]:
+                accs = [r.get('val_acc', 0.5) for r in layer_results]
+                ax_acc.plot(layers, accs, marker='s', linewidth=2, markersize=5,
+                           color=color, label=f'{pooling.upper()}', alpha=0.8)
+                
+                # Mark best accuracy layer
+                best_acc = max(layer_results, key=lambda x: x.get('val_acc', 0))
+                ax_acc.scatter([best_acc['layer']], [best_acc.get('val_acc', 0.5)],
+                              color=color, s=150, zorder=5, edgecolors='black', linewidths=2)
+        
+        # Style AUC subplot
+        ax_auc.axhline(y=0.5, color='red', linestyle='--', alpha=0.3, label='Random Chance')
+        ax_auc.axhline(y=0.7, color='green', linestyle=':', alpha=0.3, label='Strong Signal (0.7)')
+        ax_auc.set_ylabel('Validation AUC', fontsize=12)
+        ax_auc.set_title(f'Layerwise Validation AUC Comparison\n{dataset} | {model}', 
+                        fontsize=14, fontweight='bold')
+        ax_auc.legend(loc='lower right', fontsize=10)
+        ax_auc.grid(True, alpha=0.3)
+        ax_auc.set_ylim(0.4, 1.0)
+        
+        # Style accuracy subplot if present
+        if ax_acc is not None:
+            ax_acc.axhline(y=0.5, color='red', linestyle='--', alpha=0.3, label='Random Chance')
+            ax_acc.set_xlabel('Layer', fontsize=12)
+            ax_acc.set_ylabel('Validation Accuracy', fontsize=12)
+            ax_acc.set_title('Layerwise Validation Accuracy Comparison', fontsize=14, fontweight='bold')
+            ax_acc.legend(loc='lower right', fontsize=10)
+            ax_acc.grid(True, alpha=0.3)
+            ax_acc.set_ylim(0.4, 1.0)
+        else:
+            ax_auc.set_xlabel('Layer', fontsize=12)
+        
+        plt.tight_layout()
+        
+        # Save or show
+        if save_path:
+            # Create unique filename for each model/dataset combo
+            model_short = model.replace('/', '_').replace('-', '_')
+            dataset_short = dataset.replace('-', '_')
+            actual_path = save_path.replace('.png', f'_{model_short}_{dataset_short}.png')
+            plt.savefig(actual_path, dpi=300, bbox_inches='tight')
+            print(f"✓ Saved layerwise comparison to {actual_path}")
+        else:
+            plt.show()
+        
+        plt.close()
+
 def create_ood_matrix(experiments: List[Dict]) -> pd.DataFrame:
     """
     Create matrix of train → test AUCs for OOD generalization.
@@ -359,6 +491,10 @@ def main():
 
     dataset_plot = os.path.join(args.output_dir, "dataset_comparison.png")
     plot_dataset_comparison(experiments, dataset_plot)
+
+    # Layerwise comparison across pooling strategies
+    layerwise_plot = os.path.join(args.output_dir, "layerwise_comparison.png")
+    plot_layerwise_comparison(experiments, layerwise_plot)
 
     # OOD matrix
     ood_matrix = create_ood_matrix(experiments)
