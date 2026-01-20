@@ -438,8 +438,7 @@ def main():
 
         model = LayerProbe(
             input_dim=D,
-            pooling=args.pooling,
-            num_tokens=T
+            pooling_type=args.pooling
         ).to(device)
 
         best_val_auc, best_epoch = train_probe(
@@ -471,8 +470,7 @@ def main():
 
             model = LayerProbe(
                 input_dim=D,
-                pooling=args.pooling,
-                num_tokens=T
+                pooling_type=args.pooling
             ).to(device)
 
             # Create dataloaders that select specific layer
