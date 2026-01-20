@@ -49,7 +49,7 @@ from safetensors.torch import save_file
 # Add src to path
 sys.path.append(os.path.join(os.getcwd(), 'actprobe', 'src'))
 
-from actprobe.datasets.deception_loaders import DeceptionRoleplayingDataset
+from actprobe.datasets.deception_loaders import DeceptionRoleplayingDataset, DeceptionInsiderTradingDataset
 from actprobe.llm.activations import ActivationRunner
 from actprobe.features.resample import resample_activations
 from actprobe.llm.generate import CerebrasGenerator
@@ -229,6 +229,7 @@ class DeceptionLabeler:
 
 DATASET_MAP = {
     "Deception-Roleplaying": DeceptionRoleplayingDataset,
+    "Deception-InsiderTrading": DeceptionInsiderTradingDataset,
 }
 
 # ============================================================================
@@ -328,6 +329,13 @@ def main():
         help="HuggingFace token for gated models (or set HF_TOKEN env var)"
     )
 
+    # Force regeneration
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force regeneration even if activations already exist"
+    )
+
     args = parser.parse_args()
 
     logger.info(f"{'='*70}")
@@ -394,6 +402,20 @@ def main():
 
     manifest_path = os.path.join(save_dir, "manifest.jsonl")
     logger.info(f"[4/6] Output directory: {save_dir}\n")
+
+    # Check if activations already exist (skip if so, unless --force)
+    if not args.force and os.path.exists(manifest_path):
+        import glob
+        existing_shards = glob.glob(os.path.join(save_dir, "shard_*.safetensors"))
+        if existing_shards:
+            logger.info(f"⚠️  Activations already exist in {save_dir}")
+            logger.info(f"   Found {len(existing_shards)} shard(s) and manifest.jsonl")
+            logger.info(f"   Skipping generation to avoid overwriting existing data.")
+            logger.info(f"   To regenerate, use --force flag or delete the directory.")
+            return 0
+
+    if args.force and os.path.exists(manifest_path):
+        logger.info(f"ℹ️  --force flag set: Will overwrite existing activations in {save_dir}")
 
     # Open manifest file for writing
     manifest_file = open(manifest_path, "w")
