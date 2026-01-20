@@ -273,57 +273,84 @@ def plot_layerwise_comparison(experiments: List[Dict], save_path: str = None):
             fig, ax_auc = plt.subplots(figsize=(14, 6))
             ax_acc = None
         
+        # Track overall best across all pooling strategies
+        overall_best_auc = 0
+        overall_best_info = None
+
         # Plot each pooling strategy
         for pooling, layer_results in all_results.items():
             layers = [r['layer'] for r in layer_results]
             aucs = [r['val_auc'] for r in layer_results]
             color = colors.get(pooling, '#666666')
-            
+
             # Plot AUC line
-            ax_auc.plot(layers, aucs, marker='o', linewidth=2, markersize=5,
-                       color=color, label=f'{pooling.upper()}', alpha=0.8)
-            
-            # Mark best layer
+            ax_auc.plot(layers, aucs, marker='o', linewidth=2.5, markersize=6,
+                       color=color, label=f'{pooling.upper()}', alpha=0.85)
+
+            # Mark best layer for this pooling
             best = max(layer_results, key=lambda x: x['val_auc'])
-            ax_auc.scatter([best['layer']], [best['val_auc']], 
-                          color=color, s=150, zorder=5, edgecolors='black', linewidths=2)
-            ax_auc.annotate(f"L{best['layer']}", 
-                           (best['layer'], best['val_auc']),
-                           textcoords="offset points", xytext=(0, 10),
-                           ha='center', fontsize=8, fontweight='bold')
-            
+            ax_auc.scatter([best['layer']], [best['val_auc']],
+                          color=color, s=200, zorder=5, edgecolors='black', linewidths=2.5,
+                          marker='*')
+
+            # Track overall best
+            if best['val_auc'] > overall_best_auc:
+                overall_best_auc = best['val_auc']
+                overall_best_info = (pooling, best['layer'], best['val_auc'])
+
             # Plot accuracy if available
             if ax_acc is not None and 'val_acc' in layer_results[0]:
                 accs = [r.get('val_acc', 0.5) for r in layer_results]
-                ax_acc.plot(layers, accs, marker='s', linewidth=2, markersize=5,
-                           color=color, label=f'{pooling.upper()}', alpha=0.8)
-                
+                ax_acc.plot(layers, accs, marker='s', linewidth=2.5, markersize=6,
+                           color=color, label=f'{pooling.upper()}', alpha=0.85)
+
                 # Mark best accuracy layer
                 best_acc = max(layer_results, key=lambda x: x.get('val_acc', 0))
                 ax_acc.scatter([best_acc['layer']], [best_acc.get('val_acc', 0.5)],
-                              color=color, s=150, zorder=5, edgecolors='black', linewidths=2)
+                              color=color, s=200, zorder=5, edgecolors='black', linewidths=2.5,
+                              marker='*')
+
+        # Highlight overall best on validation AUC plot
+        if overall_best_info:
+            pooling, layer, auc = overall_best_info
+            color = colors.get(pooling, '#666666')
+
+            # Add prominent annotation for overall best
+            ax_auc.annotate(
+                f'BEST: {pooling.upper()}\nLayer {layer}\nAUC: {auc:.3f}',
+                xy=(layer, auc),
+                xytext=(15, 15),
+                textcoords='offset points',
+                bbox=dict(boxstyle='round,pad=0.8', facecolor=color, alpha=0.3,
+                         edgecolor='black', linewidth=2),
+                arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.3',
+                              color='black', lw=2),
+                fontsize=11,
+                fontweight='bold',
+                ha='left'
+            )
         
         # Style AUC subplot
-        ax_auc.axhline(y=0.5, color='red', linestyle='--', alpha=0.3, label='Random Chance')
-        ax_auc.axhline(y=0.7, color='green', linestyle=':', alpha=0.3, label='Strong Signal (0.7)')
-        ax_auc.set_ylabel('Validation AUC', fontsize=12)
-        ax_auc.set_title(f'Layerwise Validation AUC Comparison\n{dataset} | {model}', 
+        ax_auc.axhline(y=0.5, color='red', linestyle='--', alpha=0.4, linewidth=1.5, label='Random Chance')
+        ax_auc.axhline(y=0.7, color='green', linestyle=':', alpha=0.4, linewidth=1.5, label='Strong Signal (0.7)')
+        ax_auc.set_ylabel('Validation AUC', fontsize=13, fontweight='bold')
+        ax_auc.set_title(f'Layerwise Validation AUC Comparison\n{dataset} | {model}',
                         fontsize=14, fontweight='bold')
-        ax_auc.legend(loc='lower right', fontsize=10)
-        ax_auc.grid(True, alpha=0.3)
-        ax_auc.set_ylim(0.4, 1.0)
-        
+        ax_auc.legend(loc='best', fontsize=11, framealpha=0.9)
+        ax_auc.grid(True, alpha=0.3, linestyle='--')
+        ax_auc.set_ylim(0.45, 1.0)
+
         # Style accuracy subplot if present
         if ax_acc is not None:
-            ax_acc.axhline(y=0.5, color='red', linestyle='--', alpha=0.3, label='Random Chance')
-            ax_acc.set_xlabel('Layer', fontsize=12)
-            ax_acc.set_ylabel('Validation Accuracy', fontsize=12)
+            ax_acc.axhline(y=0.5, color='red', linestyle='--', alpha=0.4, linewidth=1.5, label='Random Chance')
+            ax_acc.set_xlabel('Layer', fontsize=13, fontweight='bold')
+            ax_acc.set_ylabel('Validation Accuracy', fontsize=13, fontweight='bold')
             ax_acc.set_title('Layerwise Validation Accuracy Comparison', fontsize=14, fontweight='bold')
-            ax_acc.legend(loc='lower right', fontsize=10)
-            ax_acc.grid(True, alpha=0.3)
-            ax_acc.set_ylim(0.4, 1.0)
+            ax_acc.legend(loc='best', fontsize=11, framealpha=0.9)
+            ax_acc.grid(True, alpha=0.3, linestyle='--')
+            ax_acc.set_ylim(0.45, 1.0)
         else:
-            ax_auc.set_xlabel('Layer', fontsize=12)
+            ax_auc.set_xlabel('Layer', fontsize=13, fontweight='bold')
         
         plt.tight_layout()
         
