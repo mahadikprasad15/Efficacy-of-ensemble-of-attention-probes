@@ -126,9 +126,13 @@ class CachedOODDataset(Dataset):
 
 
 def find_probe_files(probes_dir: str) -> List[str]:
-    """Find all probe_layer_*.pt files in directory."""
+    """Find all probe_layer_*.pt files in directory, sorted numerically."""
     pattern = os.path.join(probes_dir, "probe_layer_*.pt")
-    probe_files = sorted(glob.glob(pattern))
+    # Sort numerically (not string sort which puts layer 10 before layer 2)
+    probe_files = sorted(
+        glob.glob(pattern),
+        key=lambda x: int(x.split('_')[-1].replace('.pt', ''))
+    )
     return probe_files
 
 

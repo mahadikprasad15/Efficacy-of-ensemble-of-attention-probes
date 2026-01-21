@@ -136,7 +136,11 @@ def evaluate_test_metrics(
     from sklearn.metrics import roc_auc_score, accuracy_score
 
     # Find all probe files
-    probe_files = sorted(glob.glob(os.path.join(probes_dir, "probe_layer_*.pt")))
+    # Find all probe files and sort numerically (not string sort!)
+    probe_files = sorted(
+        glob.glob(os.path.join(probes_dir, "probe_layer_*.pt")),
+        key=lambda x: int(x.split('_')[-1].replace('.pt', ''))
+    )
 
     if not probe_files:
         print(f"⚠️  No probe files found in {probes_dir}")

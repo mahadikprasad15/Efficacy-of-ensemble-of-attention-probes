@@ -155,7 +155,11 @@ def extract_logits_from_probes(
         logits: (N, L) array
         labels: (N,) array
     """
-    probe_files = sorted(glob.glob(os.path.join(probes_dir, "probe_layer_*.pt")))
+    # Sort probe files numerically (not string sort which puts layer 10 before layer 2)
+    probe_files = sorted(
+        glob.glob(os.path.join(probes_dir, "probe_layer_*.pt")),
+        key=lambda x: int(x.split('_')[-1].replace('.pt', ''))
+    )
 
     if not probe_files:
         raise ValueError(f"No probe files in {probes_dir}")
