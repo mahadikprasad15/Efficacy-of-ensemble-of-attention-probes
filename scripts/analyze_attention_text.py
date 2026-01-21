@@ -194,85 +194,136 @@ for sample in tqdm(selected_samples):
 # ============================================================================
 print("\nGenerating visualizations...")
 
-def plot_attention_text(result, ax, max_tokens=60):
-    """Plot text with attention highlighting."""
-    tokens = result['tokens'][:max_tokens]
-    weights = result['weights'][:max_tokens]
+def create_html_visualization(results, output_path):
+    """Create an HTML file with color-coded attention on text."""
     
-    # Normalize weights for coloring
-    weights_norm = (weights - weights.min()) / (weights.max() - weights.min() + 1e-8)
+    html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
+        .sample { background: white; padding: 20px; margin: 20px 0; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .honest { border-left: 5px solid #2ecc71; }
+        .deceptive { border-left: 5px solid #e74c3c; }
+        .label { font-weight: bold; font-size: 18px; margin-bottom: 10px; }
+        .label.honest { color: #2ecc71; }
+        .label.deceptive { color: #e74c3c; }
+        .text { font-size: 16px; line-height: 2.2; }
+        .token { padding: 3px 6px; margin: 2px; border-radius: 4px; display: inline-block; }
+        .stats { margin-top: 15px; font-size: 14px; color: #666; background: #f0f0f0; padding: 10px; border-radius: 5px; }
+        h1 { text-align: center; color: #333; }
+        .legend { text-align: center; margin-bottom: 20px; }
+        .legend span { padding: 5px 15px; margin: 5px; border-radius: 5px; display: inline-block; }
+    </style>
+</head>
+<body>
+    <h1>Attention Weights on Text (Layer 16 ATTN Pooling)</h1>
+    <div class="legend">
+        <span style="background: #ffffcc;">Low Attention</span>
+        <span style="background: #ffeda0;">→</span>
+        <span style="background: #feb24c;">→</span>
+        <span style="background: #f03b20;">High Attention</span>
+    </div>
+"""
     
-    # Create colormap
-    cmap = plt.cm.YlOrRd
+    for result in results:
+        label_class = 'honest' if result['label'] == 'HONEST' else 'deceptive'
+        
+        # Build token spans with color
+        tokens = result['tokens'][:80]
+        weights = result['weights'][:80]
+        
+        # Normalize weights
+        w_min, w_max = weights.min(), weights.max()
+        weights_norm = (weights - w_min) / (w_max - w_min + 1e-8)
+        
+        token_html = ""
+        for token, w_norm in zip(tokens, weights_norm):
+            # Clean token
+            token_display = token.replace('▁', ' ').replace('Ġ', ' ')
+            if not token_display.strip():
+                continue
+            
+            # Color gradient: yellow (low) -> orange -> red (high)
+            if w_norm < 0.3:
+                bg = f"rgba(255, 255, 200, {0.3 + w_norm})"
+                text_color = "#333"
+            elif w_norm < 0.6:
+                bg = f"rgba(254, 178, 76, {0.5 + w_norm*0.5})"
+                text_color = "#333"
+            else:
+                bg = f"rgba(240, 59, 32, {0.6 + w_norm*0.4})"
+                text_color = "white"
+            
+            token_html += f'<span class="token" style="background: {bg}; color: {text_color};">{token_display}</span>'
+        
+        # Top tokens
+        valid_top = [i for i in result['top_5_idx'][:5] if i < len(tokens)]
+        top_tokens = ", ".join([f"'{tokens[i].replace('▁', ' ').strip()}'" for i in valid_top if tokens[i].strip()])
+        
+        concentration = sum(sorted(weights, reverse=True)[:5]) / (sum(weights) + 1e-8)
+        
+        html += f"""
+    <div class="sample {label_class}">
+        <div class="label {label_class}">{result['label']} | ID: {result['id']}</div>
+        <div class="text">{token_html}</div>
+        <div class="stats">
+            <strong>Top 5 tokens get {concentration*100:.1f}% attention:</strong> {top_tokens}
+        </div>
+    </div>
+"""
     
-    # Clear axis
-    ax.set_xlim(0, 10)
-    ax.set_ylim(0, 1)
-    ax.axis('off')
+    html += """
+</body>
+</html>
+"""
+    
+    with open(output_path, 'w') as f:
+        f.write(html)
+    
+    return output_path
+
+# Create HTML visualization (much more legible!)
+html_path = f"{OUTPUT_DIR}/attention_on_text.html"
+create_html_visualization(results, html_path)
+print(f"✓ Saved HTML: {html_path}")
+
+# Also create a simple PNG with just the top words per sample
+fig, axes = plt.subplots(5, 2, figsize=(16, 12))
+fig.suptitle('Top Attended Words per Sample\n(Layer 16 ATTN Pooling)', fontsize=16, fontweight='bold')
+
+for idx, result in enumerate(results):
+    row, col = idx // 2, idx % 2
+    ax = axes[row, col]
+    
+    # Get top 10 tokens with weights
+    valid_idx = [i for i in np.argsort(result['weights'])[::-1][:10] if i < len(result['tokens'])]
+    top_tokens = [result['tokens'][i].replace('▁', ' ').replace('Ġ', ' ').strip() for i in valid_idx]
+    top_weights = [result['weights'][i] for i in valid_idx]
+    
+    # Filter empty tokens
+    filtered = [(t, w) for t, w in zip(top_tokens, top_weights) if t and len(t) > 1]
+    if filtered:
+        tokens_f, weights_f = zip(*filtered[:8])
+    else:
+        tokens_f, weights_f = ['[empty]'], [0]
+    
+    # Bar chart
+    colors = plt.cm.YlOrRd(np.linspace(0.3, 0.9, len(tokens_f)))
+    bars = ax.barh(range(len(tokens_f)), weights_f[::-1], color=colors[::-1])
+    ax.set_yticks(range(len(tokens_f)))
+    ax.set_yticklabels(tokens_f[::-1], fontsize=10)
+    ax.set_xlabel('Attention Weight', fontsize=10)
     
     # Title with label
-    color = '#2ecc71' if result['label'] == 'HONEST' else '#e74c3c'
-    ax.set_title(f"{result['label']} | ID: {result['id'][:20]}...", 
-                fontsize=12, fontweight='bold', color=color, loc='left')
-    
-    # Display tokens in wrapped format
-    x, y = 0.01, 0.85
-    line_height = 0.12
-    
-    for i, (token, w, w_norm) in enumerate(zip(tokens, weights, weights_norm)):
-        # Clean token for display
-        token_display = token.replace('▁', ' ').replace('Ġ', ' ').strip()
-        if not token_display:
-            token_display = '·'
-        
-        # Background color based on attention
-        bg_color = cmap(w_norm)
-        
-        # Calculate token width
-        token_width = len(token_display) * 0.012 + 0.02
-        
-        # Check if we need to wrap to next line
-        if x + token_width > 0.98:
-            x = 0.01
-            y -= line_height
-            if y < 0.1:
-                break
-        
-        # Draw background rectangle
-        rect = Rectangle((x, y - 0.04), token_width, 0.08, 
-                         facecolor=bg_color, edgecolor='none', alpha=0.8)
-        ax.add_patch(rect)
-        
-        # Draw token text
-        text_color = 'white' if w_norm > 0.6 else 'black'
-        ax.text(x + token_width/2, y, token_display, 
-               fontsize=8, ha='center', va='center', color=text_color,
-               fontfamily='monospace')
-        
-        x += token_width + 0.005
-    
-    # Add attention statistics
-    concentration = sum(sorted(weights, reverse=True)[:5]) / (sum(weights) + 1e-8)
-    # Safe access to top tokens
-    valid_top_idx = [i for i in result['top_5_idx'][:5] if i < len(tokens)]
-    top_5_tokens = [tokens[i].replace('▁', ' ').replace('Ġ', ' ') for i in valid_top_idx]
-    
-    stats_text = f"Top 5 tokens get {concentration*100:.1f}% attention"
-    ax.text(0.01, 0.02, stats_text, fontsize=8, transform=ax.transAxes,
-           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    label_color = '#2ecc71' if result['label'] == 'HONEST' else '#e74c3c'
+    ax.set_title(f"{result['label']}: {result['id'][:15]}...", fontsize=11, fontweight='bold', color=label_color)
 
-# Create figure with 10 subplots (5 honest + 5 deceptive)
-fig, axes = plt.subplots(10, 1, figsize=(16, 25))
-fig.suptitle('Attention Weights on Actual Text\n(Layer 16 ATTN Pooling)', 
-             fontsize=16, fontweight='bold', y=0.995)
-
-for i, result in enumerate(results):
-    plot_attention_text(result, axes[i])
-
-plt.tight_layout(rect=[0, 0, 1, 0.99])
-save_path = f"{OUTPUT_DIR}/attention_on_text.png"
-plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
-print(f"✓ Saved: {save_path}")
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+png_path = f"{OUTPUT_DIR}/top_attended_words.png"
+plt.savefig(png_path, dpi=150, bbox_inches='tight', facecolor='white')
+print(f"✓ Saved PNG: {png_path}")
 plt.show()
 
 # ============================================================================
