@@ -28,7 +28,7 @@ print(f"Device: {device}")
 # PATHS
 # ============================================================================
 OOD_DIR = "data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test"
-APOLLO_DATA = "data/apollo_raw/llama-70b-3.3-generations.json"
+APOLLO_DATA = "data/apollo_raw/insider_trading/llama-70b-3.3-generations.json"
 PROBES_BASE = "data/probes/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying"
 MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
 OUTPUT_DIR = "results/mechanistic_analysis"
