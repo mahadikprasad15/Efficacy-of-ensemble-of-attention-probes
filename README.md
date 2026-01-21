@@ -6,7 +6,7 @@ This project investigates whether learned pooling strategies (mean, max, last, *
 
 ---
 
-## 🏆 Key Results
+## Results
 
 | Method | Validation AUC | OOD AUC | Generalization Gap |
 |--------|---------------|---------|-------------------|
@@ -230,53 +230,6 @@ os.environ['CEREBRAS_API_KEY'] = 'your_cerebras_key'
 
 ---
 
-## Research Implications
-
-### For AI Safety
-- **Validation metrics alone are dangerous**: MEAN pooling achieves 0.977 val AUC but fails OOD (0.492)
-- **Monitoring systems can appear perfect but be fundamentally brittle**
-- **Middle layers (11-16) contain the most generalizable deception signals**
-
-### For Interpretability
-- Attention pooling learns to focus on task-relevant tokens (not just averaging noise)
-- Gated ensemble identifies which layers are trustworthy per-sample
-- Layer selection is more important than ensemble method for generalization
-
----
-
-## Citation
-
-```bibtex
-@article{efficacy-ensemble-probes,
-  title={Efficacy of Ensemble of Attention Probes for OOD Deception Detection},
-  author={Mahadik, Prasad},
-  year={2026}
-}
-```
-
 Related work:
 - [Apollo Research: Scheming Evaluations](https://github.com/apollonetwork/scheming-evals)
 - [Burns et al.: Discovering Latent Knowledge](https://arxiv.org/abs/2212.03827)
-
----
-
-## Troubleshooting
-
-### Out of Memory (OOM)
-- Reduce `--batch_size` (try 4 or 2)
-- Use `--limit 100` for testing
-
-### HuggingFace Authentication
-```bash
-export HF_TOKEN=your_token
-# or
-huggingface-cli login
-```
-
-### Cerebras API Issues
-- API errors fall back to regex-based labeling automatically
-- Check key: `export CEREBRAS_API_KEY=your_key`
-
-### No Probes Found
-- Ensure probes are in the correct path structure:
-  `data/probes/{model}/{dataset}/{pooling}/probe_layer_*.pt`
