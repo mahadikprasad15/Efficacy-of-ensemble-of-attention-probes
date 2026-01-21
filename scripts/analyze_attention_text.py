@@ -1,10 +1,7 @@
 # ============================================================================
-# ENHANCED MECHANISTIC ANALYSIS: Text + Attention Visualization
-# ============================================================================
-# Improvements:
-# 1. Show actual text/tokens with attention weights
-# 2. "Attention Concentration" metric: What % of tokens capture 80% attention?
-# 3. Word-cloud style visualization of high-attention tokens
+# TEXT-BASED ATTENTION VISUALIZATION
+# Shows actual words with attention weights highlighted
+# 5 honest + 5 deceptive examples
 # ============================================================================
 
 import os
@@ -15,9 +12,11 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from matplotlib.patches import Rectangle
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
 from tqdm import tqdm
+import textwrap
 
 sys.path.append(os.path.join(os.getcwd(), 'actprobe', 'src'))
 from actprobe.probes.models import LayerProbe
@@ -26,9 +25,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
 # ============================================================================
-# PATHS - Update these to match your setup
+# PATHS
 # ============================================================================
 OOD_DIR = "data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test"
+APOLLO_DATA = "data/apollo_raw/llama-70b-3.3-generations.json"
 PROBES_BASE = "data/probes/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying"
 MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
 OUTPUT_DIR = "results/mechanistic_analysis"
@@ -46,13 +46,42 @@ try:
     print("✓ Tokenizer loaded")
 except Exception as e:
     print(f"⚠️ Could not load tokenizer: {e}")
-    print("   Will use token positions instead of actual text")
     HAS_TOKENIZER = False
+    # Create a dummy tokenizer for position-based display
+    class DummyTokenizer:
+        def convert_ids_to_tokens(self, ids):
+            return [f"[{i}]" for i in ids]
+    tokenizer = DummyTokenizer()
 
 # ============================================================================
-# LOAD DATA
+# LOAD APOLLO DATA (for original text)
 # ============================================================================
-print("\nLoading OOD data...")
+print("\nLoading Apollo data for original text...")
+apollo_texts = {}
+try:
+    with open(APOLLO_DATA, 'r') as f:
+        apollo_data = json.load(f)
+    
+    for item in apollo_data:
+        # Extract the trade_message (model's response)
+        if 'metadata' in item and 'trade_message' in item['metadata']:
+            scenario_id = item.get('scenario_id', item.get('id', ''))
+            trade_msg = item['metadata']['trade_message']
+            made_trade = item['metadata'].get('made_trade', '')
+            
+            apollo_texts[scenario_id] = {
+                'text': trade_msg,
+                'made_trade': made_trade
+            }
+    print(f"✓ Loaded {len(apollo_texts)} Apollo texts")
+except Exception as e:
+    print(f"⚠️ Could not load Apollo data: {e}")
+    apollo_texts = {}
+
+# ============================================================================
+# LOAD ACTIVATIONS DATA
+# ============================================================================
+print("\nLoading OOD activations...")
 with open(f"{OOD_DIR}/manifest.jsonl", 'r') as f:
     manifest = [json.loads(line) for line in f]
 
@@ -61,234 +90,221 @@ all_tensors = {}
 for shard_path in shards:
     all_tensors.update(load_file(shard_path))
 
-samples, labels, metadata_list = [], [], []
+samples_data = []
 for entry in manifest:
     eid = entry['id']
     if eid in all_tensors:
-        samples.append(all_tensors[eid])
-        labels.append(entry['label'])
-        metadata_list.append(entry.get('metadata', {}))
+        # Try to get text from Apollo data
+        text = ""
+        if eid in apollo_texts:
+            text = apollo_texts[eid]['text']
+        elif 'text' in entry:
+            text = entry['text']
+        elif 'completion' in entry:
+            text = entry['completion']
+        
+        samples_data.append({
+            'id': eid,
+            'tensor': all_tensors[eid],
+            'label': entry['label'],
+            'text': text[:500] if text else f"[Sample {eid}]"  # Truncate long text
+        })
 
-X = torch.stack(samples).float()
-y = np.array(labels)
-print(f"✓ Loaded {len(X)} samples ({sum(y==0)} honest, {sum(y==1)} deceptive)")
+print(f"✓ Loaded {len(samples_data)} samples")
+print(f"  With text: {sum(1 for s in samples_data if len(s['text']) > 20)}")
 
 # ============================================================================
 # LOAD PROBE
 # ============================================================================
-D = X.shape[-1]
+D = samples_data[0]['tensor'].shape[-1]
 probe_path = f"{PROBES_BASE}/attn/probe_layer_{BEST_LAYER}.pt"
 probe = LayerProbe(input_dim=D, pooling_type="attn").to(device)
 probe.load_state_dict(torch.load(probe_path, map_location=device))
 probe.eval()
 
 # ============================================================================
-# ANALYSIS 1: Attention Concentration Metric
+# SELECT 5 HONEST + 5 DECEPTIVE
 # ============================================================================
-print("\n" + "="*60)
-print("ANALYSIS 1: Attention Concentration Metric")
-print("What % of tokens capture 80% of attention?")
-print("="*60)
+honest_samples = [s for s in samples_data if s['label'] == 0][:5]
+deceptive_samples = [s for s in samples_data if s['label'] == 1][:5]
 
-n_examples = min(50, len(X))
+if len(honest_samples) < 5 or len(deceptive_samples) < 5:
+    print(f"⚠️ Not enough samples: {len(honest_samples)} honest, {len(deceptive_samples)} deceptive")
+    # Use whatever we have
+    honest_samples = [s for s in samples_data if s['label'] == 0][:5]
+    deceptive_samples = [s for s in samples_data if s['label'] == 1][:5]
 
-def compute_attention_concentration(weights, threshold=0.8):
-    """
-    Compute what fraction of tokens are needed to capture `threshold` of attention.
-    Lower = more concentrated/focused.
-    """
-    # Sort weights descending
-    sorted_weights = np.sort(weights)[::-1]
-    cumsum = np.cumsum(sorted_weights)
-    # Find first index where cumsum >= threshold
-    idx = np.searchsorted(cumsum, threshold) + 1
-    return idx / len(weights)
+selected_samples = honest_samples + deceptive_samples
+print(f"\n✓ Selected {len(honest_samples)} honest + {len(deceptive_samples)} deceptive samples")
 
-concentration_scores = []
-attention_all = []
+# ============================================================================
+# GET ATTENTION WEIGHTS FOR EACH SAMPLE
+# ============================================================================
+print("\nExtracting attention weights...")
 
-with torch.no_grad():
-    for i in range(n_examples):
-        x_sample = X[i:i+1, BEST_LAYER, :, :].to(device)
-        _, weights = probe.pooling(x_sample, return_attention=True)
+results = []
+for sample in tqdm(selected_samples):
+    tensor = torch.tensor(sample['tensor']).float().unsqueeze(0)  # (1, L, T, D)
+    x_layer = tensor[:, BEST_LAYER, :, :].to(device)  # (1, T, D)
+    
+    with torch.no_grad():
+        _, weights = probe.pooling(x_layer, return_attention=True)
         weights = weights.cpu().numpy().flatten()
+    
+    # Tokenize the text if we have it
+    text = sample['text']
+    if HAS_TOKENIZER and text and len(text) > 10:
+        tokens = tokenizer.tokenize(text)[:len(weights)]
+    else:
+        tokens = [f"[{i}]" for i in range(len(weights))]
+    
+    # Pad tokens to match weights length
+    while len(tokens) < len(weights):
+        tokens.append("[PAD]")
+    
+    results.append({
+        'id': sample['id'],
+        'label': 'HONEST' if sample['label'] == 0 else 'DECEPTIVE',
+        'text': text,
+        'tokens': tokens[:len(weights)],
+        'weights': weights,
+        'top_5_idx': np.argsort(weights)[-5:][::-1]
+    })
+
+# ============================================================================
+# VISUALIZATION: Highlighted Text with Attention
+# ============================================================================
+print("\nGenerating visualizations...")
+
+def plot_attention_text(result, ax, max_tokens=60):
+    """Plot text with attention highlighting."""
+    tokens = result['tokens'][:max_tokens]
+    weights = result['weights'][:max_tokens]
+    
+    # Normalize weights for coloring
+    weights_norm = (weights - weights.min()) / (weights.max() - weights.min() + 1e-8)
+    
+    # Create colormap
+    cmap = plt.cm.YlOrRd
+    
+    # Clear axis
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    
+    # Title with label
+    color = '#2ecc71' if result['label'] == 'HONEST' else '#e74c3c'
+    ax.set_title(f"{result['label']} | ID: {result['id'][:20]}...", 
+                fontsize=12, fontweight='bold', color=color, loc='left')
+    
+    # Display tokens in wrapped format
+    x, y = 0.01, 0.85
+    line_height = 0.12
+    
+    for i, (token, w, w_norm) in enumerate(zip(tokens, weights, weights_norm)):
+        # Clean token for display
+        token_display = token.replace('▁', ' ').replace('Ġ', ' ').strip()
+        if not token_display:
+            token_display = '·'
         
-        conc = compute_attention_concentration(weights, threshold=0.8)
-        concentration_scores.append({
-            'sample_idx': i,
-            'label': labels[i],
-            'concentration_80': conc,
-            'weights': weights
-        })
-        attention_all.append(weights)
+        # Background color based on attention
+        bg_color = cmap(w_norm)
+        
+        # Calculate token width
+        token_width = len(token_display) * 0.012 + 0.02
+        
+        # Check if we need to wrap to next line
+        if x + token_width > 0.98:
+            x = 0.01
+            y -= line_height
+            if y < 0.1:
+                break
+        
+        # Draw background rectangle
+        rect = Rectangle((x, y - 0.04), token_width, 0.08, 
+                         facecolor=bg_color, edgecolor='none', alpha=0.8)
+        ax.add_patch(rect)
+        
+        # Draw token text
+        text_color = 'white' if w_norm > 0.6 else 'black'
+        ax.text(x + token_width/2, y, token_display, 
+               fontsize=8, ha='center', va='center', color=text_color,
+               fontfamily='monospace')
+        
+        x += token_width + 0.005
+    
+    # Add attention statistics
+    concentration = sum(sorted(weights, reverse=True)[:5]) / sum(weights)
+    top_5_tokens = [tokens[i].replace('▁', ' ').replace('Ġ', ' ') for i in result['top_5_idx'][:5]]
+    
+    stats_text = f"Top 5 tokens get {concentration*100:.1f}% attention"
+    ax.text(0.01, 0.02, stats_text, fontsize=8, transform=ax.transAxes,
+           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-attention_all = np.array(attention_all)
+# Create figure with 10 subplots (5 honest + 5 deceptive)
+fig, axes = plt.subplots(10, 1, figsize=(16, 25))
+fig.suptitle('Attention Weights on Actual Text\n(Layer 16 ATTN Pooling)', 
+             fontsize=16, fontweight='bold', y=0.995)
 
-# Summary stats
-honest_conc = [c['concentration_80'] for c in concentration_scores if c['label'] == 0]
-deceptive_conc = [c['concentration_80'] for c in concentration_scores if c['label'] == 1]
+for i, result in enumerate(results):
+    plot_attention_text(result, axes[i])
 
-print(f"\n📊 Attention Concentration (80% threshold):")
-print(f"   Overall mean: {np.mean([c['concentration_80'] for c in concentration_scores]):.1%} of tokens")
-print(f"   Honest samples: {np.mean(honest_conc):.1%} of tokens")
-print(f"   Deceptive samples: {np.mean(deceptive_conc):.1%} of tokens")
-print(f"   → {'Deceptive' if np.mean(deceptive_conc) > np.mean(honest_conc) else 'Honest'} requires more tokens")
-
-# Plot
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-# 1a: Histogram of concentration scores
-ax1 = axes[0]
-ax1.hist(honest_conc, bins=15, alpha=0.6, label='Honest', color='#2ecc71')
-ax1.hist(deceptive_conc, bins=15, alpha=0.6, label='Deceptive', color='#e74c3c')
-ax1.axvline(np.mean(honest_conc), color='#2ecc71', linestyle='--', linewidth=2)
-ax1.axvline(np.mean(deceptive_conc), color='#e74c3c', linestyle='--', linewidth=2)
-ax1.set_xlabel('Fraction of Tokens for 80% Attention', fontsize=12)
-ax1.set_ylabel('Count', fontsize=12)
-ax1.set_title('Attention Concentration\n(Lower = More Focused)', fontsize=14, fontweight='bold')
-ax1.legend()
-
-# 1b: Cumulative attention curve (average)
-ax2 = axes[1]
-mean_weights = attention_all.mean(axis=0)
-sorted_mean = np.sort(mean_weights)[::-1]
-cumsum = np.cumsum(sorted_mean)
-x_pct = np.arange(1, len(cumsum)+1) / len(cumsum)
-
-ax2.plot(x_pct * 100, cumsum, linewidth=2, color='coral')
-ax2.axhline(0.8, color='gray', linestyle='--', alpha=0.7, label='80% threshold')
-ax2.axhline(0.9, color='gray', linestyle=':', alpha=0.5, label='90% threshold')
-ax2.fill_between(x_pct * 100, 0, cumsum, alpha=0.3, color='coral')
-
-# Find where we hit 80%
-idx_80 = np.searchsorted(cumsum, 0.8)
-ax2.axvline(x_pct[idx_80] * 100, color='red', linestyle='--', linewidth=2)
-ax2.annotate(f'{x_pct[idx_80]*100:.1f}% of tokens\n→ 80% attention', 
-             xy=(x_pct[idx_80]*100, 0.8), xytext=(x_pct[idx_80]*100 + 10, 0.6),
-             fontsize=11, arrowprops=dict(arrowstyle='->', color='red'))
-
-ax2.set_xlabel('% of Tokens (sorted by attention)', fontsize=12)
-ax2.set_ylabel('Cumulative Attention', fontsize=12)
-ax2.set_title('Cumulative Attention Curve', fontsize=14, fontweight='bold')
-ax2.legend()
-ax2.set_xlim(0, 100)
-ax2.set_ylim(0, 1.05)
-
-# 1c: Top tokens visualization
-ax3 = axes[2]
-top_k = 15
-top_positions = np.argsort(mean_weights)[-top_k:][::-1]
-top_weights = mean_weights[top_positions]
-
-bars = ax3.barh(range(top_k), top_weights[::-1], color='coral')
-ax3.set_yticks(range(top_k))
-ax3.set_yticklabels([f'Token {p}' for p in top_positions[::-1]])
-ax3.set_xlabel('Mean Attention Weight', fontsize=12)
-ax3.set_title(f'Top {top_k} Attended Positions', fontsize=14, fontweight='bold')
-
-# Add percentage labels
-total_top_weight = top_weights.sum()
-for i, (bar, w) in enumerate(zip(bars, top_weights[::-1])):
-    ax3.text(bar.get_width() + 0.001, bar.get_y() + bar.get_height()/2,
-             f'{w/mean_weights.sum()*100:.1f}%', va='center', fontsize=9)
-
-plt.tight_layout()
-save_path = f"{OUTPUT_DIR}/attention_concentration.png"
-plt.savefig(save_path, dpi=300, bbox_inches='tight')
+plt.tight_layout(rect=[0, 0, 1, 0.99])
+save_path = f"{OUTPUT_DIR}/attention_on_text.png"
+plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
 print(f"✓ Saved: {save_path}")
 plt.show()
 
 # ============================================================================
-# ANALYSIS 2: Token-Level Attention with Text (if tokenizer available)
+# PRINT TOP ATTENDED WORDS
 # ============================================================================
-print("\n" + "="*60)
-print("ANALYSIS 2: Text Visualization with Attention Weights")
-print("="*60)
+print("\n" + "="*80)
+print("TOP 5 ATTENDED TOKENS PER SAMPLE")
+print("="*80)
 
-# Get a few example samples
-n_visualize = 3
-
-fig, axes = plt.subplots(n_visualize, 1, figsize=(16, 4*n_visualize))
-if n_visualize == 1:
-    axes = [axes]
-
-for idx, (sample_idx, ax) in enumerate(zip([0, 5, 10], axes)):
-    weights = concentration_scores[sample_idx]['weights']
-    label = "DECEPTIVE" if labels[sample_idx] == 1 else "HONEST"
+for result in results:
+    label_color = "🟢" if result['label'] == 'HONEST' else "🔴"
+    print(f"\n{label_color} {result['label']}")
+    print(f"   ID: {result['id'][:30]}...")
     
-    # Normalize for visualization
-    weights_norm = weights / weights.max()
+    top_words = []
+    for idx in result['top_5_idx']:
+        if idx < len(result['tokens']):
+            token = result['tokens'][idx].replace('▁', ' ').replace('Ġ', ' ').strip()
+            weight = result['weights'][idx]
+            top_words.append(f"'{token}' ({weight:.3f})")
     
-    # Create color-coded bar chart for token positions
-    n_tokens = min(80, len(weights))
-    positions = np.arange(n_tokens)
-    
-    # Color by weight
-    colors = plt.cm.YlOrRd(weights_norm[:n_tokens])
-    
-    bars = ax.bar(positions, weights[:n_tokens], color=colors, edgecolor='none')
-    ax.set_xlim(-0.5, n_tokens - 0.5)
-    ax.set_xlabel('Token Position', fontsize=11)
-    ax.set_ylabel('Attention Weight', fontsize=11)
-    ax.set_title(f'Sample {sample_idx}: {label}', fontsize=13, fontweight='bold')
-    
-    # Mark top-5 positions
-    top5 = np.argsort(weights)[-5:]
-    for pos in top5:
-        if pos < n_tokens:
-            ax.annotate(f'#{pos}', xy=(pos, weights[pos]), 
-                       xytext=(pos, weights[pos] + 0.01),
-                       ha='center', fontsize=8, color='red')
-    
-    # Add concentration score
-    conc = concentration_scores[sample_idx]['concentration_80']
-    ax.text(0.95, 0.95, f'Concentration: {conc:.1%} of tokens\nfor 80% attention',
-            transform=ax.transAxes, fontsize=10, verticalalignment='top',
-            horizontalalignment='right', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-
-plt.tight_layout()
-save_path = f"{OUTPUT_DIR}/token_attention_examples.png"
-plt.savefig(save_path, dpi=300, bbox_inches='tight')
-print(f"✓ Saved: {save_path}")
-plt.show()
+    print(f"   Top tokens: {', '.join(top_words)}")
 
 # ============================================================================
-# ANALYSIS 3: Summary Statistics
+# COMPARE: What words do HONEST vs DECEPTIVE attend to?
 # ============================================================================
-print("\n" + "="*60)
-print("📊 SUMMARY: Mechanistic Insights")
-print("="*60)
+print("\n" + "="*80)
+print("HONEST vs DECEPTIVE: TOP ATTENDED WORDS COMPARISON")
+print("="*80)
 
-print(f"""
-ATTENTION CONCENTRATION:
-- {np.mean([c['concentration_80'] for c in concentration_scores]):.1%} of tokens capture 80% of attention
-- This means the probe focuses on ~{int(np.mean([c['concentration_80'] for c in concentration_scores]) * len(weights))} tokens out of {len(weights)}
-- Honest samples: {np.mean(honest_conc):.1%} concentration
-- Deceptive samples: {np.mean(deceptive_conc):.1%} concentration
+honest_top_words = []
+deceptive_top_words = []
 
-INTERPRETATION:
-""")
+for result in results:
+    for idx in result['top_5_idx'][:3]:
+        if idx < len(result['tokens']):
+            word = result['tokens'][idx].replace('▁', ' ').replace('Ġ', ' ').strip().lower()
+            if word and len(word) > 1:
+                if result['label'] == 'HONEST':
+                    honest_top_words.append(word)
+                else:
+                    deceptive_top_words.append(word)
 
-if np.mean(deceptive_conc) > np.mean(honest_conc):
-    print("→ Deceptive samples require MORE tokens to detect (more diffuse signal)")
-    print("→ Honest samples have a clearer, more concentrated signature")
-else:
-    print("→ Honest samples require MORE tokens to detect (more diffuse signal)")
-    print("→ Deceptive samples have a clearer, more concentrated signature")
+print(f"\n🟢 HONEST top words: {', '.join(set(honest_top_words))}")
+print(f"🔴 DECEPTIVE top words: {', '.join(set(deceptive_top_words))}")
 
-print(f"""
-TOP ATTENDED POSITIONS: {top_positions[:5].tolist()}
-- These correspond to LATE tokens in the response
-- Likely where the model states its action/decision
-- "I will execute the trade" vs "I refuse to act on insider info"
+# Find overlapping words
+common = set(honest_top_words) & set(deceptive_top_words)
+if common:
+    print(f"\n⚪ Common to both: {', '.join(common)}")
+    print("   → Probe focuses on same semantic positions regardless of class!")
 
-WHY THIS MATTERS:
-- Focused attention → probe has learned specific "tell" positions
-- These positions generalize across Roleplaying → Insider Trading
-- The probe is NOT looking at different parts for different classes
-- Instead, it reads the SAME positions but detects different representations
-""")
-
-print("="*60)
-print(f"✅ All plots saved to: {OUTPUT_DIR}/")
-print("="*60)
+print("\n" + "="*80)
+print(f"✅ Visualization saved to: {save_path}")
+print("="*80)
