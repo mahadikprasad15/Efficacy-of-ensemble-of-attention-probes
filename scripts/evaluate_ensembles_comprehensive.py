@@ -94,8 +94,17 @@ ENSEMBLE_COLORS = {
 
 
 class CachedDataset(Dataset):
-    """Load cached activations."""
+    """Load cached activations using manifest.jsonl format."""
     def __init__(self, activations_dir: str):
+        # Load manifest first (contains IDs and labels)
+        manifest_path = os.path.join(activations_dir, "manifest.jsonl")
+        if not os.path.exists(manifest_path):
+            raise ValueError(f"No manifest.jsonl found in {activations_dir}")
+        
+        with open(manifest_path, 'r') as f:
+            manifest = [json.loads(line) for line in f]
+        
+        # Load shards
         shard_pattern = os.path.join(activations_dir, "shard_*.safetensors")
         shards = sorted(glob.glob(shard_pattern))
 
@@ -103,15 +112,26 @@ class CachedDataset(Dataset):
             raise ValueError(f"No shards found in {activations_dir}")
 
         print(f"Loading {len(shards)} shard(s)...")
-        self.samples = []
-
+        
+        # Load all tensors from shards
+        all_tensors = {}
         for shard_path in tqdm(shards, desc="Loading"):
             shard_data = load_file(shard_path)
-            for key in shard_data.keys():
-                if key.endswith("_activations"):
-                    label_key = key.replace("_activations", "_label")
-                    if label_key in shard_data:
-                        self.samples.append((shard_data[key], shard_data[label_key].item()))
+            all_tensors.update(shard_data)
+        
+        # Match manifest entries with tensors
+        self.samples = []
+        for entry in manifest:
+            eid = entry['id']
+            label = entry.get('label', -1)
+            
+            # Skip if no valid label
+            if label == -1:
+                continue
+                
+            # Check if tensor exists
+            if eid in all_tensors:
+                self.samples.append((all_tensors[eid], label))
 
         print(f"✓ Loaded {len(self.samples)} samples")
 
