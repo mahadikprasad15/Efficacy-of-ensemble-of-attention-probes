@@ -141,19 +141,50 @@ probe.load_state_dict(torch.load(probe_path, map_location=device))
 probe.eval()
 
 # ============================================================================
-# SELECT 5 HONEST + 5 DECEPTIVE
+# RUN PREDICTIONS AND CLASSIFY AS TP/TN/FP/FN
 # ============================================================================
-honest_samples = [s for s in samples_data if s['label'] == 0][:5]
-deceptive_samples = [s for s in samples_data if s['label'] == 1][:5]
+print("\nRunning predictions on all samples...")
 
-if len(honest_samples) < 5 or len(deceptive_samples) < 5:
-    print(f"⚠️ Not enough samples: {len(honest_samples)} honest, {len(deceptive_samples)} deceptive")
-    # Use whatever we have
-    honest_samples = [s for s in samples_data if s['label'] == 0][:5]
-    deceptive_samples = [s for s in samples_data if s['label'] == 1][:5]
+# Classify each sample
+classified = {'TP': [], 'TN': [], 'FP': [], 'FN': []}
 
-selected_samples = honest_samples + deceptive_samples
-print(f"\n✓ Selected {len(honest_samples)} honest + {len(deceptive_samples)} deceptive samples")
+for sample in tqdm(samples_data, desc="Predicting"):
+    tensor = sample['tensor'].clone().detach().float().unsqueeze(0)  # (1, L, T, D)
+    x_layer = tensor[:, BEST_LAYER, :, :].to(device)  # (1, T, D)
+    
+    with torch.no_grad():
+        logit = probe(x_layer).cpu().item()
+        pred = 1 if logit > 0 else 0  # Predict deceptive if logit > 0
+    
+    gold = sample['label']
+    
+    # Classify
+    if gold == 1 and pred == 1:
+        category = 'TP'  # True Positive: Correctly detected deceptive
+    elif gold == 0 and pred == 0:
+        category = 'TN'  # True Negative: Correctly detected honest
+    elif gold == 0 and pred == 1:
+        category = 'FP'  # False Positive: Honest wrongly flagged
+    else:  # gold == 1 and pred == 0
+        category = 'FN'  # False Negative: Deceptive escaped detection
+    
+    sample['prediction'] = pred
+    sample['category'] = category
+    classified[category].append(sample)
+
+print(f"\n📊 Prediction Results:")
+print(f"   True Positives (correctly detected deceptive): {len(classified['TP'])}")
+print(f"   True Negatives (correctly detected honest): {len(classified['TN'])}")
+print(f"   False Positives (honest wrongly flagged): {len(classified['FP'])}")
+print(f"   False Negatives (deceptive escaped): {len(classified['FN'])}")
+
+# Select samples: 2-3 from each category
+n_per_category = 3
+selected_samples = []
+for cat in ['TP', 'TN', 'FP', 'FN']:
+    selected_samples.extend(classified[cat][:n_per_category])
+
+print(f"\n✓ Selected {len(selected_samples)} samples for visualization")
 
 # ============================================================================
 # GET ATTENTION WEIGHTS FOR EACH SAMPLE
@@ -162,7 +193,7 @@ print("\nExtracting attention weights...")
 
 results = []
 for sample in tqdm(selected_samples):
-    tensor = torch.tensor(sample['tensor']).float().unsqueeze(0)  # (1, L, T, D)
+    tensor = sample['tensor'].clone().detach().float().unsqueeze(0)  # (1, L, T, D)
     x_layer = tensor[:, BEST_LAYER, :, :].to(device)  # (1, T, D)
     
     with torch.no_grad():
@@ -180,9 +211,21 @@ for sample in tqdm(selected_samples):
     while len(tokens) < len(weights):
         tokens.append("[PAD]")
     
+    # Label with category
+    cat = sample['category']
+    label_map = {
+        'TP': '✅ TRUE POSITIVE (Deceptive → Correctly Detected)',
+        'TN': '✅ TRUE NEGATIVE (Honest → Correctly Detected)',
+        'FP': '❌ FALSE POSITIVE (Honest → Wrongly Flagged)',
+        'FN': '❌ FALSE NEGATIVE (Deceptive → Escaped Detection)'
+    }
+    
     results.append({
         'id': sample['id'],
-        'label': 'HONEST' if sample['label'] == 0 else 'DECEPTIVE',
+        'category': cat,
+        'label': label_map[cat],
+        'gold': 'DECEPTIVE' if sample['label'] == 1 else 'HONEST',
+        'pred': 'DECEPTIVE' if sample['prediction'] == 1 else 'HONEST',
         'text': text,
         'tokens': tokens[:len(weights)],
         'weights': weights,
@@ -204,31 +247,37 @@ def create_html_visualization(results, output_path):
     <style>
         body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
         .sample { background: white; padding: 20px; margin: 20px 0; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        .honest { border-left: 5px solid #2ecc71; }
-        .deceptive { border-left: 5px solid #e74c3c; }
-        .label { font-weight: bold; font-size: 18px; margin-bottom: 10px; }
-        .label.honest { color: #2ecc71; }
-        .label.deceptive { color: #e74c3c; }
+        .TP { border-left: 5px solid #27ae60; }
+        .TN { border-left: 5px solid #3498db; }
+        .FP { border-left: 5px solid #e74c3c; }
+        .FN { border-left: 5px solid #f39c12; }
+        .label { font-weight: bold; font-size: 16px; margin-bottom: 5px; }
+        .label.TP { color: #27ae60; }
+        .label.TN { color: #3498db; }
+        .label.FP { color: #e74c3c; }
+        .label.FN { color: #f39c12; }
+        .meta { font-size: 13px; color: #666; margin-bottom: 10px; }
         .text { font-size: 16px; line-height: 2.2; }
         .token { padding: 3px 6px; margin: 2px; border-radius: 4px; display: inline-block; }
         .stats { margin-top: 15px; font-size: 14px; color: #666; background: #f0f0f0; padding: 10px; border-radius: 5px; }
         h1 { text-align: center; color: #333; }
-        .legend { text-align: center; margin-bottom: 20px; }
-        .legend span { padding: 5px 15px; margin: 5px; border-radius: 5px; display: inline-block; }
+        h2 { color: #555; border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-top: 40px; }
+        .legend { text-align: center; margin-bottom: 30px; padding: 15px; background: white; border-radius: 10px; }
+        .legend span { padding: 8px 15px; margin: 5px; border-radius: 5px; display: inline-block; font-weight: bold; }
     </style>
 </head>
 <body>
-    <h1>Attention Weights on Text (Layer 16 ATTN Pooling)</h1>
+    <h1>🔍 Attention Analysis: Correct vs Incorrect Predictions</h1>
     <div class="legend">
-        <span style="background: #ffffcc;">Low Attention</span>
-        <span style="background: #ffeda0;">→</span>
-        <span style="background: #feb24c;">→</span>
-        <span style="background: #f03b20;">High Attention</span>
+        <span style="background: #d4edda; color: #27ae60;">✅ TP: Deceptive Correctly Detected</span>
+        <span style="background: #cce5ff; color: #3498db;">✅ TN: Honest Correctly Detected</span>
+        <span style="background: #f8d7da; color: #e74c3c;">❌ FP: Honest Wrongly Flagged</span>
+        <span style="background: #fff3cd; color: #f39c12;">❌ FN: Deceptive Escaped Detection</span>
     </div>
 """
     
     for result in results:
-        label_class = 'honest' if result['label'] == 'HONEST' else 'deceptive'
+        cat = result['category']
         
         # Build token spans with color
         tokens = result['tokens'][:80]
@@ -265,8 +314,9 @@ def create_html_visualization(results, output_path):
         concentration = sum(sorted(weights, reverse=True)[:5]) / (sum(weights) + 1e-8)
         
         html += f"""
-    <div class="sample {label_class}">
-        <div class="label {label_class}">{result['label']} | ID: {result['id']}</div>
+    <div class="sample {cat}">
+        <div class="label {cat}">{result['label']}</div>
+        <div class="meta">ID: {result['id']} | Gold: {result['gold']} | Pred: {result['pred']}</div>
         <div class="text">{token_html}</div>
         <div class="stats">
             <strong>Top 5 tokens get {concentration*100:.1f}% attention:</strong> {top_tokens}
