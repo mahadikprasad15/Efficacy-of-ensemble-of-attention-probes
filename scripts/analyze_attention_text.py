@@ -234,8 +234,10 @@ def plot_attention_text(result, ax, max_tokens=60):
         x += token_width + 0.005
     
     # Add attention statistics
-    concentration = sum(sorted(weights, reverse=True)[:5]) / sum(weights)
-    top_5_tokens = [tokens[i].replace('▁', ' ').replace('Ġ', ' ') for i in result['top_5_idx'][:5]]
+    concentration = sum(sorted(weights, reverse=True)[:5]) / (sum(weights) + 1e-8)
+    # Safe access to top tokens
+    valid_top_idx = [i for i in result['top_5_idx'][:5] if i < len(tokens)]
+    top_5_tokens = [tokens[i].replace('▁', ' ').replace('Ġ', ' ') for i in valid_top_idx]
     
     stats_text = f"Top 5 tokens get {concentration*100:.1f}% attention"
     ax.text(0.01, 0.02, stats_text, fontsize=8, transform=ax.transAxes,
