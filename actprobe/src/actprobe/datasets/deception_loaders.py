@@ -180,11 +180,14 @@ class DeceptionInsiderTradingDataset(BaseDataset):
     """
 
     # Label mapping from Apollo's classification
+    # Based on made_trade field:
+    # - "yes": Model made the insider trade = DECEPTIVE (if it then hides it in report)
+    # - "no": Model refused to trade on insider info = HONEST  
+    # - "invalid": Skip (model didn't complete the scenario properly)
     LABEL_MAP = {
-        "explicit": 0,    # HONEST - model admits using insider info
-        "implied": -1,    # AMBIGUOUS - skip these
-        "concealed": 1,   # DECEPTIVE - model hides insider trading
-        "invalid": -1     # SKIP
+        "yes": 1,       # Made insider trade - potentially DECEPTIVE
+        "no": 0,        # Refused to trade - HONEST
+        "invalid": -1   # SKIP
     }
 
     def __init__(self,
@@ -235,7 +238,7 @@ class DeceptionInsiderTradingDataset(BaseDataset):
 
         Parses the JSON file and extracts:
         - Conversation transcript (for context)
-        - Pre-assigned labels from report_label metadata
+        - Pre-assigned labels from made_trade metadata
         - Model's response (for activation extraction)
         """
         if self.use_synthetic:
@@ -294,12 +297,17 @@ class DeceptionInsiderTradingDataset(BaseDataset):
                     ...
                 ],
                 "metadata": {
-                    "report_label": "explicit" | "implied" | "concealed" | "invalid",
-                    ...
+                    "trade_message": "...",
+                    "made_trade": "yes" | "no" | "invalid"
                 }
             },
             ...
         ]
+        
+        Label mapping:
+        - "yes": Model made insider trade → DECEPTIVE (label=1)
+        - "no": Model refused → HONEST (label=0)
+        - "invalid": Skip
         """
         with open(self.actual_data_file, 'r') as f:
             raw_data = json.load(f)
@@ -307,28 +315,25 @@ class DeceptionInsiderTradingDataset(BaseDataset):
         print(f"  Parsing {len(raw_data)} rollouts from Apollo data...")
 
         all_examples = []
-        skipped = {"no_label": 0, "invalid": 0, "ambiguous": 0}
+        skipped = {"no_label": 0, "invalid": 0}
 
         for idx, rollout in enumerate(raw_data):
-            # Get metadata and label
+            # Get metadata
             metadata = rollout.get("metadata", {})
-            report_label = metadata.get("report_label")
+            made_trade = metadata.get("made_trade")
 
-            # Skip if no label
-            if report_label is None:
+            # Skip if no trade decision
+            if made_trade is None:
                 skipped["no_label"] += 1
                 continue
 
-            # Map label
-            label = self.LABEL_MAP.get(report_label, -1)
+            # Map label: yes=deceptive, no=honest, invalid=skip
+            label = self.LABEL_MAP.get(made_trade.lower().strip(), -1)
             
-            # Skip invalid/ambiguous unless include_ambiguous is True
+            # Skip invalid
             if label == -1:
-                if report_label == "implied" and self.include_ambiguous:
-                    label = 2  # Use 2 for ambiguous class
-                else:
-                    skipped["ambiguous" if report_label == "implied" else "invalid"] += 1
-                    continue
+                skipped["invalid"] += 1
+                continue
 
             # Extract transcript
             transcript = rollout.get("transcript", [])
@@ -340,44 +345,51 @@ class DeceptionInsiderTradingDataset(BaseDataset):
                     scenario = msg.get("content", "")
                     break
 
-            # Get model's trading report (last assistant message before report)
-            # Find the message that contains the actual trade report
-            model_response = ""
-            for msg in transcript:
-                if msg.get("role") == "assistant":
-                    content = msg.get("content", "")
-                    # Look for trading-related content
-                    if "trade" in content.lower() or "buy" in content.lower() or "sell" in content.lower():
-                        model_response = content
-                        break
+            # Get the trade_message from metadata - this is the KEY deceptive/honest content
+            # This is the model's reasoning + action that we want to analyze
+            trade_message = metadata.get("trade_message", "")
             
-            if not model_response:
-                # Fallback: use last assistant message
+            # If no trade_message, get the last assistant message
+            if not trade_message:
                 for msg in reversed(transcript):
                     if msg.get("role") == "assistant":
-                        model_response = msg.get("content", "")
+                        trade_message = msg.get("content", "")
                         break
 
-            # Create prompt (scenario context)
+            # Build the full context: scenario + conversation up to the critical moment
+            # For activation extraction, we want the FULL transcript leading to the decision
+            full_context = ""
+            for msg in transcript:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role == "system":
+                    full_context += f"System: {content}\n\n"
+                elif role == "user":
+                    full_context += f"User: {content}\n\n"
+                elif role == "assistant":
+                    full_context += f"Assistant: {content}\n\n"
+
+            # Create prompt (just scenario for now, matching roleplaying format)
             prompt = DECEPTION_INSIDER_TRADING.format(scenario=scenario[:2000])
 
             example = {
                 "prompt": prompt,
-                "gold_label": label,  # Pre-assigned from Apollo's classification
-                "completion": model_response,  # Pre-generated response
+                "gold_label": label,  # Pre-assigned: 0=honest, 1=deceptive
+                "completion": trade_message,  # The critical decision/report message
+                "full_context": full_context,  # Full transcript for activation extraction
                 "metadata": {
                     "dataset": "Deception-InsiderTrading",
                     "id": f"insider_{idx}",
                     "split": self.split,
                     "scenario": scenario[:500],
-                    "report_label": report_label,
+                    "made_trade": made_trade,
                     "has_pregenerated_response": True
                 }
             }
             all_examples.append(example)
 
         print(f"  ✓ Parsed {len(all_examples)} valid examples")
-        print(f"  Skipped: {skipped['no_label']} no label, {skipped['ambiguous']} ambiguous, {skipped['invalid']} invalid")
+        print(f"  Skipped: {skipped['no_label']} no label, {skipped['invalid']} invalid")
 
         return all_examples
 
