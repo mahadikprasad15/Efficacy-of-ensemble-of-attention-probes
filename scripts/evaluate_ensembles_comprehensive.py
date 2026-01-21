@@ -181,7 +181,7 @@ def extract_logits_from_probes(
 
         with torch.no_grad():
             for x, y in dataloader:
-                x = x.to(device)
+                x = x.to(device).float()  # Convert to float32 (probes expect float32)
                 x_layer = x[:, layer_idx, :, :]
                 logits = probe(x_layer).cpu().numpy().flatten()
                 layer_logits.extend(logits)
