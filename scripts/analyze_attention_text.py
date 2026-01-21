@@ -431,5 +431,6 @@ if common:
     print("   → Probe focuses on same semantic positions regardless of class!")
 
 print("\n" + "="*80)
-print(f"✅ Visualization saved to: {save_path}")
+print(f"✅ Saved: {html_path}")
+print(f"✅ Saved: {png_path}")
 print("="*80)
