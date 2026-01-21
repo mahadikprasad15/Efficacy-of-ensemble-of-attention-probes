@@ -62,18 +62,36 @@ try:
     with open(APOLLO_DATA, 'r') as f:
         apollo_data = json.load(f)
     
-    for item in apollo_data:
-        # Extract the trade_message (model's response)
-        if 'metadata' in item and 'trade_message' in item['metadata']:
-            scenario_id = item.get('scenario_id', item.get('id', ''))
-            trade_msg = item['metadata']['trade_message']
-            made_trade = item['metadata'].get('made_trade', '')
-            
-            apollo_texts[scenario_id] = {
-                'text': trade_msg,
+    # IDs are formatted as "insider_{idx}" based on array index
+    for idx, item in enumerate(apollo_data):
+        item_id = f"insider_{idx}"
+        
+        # Get metadata
+        metadata = item.get('metadata', {})
+        
+        # Extract trade_message (the key deceptive/honest content)
+        trade_message = metadata.get('trade_message', '')
+        
+        # If no trade_message, get last assistant message
+        if not trade_message:
+            transcript = item.get('transcript', [])
+            for msg in reversed(transcript):
+                if msg.get('role') == 'assistant':
+                    trade_message = msg.get('content', '')
+                    break
+        
+        made_trade = metadata.get('made_trade', '')
+        
+        if trade_message:
+            apollo_texts[item_id] = {
+                'text': trade_message,
                 'made_trade': made_trade
             }
+    
     print(f"✓ Loaded {len(apollo_texts)} Apollo texts")
+    # Show sample IDs
+    sample_ids = list(apollo_texts.keys())[:5]
+    print(f"  Sample IDs: {sample_ids}")
 except Exception as e:
     print(f"⚠️ Could not load Apollo data: {e}")
     apollo_texts = {}
