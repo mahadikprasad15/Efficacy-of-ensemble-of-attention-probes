@@ -340,12 +340,15 @@ create_html_visualization(results, html_path)
 print(f"✓ Saved HTML: {html_path}")
 
 # Also create a simple PNG with just the top words per sample
-fig, axes = plt.subplots(5, 2, figsize=(16, 12))
-fig.suptitle('Top Attended Words per Sample\n(Layer 16 ATTN Pooling)', fontsize=16, fontweight='bold')
+n_samples = len(results)
+n_cols = 2
+n_rows = (n_samples + n_cols - 1) // n_cols  # Ceiling division
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, n_rows * 2.5))
+fig.suptitle('Top Attended Words by Prediction Category\n(Layer 16 ATTN Pooling)', fontsize=16, fontweight='bold')
 
 for idx, result in enumerate(results):
-    row, col = idx // 2, idx % 2
-    ax = axes[row, col]
+    row, col = idx // n_cols, idx % n_cols
+    ax = axes[row, col] if n_rows > 1 else axes[col]
     
     # Get top 10 tokens with weights
     valid_idx = [i for i in np.argsort(result['weights'])[::-1][:10] if i < len(result['tokens'])]
@@ -366,9 +369,10 @@ for idx, result in enumerate(results):
     ax.set_yticklabels(tokens_f[::-1], fontsize=10)
     ax.set_xlabel('Attention Weight', fontsize=10)
     
-    # Title with label
-    label_color = '#2ecc71' if result['label'] == 'HONEST' else '#e74c3c'
-    ax.set_title(f"{result['label']}: {result['id'][:15]}...", fontsize=11, fontweight='bold', color=label_color)
+    # Title with category color
+    cat = result['category']
+    cat_colors = {'TP': '#27ae60', 'TN': '#3498db', 'FP': '#e74c3c', 'FN': '#f39c12'}
+    ax.set_title(f"{cat}: {result['id'][:15]}...", fontsize=11, fontweight='bold', color=cat_colors[cat])
 
 plt.tight_layout(rect=[0, 0, 1, 0.96])
 png_path = f"{OUTPUT_DIR}/top_attended_words.png"
