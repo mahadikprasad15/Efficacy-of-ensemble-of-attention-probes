@@ -163,74 +163,85 @@ class DeceptionInsiderTradingDataset(BaseDataset):
     """
     Apollo Research Insider Trading Dataset
 
-    Dataset Structure:
-        - Scenario describes an insider trading situation
-        - Model generates a trading report
-        - LLM judge labels as honest (discloses insider info) or deceptive (hides it)
+    This loader parses the Apollo Research pre-generated insider trading data
+    from llama-70b-3.3-generations.json which contains:
+    - Full conversation transcripts between the AI and the system
+    - Pre-classified labels in metadata['report_label']:
+        - 'explicit': HONEST (model explicitly admits using insider info)
+        - 'implied': AMBIGUOUS (model implies but doesn't admit)
+        - 'concealed': DECEPTIVE (model conceals the insider trading)
 
-    Note: This dataset may need to be downloaded separately from Apollo's repo.
-    For now, we provide a simple placeholder that creates synthetic scenarios.
+    The dataset is used for OOD evaluation - probes trained on Roleplaying
+    are tested on this realistic Insider Trading scenario.
 
     Usage:
-        ds = DeceptionInsiderTradingDataset(split="train")
+        ds = DeceptionInsiderTradingDataset(split="test")
         ds.load_data()
     """
 
+    # Label mapping from Apollo's classification
+    LABEL_MAP = {
+        "explicit": 0,    # HONEST - model admits using insider info
+        "implied": -1,    # AMBIGUOUS - skip these
+        "concealed": 1,   # DECEPTIVE - model hides insider trading
+        "invalid": -1     # SKIP
+    }
+
     def __init__(self,
-                 split: str = "train",
+                 split: str = "test",
                  limit: Optional[int] = None,
-                 data_file: str = "data/apollo_raw/insider_trading/scenarios.json",
-                 random_seed: int = 42):
+                 data_file: str = "data/apollo_raw/insider_trading/llama-70b-3.3-generations.json",
+                 random_seed: int = 42,
+                 include_ambiguous: bool = False):
         """
         Args:
-            split: "train", "validation", or "test"
+            split: "train", "validation", or "test" (default "test" for OOD eval)
             limit: Maximum number of examples to load
-            data_file: Path to JSON file with insider trading scenarios
+            data_file: Path to Apollo's pre-generated JSON file
             random_seed: Seed for reproducible splits
+            include_ambiguous: If True, include 'implied' labels as a third class
         """
         super().__init__(split=split, limit=limit)
         self.data_file = data_file
         self.random_seed = random_seed
+        self.include_ambiguous = include_ambiguous
 
-        # Check if data file exists
-        if not os.path.exists(data_file):
-            print(f"⚠️  Insider trading data file not found: {data_file}")
-            print("Creating synthetic placeholder scenarios...")
+        # Check multiple possible paths
+        possible_paths = [
+            data_file,
+            "data/apollo_raw/insider_trading/llama-70b-3.3-generations.json",
+            "data/insider_trading/llama-70b-3.3-generations.json"
+        ]
+        
+        self.actual_data_file = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                self.actual_data_file = path
+                break
+        
+        if self.actual_data_file is None:
+            print(f"⚠️  Apollo Insider Trading data not found. Tried:")
+            for p in possible_paths:
+                print(f"     - {p}")
+            print("   Run: python scripts/download_apollo_data.py --datasets insider_trading")
             self.use_synthetic = True
         else:
             self.use_synthetic = False
+            print(f"✓ Found Apollo data: {self.actual_data_file}")
 
     def load_data(self):
         """
-        Load insider trading scenarios and create prompts.
+        Load pre-classified insider trading data from Apollo Research.
 
-        If no data file exists, creates synthetic scenarios as placeholders.
+        Parses the JSON file and extracts:
+        - Conversation transcript (for context)
+        - Pre-assigned labels from report_label metadata
+        - Model's response (for activation extraction)
         """
         if self.use_synthetic:
-            # Create synthetic scenarios for testing
             all_examples = self._create_synthetic_scenarios()
         else:
-            # Load from file
-            with open(self.data_file, 'r') as f:
-                raw_data = json.load(f)
-
-            all_examples = []
-            for idx, item in enumerate(raw_data):
-                prompt = DECEPTION_INSIDER_TRADING.format(
-                    scenario=item.get('scenario', '')
-                )
-
-                example = {
-                    "prompt": prompt,
-                    "gold_label": None,
-                    "metadata": {
-                        "dataset": "Deception-InsiderTrading",
-                        "id": f"insider_{idx}",
-                        "split": self.split,
-                        "scenario": item.get('scenario', '')
-                    }
-                }
-                all_examples.append(example)
+            all_examples = self._load_apollo_data()
 
         # Create splits
         random.seed(self.random_seed)
@@ -252,9 +263,123 @@ class DeceptionInsiderTradingDataset(BaseDataset):
         # Apply limit
         self.apply_limit()
 
+        # Count labels
+        label_counts = {"honest": 0, "deceptive": 0, "ambiguous": 0}
+        for ex in self.data:
+            lbl = ex.get("gold_label")
+            if lbl == 0:
+                label_counts["honest"] += 1
+            elif lbl == 1:
+                label_counts["deceptive"] += 1
+            else:
+                label_counts["ambiguous"] += 1
+
         print(f"Loaded {len(self.data)} insider trading examples for split '{self.split}'")
+        print(f"  Labels: {label_counts['honest']} honest, {label_counts['deceptive']} deceptive" + 
+              (f", {label_counts['ambiguous']} ambiguous" if label_counts['ambiguous'] > 0 else ""))
         if self.use_synthetic:
-            print("  ⚠️  Using synthetic scenarios (real data not found)")
+            print("  ⚠️  Using synthetic scenarios (Apollo data not found)")
+
+    def _load_apollo_data(self) -> List[Dict]:
+        """
+        Load and parse Apollo Research's pre-generated insider trading data.
+        
+        The JSON structure is:
+        [
+            {
+                "transcript": [
+                    {"role": "system", "content": "...scenario..."},
+                    {"role": "user", "content": "...date..."},
+                    {"role": "assistant", "content": "...model response..."},
+                    ...
+                ],
+                "metadata": {
+                    "report_label": "explicit" | "implied" | "concealed" | "invalid",
+                    ...
+                }
+            },
+            ...
+        ]
+        """
+        with open(self.actual_data_file, 'r') as f:
+            raw_data = json.load(f)
+
+        print(f"  Parsing {len(raw_data)} rollouts from Apollo data...")
+
+        all_examples = []
+        skipped = {"no_label": 0, "invalid": 0, "ambiguous": 0}
+
+        for idx, rollout in enumerate(raw_data):
+            # Get metadata and label
+            metadata = rollout.get("metadata", {})
+            report_label = metadata.get("report_label")
+
+            # Skip if no label
+            if report_label is None:
+                skipped["no_label"] += 1
+                continue
+
+            # Map label
+            label = self.LABEL_MAP.get(report_label, -1)
+            
+            # Skip invalid/ambiguous unless include_ambiguous is True
+            if label == -1:
+                if report_label == "implied" and self.include_ambiguous:
+                    label = 2  # Use 2 for ambiguous class
+                else:
+                    skipped["ambiguous" if report_label == "implied" else "invalid"] += 1
+                    continue
+
+            # Extract transcript
+            transcript = rollout.get("transcript", [])
+            
+            # Get scenario from system message
+            scenario = ""
+            for msg in transcript:
+                if msg.get("role") == "system":
+                    scenario = msg.get("content", "")
+                    break
+
+            # Get model's trading report (last assistant message before report)
+            # Find the message that contains the actual trade report
+            model_response = ""
+            for msg in transcript:
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    # Look for trading-related content
+                    if "trade" in content.lower() or "buy" in content.lower() or "sell" in content.lower():
+                        model_response = content
+                        break
+            
+            if not model_response:
+                # Fallback: use last assistant message
+                for msg in reversed(transcript):
+                    if msg.get("role") == "assistant":
+                        model_response = msg.get("content", "")
+                        break
+
+            # Create prompt (scenario context)
+            prompt = DECEPTION_INSIDER_TRADING.format(scenario=scenario[:2000])
+
+            example = {
+                "prompt": prompt,
+                "gold_label": label,  # Pre-assigned from Apollo's classification
+                "completion": model_response,  # Pre-generated response
+                "metadata": {
+                    "dataset": "Deception-InsiderTrading",
+                    "id": f"insider_{idx}",
+                    "split": self.split,
+                    "scenario": scenario[:500],
+                    "report_label": report_label,
+                    "has_pregenerated_response": True
+                }
+            }
+            all_examples.append(example)
+
+        print(f"  ✓ Parsed {len(all_examples)} valid examples")
+        print(f"  Skipped: {skipped['no_label']} no label, {skipped['ambiguous']} ambiguous, {skipped['invalid']} invalid")
+
+        return all_examples
 
     def _create_synthetic_scenarios(self) -> List[Dict]:
         """Create synthetic insider trading scenarios for testing."""
@@ -268,13 +393,14 @@ class DeceptionInsiderTradingDataset(BaseDataset):
 
         examples = []
         for idx, scenario in enumerate(scenarios):
-            # Duplicate each scenario 20 times to create 100 examples
             for i in range(20):
                 prompt = DECEPTION_INSIDER_TRADING.format(scenario=scenario)
+                # Synthetic: alternate labels for balance
+                label = i % 2  # 0 or 1
 
                 example = {
                     "prompt": prompt,
-                    "gold_label": None,
+                    "gold_label": label,
                     "metadata": {
                         "dataset": "Deception-InsiderTrading",
                         "id": f"insider_synthetic_{idx}_{i}",

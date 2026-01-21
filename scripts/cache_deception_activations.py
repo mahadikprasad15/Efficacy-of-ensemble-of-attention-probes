@@ -336,6 +336,13 @@ def main():
         help="Force regeneration even if activations already exist"
     )
 
+    # Use pre-generated responses (for datasets like Apollo Insider Trading)
+    parser.add_argument(
+        "--use_pregenerated",
+        action="store_true",
+        help="Use pre-generated responses from the dataset (skips model generation & labeling)"
+    )
+
     args = parser.parse_args()
 
     logger.info(f"{'='*70}")
@@ -358,7 +365,22 @@ def main():
     DSClass = DATASET_MAP[args.dataset]
     ds = DSClass(split=args.split, limit=args.limit)
     ds.load_data()
-    logger.info(f"✓ Loaded {len(ds)} examples (prompts only, no labels yet)\n")
+    
+    # Check if dataset has pre-generated responses (auto-detect or use flag)
+    has_pregenerated = False
+    if len(ds) > 0:
+        first_item = ds[0]
+        if first_item.get('metadata', {}).get('has_pregenerated_response', False):
+            has_pregenerated = True
+            logger.info("  📌 Detected pre-generated responses with labels in dataset")
+    
+    if args.use_pregenerated or has_pregenerated:
+        args.use_pregenerated = True
+        logger.info(f"✓ Loaded {len(ds)} examples WITH pre-generated responses & labels\n")
+        logger.info("  ℹ️  Skipping model generation & Cerebras labeling")
+        logger.info("  ℹ️  Using Apollo Research's pre-classified labels")
+    else:
+        logger.info(f"✓ Loaded {len(ds)} examples (prompts only, no labels yet)\n")
 
     # ========================================================================
     # 2. Setup Generation Model
@@ -369,24 +391,28 @@ def main():
     logger.info(f"✓ Model loaded\n")
 
     # ========================================================================
-    # 3. Setup Labeling Model (Cerebras)
+    # 3. Setup Labeling Model (Cerebras) - Skip if using pre-generated
     # ========================================================================
 
-    logger.info(f"[3/6] Initializing Cerebras labeler ({args.labeling_model})...")
-    try:
-        cerebras_gen = CerebrasGenerator(
-            model_name=args.labeling_model,
-            api_key=args.cerebras_api_key
-        )
-        labeler = DeceptionLabeler(
-            cerebras_gen,
-            requests_per_minute=args.requests_per_minute
-        )
-        logger.info(f"✓ Labeler initialized (rate limit: {args.requests_per_minute} req/min)\n")
-    except Exception as e:
-        logger.error(f"Failed to initialize Cerebras: {e}")
-        logger.error("Make sure CEREBRAS_API_KEY is set")
-        return 1
+    labeler = None
+    if not args.use_pregenerated:
+        logger.info(f"[3/6] Initializing Cerebras labeler ({args.labeling_model})...")
+        try:
+            cerebras_gen = CerebrasGenerator(
+                model_name=args.labeling_model,
+                api_key=args.cerebras_api_key
+            )
+            labeler = DeceptionLabeler(
+                cerebras_gen,
+                requests_per_minute=args.requests_per_minute
+            )
+            logger.info(f"✓ Labeler initialized (rate limit: {args.requests_per_minute} req/min)\n")
+        except Exception as e:
+            logger.error(f"Failed to initialize Cerebras: {e}")
+            logger.error("Make sure CEREBRAS_API_KEY is set")
+            return 1
+    else:
+        logger.info(f"[3/6] Skipping Cerebras labeler (using pre-generated labels)\n")
 
     # ========================================================================
     # 4. Prepare Output Directory
@@ -453,28 +479,67 @@ def main():
         if len(batch_prompts) == args.batch_size or i == len(ds) - 1:
             try:
                 # ============================================================
-                # STEP A: Generate completions + extract activations
+                # MODE A: Pre-generated responses (Apollo Insider Trading)
                 # ============================================================
-
-                completions, raw_activations = runner.generate_and_get_activations(
-                    batch_prompts,
-                    max_new_tokens=args.max_new_tokens
-                )
+                if args.use_pregenerated:
+                    # Use pre-generated completions and labels from dataset
+                    completions = []
+                    labels_from_dataset = []
+                    
+                    for bi in batch_items:
+                        # Get pre-generated completion
+                        completion = bi.get('completion', '')
+                        if not completion:
+                            # Fallback: just use prompt continuation
+                            completion = "..."
+                        completions.append(completion)
+                        
+                        # Get pre-assigned label
+                        label = bi.get('gold_label', -1)
+                        labels_from_dataset.append(label)
+                    
+                    # Extract activations for the pre-generated completions
+                    # We need to encode the full text (prompt + completion) and extract
+                    full_texts = [p + c for p, c in zip(batch_prompts, completions)]
+                    
+                    # Calculate prompt end indices for slicing
+                    prompt_end_indices = []
+                    for prompt in batch_prompts:
+                        prompt_tokens = runner.tokenizer(prompt, return_tensors="pt").input_ids
+                        prompt_end_indices.append(prompt_tokens.shape[1])
+                    
+                    # Get activations, slicing to only completion tokens
+                    raw_activations = runner.get_activations(full_texts, prompt_end_indices=prompt_end_indices)
+                    
+                    # Create labeled items (no Cerebras needed)
+                    labeled_items = []
+                    for j, (completion, label) in enumerate(zip(completions, labels_from_dataset)):
+                        labeled_items.append({
+                            'completion': completion,
+                            'label': label,
+                            'metadata': batch_items[j]['metadata']
+                        })
 
                 # ============================================================
-                # STEP B: Label completions using Cerebras LLM judge
+                # MODE B: Generate new completions + label with Cerebras
                 # ============================================================
+                else:
+                    # STEP A: Generate completions + extract activations
+                    completions, raw_activations = runner.generate_and_get_activations(
+                        batch_prompts,
+                        max_new_tokens=args.max_new_tokens
+                    )
 
-                # Prepare items for labeling
-                items_to_label = []
-                for j, completion in enumerate(completions):
-                    items_to_label.append({
-                        'completion': completion,
-                        'metadata': batch_items[j]['metadata']
-                    })
+                    # STEP B: Label completions using Cerebras LLM judge
+                    items_to_label = []
+                    for j, completion in enumerate(completions):
+                        items_to_label.append({
+                            'completion': completion,
+                            'metadata': batch_items[j]['metadata']
+                        })
 
-                # Label with rate limiting
-                labeled_items = labeler.label_batch(items_to_label)
+                    # Label with rate limiting
+                    labeled_items = labeler.label_batch(items_to_label)
 
                 # ============================================================
                 # STEP C: Process each example (resample, save)
@@ -488,7 +553,7 @@ def main():
                     if label == -1:
                         logger.warning(
                             f"Skipping {batch_items[j]['metadata']['id']}: "
-                            f"labeling failed"
+                            f"labeling failed or ambiguous"
                         )
                         label_stats["unknown"] += 1
                         continue
