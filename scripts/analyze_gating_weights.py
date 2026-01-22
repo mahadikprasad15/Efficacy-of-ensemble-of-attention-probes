@@ -34,12 +34,9 @@ print(f"Device: {device}")
 # ARGUMENT PARSING
 # ============================================================================
 parser = argparse.ArgumentParser(description='Gating Weight Analysis')
-parser.add_argument('--id_logits', type=str, 
-                    default='results/ensembles/attn/val_logits.npy',
-                    help='Path to ID (validation) logits')
-parser.add_argument('--id_labels', type=str,
-                    default='results/ensembles/attn/val_labels.npy',
-                    help='Path to ID labels')
+parser.add_argument('--id_activations', type=str, 
+                    default='data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation',
+                    help='Path to ID (validation) activations')
 parser.add_argument('--ood_logits', type=str,
                     default='results/ood_evaluation/logits/attn_logits.npy',
                     help='Path to OOD logits')
@@ -57,6 +54,76 @@ parser.add_argument('--output_dir', type=str,
 args = parser.parse_args()
 
 os.makedirs(args.output_dir, exist_ok=True)
+
+# ============================================================================
+# HELPER: Extract logits from activations
+# ============================================================================
+def extract_logits_from_activations(activations_dir, probes_dir, device):
+    """Load activations and run probes to extract logits."""
+    manifest_path = os.path.join(activations_dir, "manifest.jsonl")
+    if not os.path.exists(manifest_path):
+        print(f"⚠️ Manifest not found: {manifest_path}")
+        return None, None
+    
+    # Load manifest
+    with open(manifest_path, 'r') as f:
+        manifest = [json.loads(line) for line in f]
+    
+    # Load shards
+    shard_files = sorted(glob.glob(os.path.join(activations_dir, "shard_*.safetensors")))
+    all_tensors = {}
+    for shard in shard_files:
+        all_tensors.update(load_file(shard))
+    
+    # Get samples and labels
+    samples, labels = [], []
+    for entry in manifest:
+        eid = entry['id']
+        if eid in all_tensors:
+            samples.append(all_tensors[eid])
+            labels.append(entry['label'])
+    
+    print(f"✓ Loaded {len(samples)} samples from {activations_dir}")
+    
+    # Find probes and extract dimensions
+    probe_files = sorted(glob.glob(os.path.join(probes_dir, "probe_layer_*.pt")))
+    if not probe_files:
+        print(f"⚠️ No probes found in {probes_dir}")
+        return None, None
+    
+    D = samples[0].shape[-1]
+    num_layers = 28
+    
+    # Load all probes
+    probes = {}
+    for pf in probe_files:
+        layer_idx = int(pf.split('_')[-1].replace('.pt', ''))
+        probe = LayerProbe(input_dim=D, pooling_type="attn").to(device)
+        probe.load_state_dict(torch.load(pf, map_location=device))
+        probe.eval()
+        probes[layer_idx] = probe
+    
+    # Extract logits for all layers
+    all_logits = []
+    for sample in tqdm(samples, desc="Extracting logits"):
+        if isinstance(sample, torch.Tensor):
+            tensor = sample.clone().detach().float().unsqueeze(0)
+        else:
+            tensor = torch.from_numpy(np.array(sample)).float().unsqueeze(0)
+        
+        layer_logits = []
+        for layer_idx in range(num_layers):
+            if layer_idx in probes:
+                x_layer = tensor[:, layer_idx, :, :].to(device)
+                with torch.no_grad():
+                    logit = probes[layer_idx](x_layer).cpu().item()
+            else:
+                logit = 0.0
+            layer_logits.append(logit)
+        
+        all_logits.append(layer_logits)
+    
+    return np.array(all_logits), np.array(labels)
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -123,21 +190,7 @@ print("\n" + "="*60)
 print("STEP 1: Load data")
 print("="*60)
 
-# Load ID data
-if os.path.exists(args.id_logits) and os.path.exists(args.id_labels):
-    id_logits = np.load(args.id_logits)
-    id_labels = np.load(args.id_labels)
-    print(f"✓ ID data: {id_logits.shape}")
-else:
-    print("⚠️ ID logits not found, will compute from activations if needed")
-    id_logits = None
-
-# Load OOD data
-ood_logits = np.load(args.ood_logits)
-ood_labels = np.load(args.ood_labels)
-print(f"✓ OOD data: {ood_logits.shape}")
-
-# Load layer selection
+# Load layer selection first (needed for both ID and OOD)
 with open(f"{args.probes_dir}/layer_results.json", 'r') as f:
     layer_results = json.load(f)
 num_layers = 28
@@ -146,10 +199,22 @@ sorted_layers = sorted(layer_results, key=lambda x: x['val_auc'], reverse=True)
 selected_layers = sorted([l['layer'] for l in sorted_layers[:k_layers]])
 print(f"K = {args.k_pct}% → {k_layers} layers: {selected_layers}")
 
-# Select only K layers
-ood_logits_k = ood_logits[:, selected_layers]
+# Load/Extract ID data from activations
+print("\n📊 Extracting ID logits from activations...")
+id_logits, id_labels = extract_logits_from_activations(args.id_activations, args.probes_dir, device)
 if id_logits is not None:
     id_logits_k = id_logits[:, selected_layers]
+    print(f"✓ ID logits shape: {id_logits.shape} → K-selected: {id_logits_k.shape}")
+else:
+    id_logits_k = None
+    print("⚠️ Could not load ID data")
+
+# Load OOD data (pre-saved logits)
+print("\n📊 Loading OOD logits...")
+ood_logits = np.load(args.ood_logits)
+ood_labels = np.load(args.ood_labels)
+ood_logits_k = ood_logits[:, selected_layers]
+print(f"✓ OOD logits shape: {ood_logits.shape} → K-selected: {ood_logits_k.shape}")
 
 # ============================================================================
 # STEP 2: TRAIN ON ID, EVALUATE ON ID
