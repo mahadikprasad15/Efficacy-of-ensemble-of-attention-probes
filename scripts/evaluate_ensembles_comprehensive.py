@@ -334,6 +334,50 @@ def train_and_evaluate_gated(
     return auc, acc
 
 
+def evaluate_gated_pretrained(
+    test_logits: np.ndarray,
+    test_labels: np.ndarray,
+    num_layers: int,
+    device: torch.device,
+    model_path: str
+) -> Tuple[float, float]:
+    """
+    Evaluate GatedEnsemble using a PRE-TRAINED model (no retraining).
+    
+    This ensures fair OOD evaluation by using gating weights learned from
+    validation data only, not from OOD data.
+    
+    Args:
+        test_logits: (N, K) logits from per-layer probes
+        test_labels: (N,) ground truth labels
+        num_layers: Number of layers (K)
+        device: Torch device
+        model_path: Path to saved gated model checkpoint
+    
+    Returns:
+        (auc, accuracy)
+    """
+    if not os.path.exists(model_path):
+        print(f"  ⚠️ No pretrained gated model at {model_path}, skipping")
+        return 0.5, 0.5
+    
+    # Load pretrained model
+    ensemble = GatedEnsemble(input_dim=num_layers, num_layers=num_layers).to(device)
+    ensemble.load_state_dict(torch.load(model_path, map_location=device))
+    ensemble.eval()
+    
+    # Evaluate WITHOUT retraining
+    with torch.no_grad():
+        test_logits_tensor = torch.tensor(test_logits, dtype=torch.float32).to(device)
+        ensemble_logits = ensemble(test_logits_tensor, test_logits_tensor.unsqueeze(-1)).cpu().numpy().flatten()
+
+    probs = 1 / (1 + np.exp(-ensemble_logits))
+    auc = roc_auc_score(test_labels, probs)
+    acc = accuracy_score(test_labels, (probs > 0.5).astype(int))
+
+    return auc, acc
+
+
 def evaluate_k_sweep(
     logits: np.ndarray,
     labels: np.ndarray,
@@ -391,6 +435,67 @@ def evaluate_k_sweep(
             num_layers=len(selected_layers),
             device=device,
             save_path=gated_save_path
+        )
+
+        results.append({
+            'k_pct': k_pct,
+            'num_layers': len(selected_layers),
+            'selected_layers': selected_layers,
+            'mean': {'auc': float(auc_mean), 'acc': float(acc_mean)},
+            'weighted': {'auc': float(auc_weighted), 'acc': float(acc_weighted)},
+            'gated': {'auc': float(auc_gated), 'acc': float(acc_gated)}
+        })
+
+    return results
+
+
+def evaluate_k_sweep_ood(
+    logits: np.ndarray,
+    labels: np.ndarray,
+    layer_results: List[Dict],
+    k_values: List[int],
+    device: torch.device,
+    pretrained_gated_dir: str
+) -> List[Dict]:
+    """
+    Sweep through K% values and evaluate all ensemble strategies on OOD data.
+    
+    IMPORTANT: For gated ensemble, this uses PRETRAINED models from validation,
+    NOT retraining on OOD data. This ensures fair OOD generalization evaluation.
+    
+    Args:
+        logits: (N, L) logits from all layers on OOD data
+        labels: (N,) OOD labels
+        layer_results: List of per-layer results for selection
+        k_values: List of K% values to try
+        device: torch device
+        pretrained_gated_dir: Directory with validation-trained gated models
+
+    Returns:
+        List of dicts with results for each K%
+    """
+    results = []
+
+    for k_pct in tqdm(k_values, desc="K% sweep (OOD - fair)"):
+        # Select top-K layers
+        selected_layers = select_top_k_layers(layer_results, k_pct)
+        logits_k = logits[:, selected_layers]
+
+        # StaticMean (no learning - fair)
+        auc_mean, acc_mean = evaluate_static_mean(logits_k, labels)
+
+        # StaticWeighted (weights from validation AUCs - fair)
+        auc_weighted, acc_weighted = evaluate_static_weighted(
+            logits_k, labels, layer_results, selected_layers
+        )
+
+        # Gated (use PRETRAINED model from validation - fair)
+        pretrained_path = os.path.join(pretrained_gated_dir, f"gated_k{k_pct}.pt")
+        auc_gated, acc_gated = evaluate_gated_pretrained(
+            logits_k, labels,
+            num_layers=len(selected_layers),
+            device=device,
+            model_path=pretrained_path
         )
 
         results.append({
@@ -638,11 +743,19 @@ def main():
         ood_labels = np.load(args.ood_labels_path)
         print(f"✓ Loaded OOD data: {ood_logits.shape}")
 
-        print("\nRunning K% sweep on OOD...")
-        ood_results = evaluate_k_sweep(
+        # Check for pretrained gated models from validation
+        pretrained_gated_dir = os.path.join(args.output_dir, "gated_models_val")
+        if not os.path.exists(pretrained_gated_dir):
+            print(f"⚠️ No pretrained gated models found at {pretrained_gated_dir}")
+            print("   Please run validation evaluation first (--eval_mode validation)")
+            print("   to train gated models before OOD evaluation.")
+            return 1
+
+        print("\n🎯 Running FAIR K% sweep on OOD...")
+        print("   (Using gated models trained on validation data only)")
+        ood_results = evaluate_k_sweep_ood(
             ood_logits, ood_labels, layer_results, k_values, device,
-            gated_save_dir=os.path.join(args.output_dir, "gated_models_ood"),
-            eval_name="OOD"
+            pretrained_gated_dir=pretrained_gated_dir
         )
 
         # Save results
