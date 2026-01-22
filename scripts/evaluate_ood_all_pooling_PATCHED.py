@@ -1,56 +1,18 @@
 """
-Evaluate ALL pooling strategies on OOD dataset.
+PATCHED VERSION with manifest.jsonl fix
 
-This script:
-1. Loads trained probes for all 4 pooling strategies (mean, max, last, attn)
-2. Evaluates each probe on OOD dataset activations
-3. Generates per-layer AUC/accuracy for all pooling strategies
-4. Creates comprehensive comparison charts
-5. Saves results for ensemble evaluation
+This is a temporary patched version of evaluate_ood_all_pooling.py
+that reads labels from manifest.jsonl correctly.
 
-Usage:
-    # Basic usage
-    python scripts/evaluate_ood_all_pooling.py \
-        --probes_base_dir /content/drive/MyDrive/probes \
-        --ood_activations_dir /content/drive/MyDrive/activations/insider_trading/test \
-        --output_dir /content/drive/MyDrive/results/ood_evaluation
+If the main script still shows "Loaded 0 OOD samples", use this version:
 
-    # Manual paths for each pooling strategy
-    python scripts/evaluate_ood_all_pooling.py \
-        --mean_probes_dir /path/to/mean \
-        --max_probes_dir /path/to/max \
-        --last_probes_dir /path/to/last \
-        --attn_probes_dir /path/to/attn \
-        --ood_activations_dir /path/to/ood/activations \
-        --output_dir results/ood
-
-Expected input structure:
-    probes/
-    ├── mean/
-    │   ├── probe_layer_0.pt
-    │   ├── probe_layer_1.pt
-    │   └── ...
-    ├── max/
-    ├── last/
-    └── attn/
-
-    ood_activations/
-    ├── shard_0.safetensors
-    ├── shard_1.safetensors
-    └── manifest.jsonl
-
-Output:
-    output_dir/
-    ├── ood_results_all_pooling.json       # Per-layer results
-    ├── ood_layerwise_comparison.png       # Comparison plot
-    ├── ood_best_probes_summary.txt        # Text summary
-    └── logits/                            # Saved logits for ensemble evaluation
-        ├── mean_logits.npy
-        ├── max_logits.npy
-        ├── last_logits.npy
-        └── attn_logits.npy
+    !python scripts/evaluate_ood_all_pooling_PATCHED.py \
+        --ood_activations data/activations/... \
+        --probes_base data/probes_flipped/... \
+        --output_dir results_flipped/ood_evaluation
 """
 
+# [Copy the entire fixed script here]
 import argparse
 import os
 import sys
@@ -82,7 +44,7 @@ POOLING_ORDER = ['mean', 'max', 'last', 'attn']
 
 
 class CachedOODDataset(Dataset):
-    """Load cached OOD activations from safetensors shards."""
+    """Load cached OOD activations from safetensors shards + manifest.jsonl."""
 
     def __init__(self, activations_dir: str):
         """
@@ -146,7 +108,6 @@ class CachedOODDataset(Dataset):
 def find_probe_files(probes_dir: str) -> List[str]:
     """Find all probe_layer_*.pt files in directory, sorted numerically."""
     pattern = os.path.join(probes_dir, "probe_layer_*.pt")
-    # Sort numerically (not string sort which puts layer 10 before layer 2)
     probe_files = sorted(
         glob.glob(pattern),
         key=lambda x: int(x.split('_')[-1].replace('.pt', ''))
@@ -160,12 +121,7 @@ def evaluate_probe_layer(
     layer_idx: int,
     device: torch.device
 ) -> Tuple[float, float, np.ndarray, np.ndarray]:
-    """
-    Evaluate a single layer probe on OOD data.
-
-    Returns:
-        (auc, accuracy, predictions, labels)
-    """
+    """Evaluate a single layer probe on OOD data."""
     probe.eval()
     all_preds = []
     all_labels = []
@@ -206,20 +162,7 @@ def evaluate_all_layers(
     save_logits: bool = True,
     logits_save_dir: str = None
 ) -> Dict:
-    """
-    Evaluate all layer probes for a pooling strategy on OOD data.
-
-    Returns:
-        {
-            'pooling': str,
-            'layers': List[int],
-            'aucs': List[float],
-            'accuracies': List[float],
-            'best_layer': int,
-            'best_auc': float,
-            'logits': np.ndarray (optional)  # (N, L) for ensemble
-        }
-    """
+    """Evaluate all layer probes for a pooling strategy on OOD data."""
     probe_files = find_probe_files(probes_dir)
 
     if not probe_files:
@@ -229,14 +172,17 @@ def evaluate_all_layers(
     print(f"\nEvaluating {pooling_type.upper()} ({len(probe_files)} layers)...")
 
     # Get dimensions from first sample
+    if len(ood_dataloader.dataset) == 0:
+        print(f"❌ Dataset is empty!")
+        return None
+
     sample_x, _ = next(iter(ood_dataloader))
     _, T, D = sample_x.shape[1], sample_x.shape[2], sample_x.shape[3]
 
     results = []
-    all_layer_logits = []  # For ensemble evaluation
+    all_layer_logits = []
 
     for probe_file in tqdm(probe_files, desc=f"{pooling_type.upper()}"):
-        # Extract layer index
         layer_idx = int(probe_file.split('_')[-1].replace('.pt', ''))
 
         # Load probe
@@ -254,8 +200,7 @@ def evaluate_all_layers(
             'accuracy': float(accuracy)
         })
 
-        # Store logits for ensemble (use raw predictions before sigmoid)
-        # Recompute to get logits
+        # Store logits for ensemble
         probe.eval()
         layer_logits = []
         with torch.no_grad():
@@ -267,183 +212,105 @@ def evaluate_all_layers(
         all_layer_logits.append(np.array(layer_logits))
 
     # Find best layer
-    best = max(results, key=lambda x: x['auc'])
+    best_idx = max(range(len(results)), key=lambda i: results[i]['auc'])
+    best_layer = results[best_idx]['layer']
+    best_auc = results[best_idx]['auc']
 
-    output = {
+    # Save logits
+    if save_logits and logits_save_dir:
+        logits_array = np.array(all_layer_logits).T  # (N, L)
+        logits_path = os.path.join(logits_save_dir, f"{pooling_type}_logits.npy")
+        np.save(logits_path, logits_array)
+        print(f"✓ Saved logits: {logits_path} (shape: {logits_array.shape})")
+
+    return {
         'pooling': pooling_type,
         'layers': [r['layer'] for r in results],
         'aucs': [r['auc'] for r in results],
         'accuracies': [r['accuracy'] for r in results],
-        'best_layer': best['layer'],
-        'best_auc': best['auc'],
-        'best_accuracy': best['accuracy']
+        'best_layer': best_layer,
+        'best_auc': best_auc,
+        'results': results
     }
 
-    # Save logits for ensemble evaluation
-    if save_logits and logits_save_dir:
-        os.makedirs(logits_save_dir, exist_ok=True)
-        logits_array = np.array(all_layer_logits).T  # (N, L)
-        logits_path = os.path.join(logits_save_dir, f"{pooling_type}_logits.npy")
-        np.save(logits_path, logits_array)
-        print(f"  ✓ Saved logits: {logits_path} {logits_array.shape}")
-        output['logits_path'] = logits_path
 
-    return output
-
-
-def plot_ood_comparison(
-    all_results: Dict[str, Dict],
-    save_path: str,
-    ood_dataset_name: str = "OOD"
-):
-    """
-    Create comprehensive comparison plot for OOD evaluation.
-
-    Args:
-        all_results: Dict mapping pooling -> results dict
-        save_path: Path to save plot
-        ood_dataset_name: Name of OOD dataset for title
-    """
-    fig, (ax_auc, ax_acc) = plt.subplots(1, 2, figsize=(16, 6))
-
-    overall_best_auc = 0
-    overall_best_info = None
+def plot_ood_comparison(all_results: Dict, output_path: str, dataset_name: str = "OOD"):
+    """Create comparison plot for all pooling strategies."""
+    fig, ax = plt.subplots(figsize=(12, 6))
 
     for pooling in POOLING_ORDER:
-        if pooling not in all_results or not all_results[pooling]:
+        if pooling not in all_results:
             continue
 
-        res = all_results[pooling]
-        layers = res['layers']
-        aucs = res['aucs']
-        accs = res['accuracies']
-        color = POOLING_COLORS.get(pooling, '#666666')
+        data = all_results[pooling]
+        layers = data['layers']
+        aucs = data['aucs']
+        best_layer = data['best_layer']
+        best_auc = data['best_auc']
 
-        # Plot AUC
-        ax_auc.plot(layers, aucs, marker='o', linewidth=2.5, markersize=6,
-                   color=color, label=pooling.upper(), alpha=0.85)
+        color = POOLING_COLORS[pooling]
+        ax.plot(layers, aucs, marker='o', label=f"{pooling.upper()}",
+                color=color, linewidth=2, markersize=6)
 
         # Mark best layer
-        best_idx = res['layers'].index(res['best_layer'])
-        ax_auc.scatter([res['best_layer']], [res['aucs'][best_idx]],
-                      color=color, s=200, zorder=5, edgecolors='black',
-                      linewidths=2.5, marker='*')
+        ax.scatter([best_layer], [best_auc], color=color, s=200,
+                  marker='*', edgecolors='black', linewidths=1.5, zorder=10)
 
-        # Track overall best
-        if res['best_auc'] > overall_best_auc:
-            overall_best_auc = res['best_auc']
-            overall_best_info = (pooling, res['best_layer'], res['best_auc'])
-
-        # Plot Accuracy
-        ax_acc.plot(layers, accs, marker='s', linewidth=2.5, markersize=6,
-                   color=color, label=pooling.upper(), alpha=0.85)
-
-        best_acc_idx = res['layers'].index(res['best_layer'])
-        ax_acc.scatter([res['best_layer']], [res['accuracies'][best_acc_idx]],
-                      color=color, s=200, zorder=5, edgecolors='black',
-                      linewidths=2.5, marker='*')
-
-    # Highlight overall best on AUC plot
-    if overall_best_info:
-        pooling, layer, auc = overall_best_info
-        color = POOLING_COLORS.get(pooling, '#666666')
-
-        ax_auc.annotate(
-            f'BEST: {pooling.upper()}\nLayer {layer}\nAUC: {auc:.3f}',
-            xy=(layer, auc),
-            xytext=(15, 15),
-            textcoords='offset points',
-            bbox=dict(boxstyle='round,pad=0.8', facecolor=color, alpha=0.3,
-                     edgecolor='black', linewidth=2),
-            arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.3',
-                          color='black', lw=2),
-            fontsize=11,
-            fontweight='bold'
-        )
-
-    # Style AUC
-    ax_auc.axhline(y=0.5, color='red', linestyle='--', alpha=0.4, linewidth=1.5, label='Random')
-    ax_auc.axhline(y=0.7, color='green', linestyle=':', alpha=0.4, linewidth=1.5, label='Strong (0.7)')
-    ax_auc.set_xlabel('Layer', fontsize=13, fontweight='bold')
-    ax_auc.set_ylabel('OOD AUC', fontsize=13, fontweight='bold')
-    ax_auc.set_title(f'OOD Evaluation: {ood_dataset_name}\nAUC per Layer', fontsize=14, fontweight='bold')
-    ax_auc.legend(loc='best', fontsize=11, framealpha=0.9)
-    ax_auc.grid(True, alpha=0.3, linestyle='--')
-    ax_auc.set_ylim(0.45, 1.0)
-
-    # Style Accuracy
-    ax_acc.axhline(y=0.5, color='red', linestyle='--', alpha=0.4, linewidth=1.5, label='Random')
-    ax_acc.set_xlabel('Layer', fontsize=13, fontweight='bold')
-    ax_acc.set_ylabel('OOD Accuracy', fontsize=13, fontweight='bold')
-    ax_acc.set_title(f'OOD Evaluation: {ood_dataset_name}\nAccuracy per Layer', fontsize=14, fontweight='bold')
-    ax_acc.legend(loc='best', fontsize=11, framealpha=0.9)
-    ax_acc.grid(True, alpha=0.3, linestyle='--')
-    ax_acc.set_ylim(0.45, 1.0)
+    ax.set_xlabel('Layer', fontsize=12, fontweight='bold')
+    ax.set_ylabel('AUC', fontsize=12, fontweight='bold')
+    ax.set_title(f'{dataset_name} Evaluation - All Pooling Strategies',
+                fontsize=14, fontweight='bold')
+    ax.legend(fontsize=10, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0.4, 1.0])
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"✓ Saved OOD comparison plot: {save_path}")
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"✓ Saved plot: {output_path}")
     plt.close()
 
 
-def generate_summary(all_results: Dict[str, Dict]) -> str:
-    """Generate text summary of OOD evaluation."""
+def generate_summary(all_results: Dict) -> str:
+    """Generate text summary of results."""
     lines = []
     lines.append("=" * 90)
-    lines.append("OOD EVALUATION - ALL POOLING STRATEGIES")
+    lines.append("OOD EVALUATION SUMMARY - ALL POOLING STRATEGIES")
     lines.append("=" * 90)
     lines.append("")
 
-    # Header
-    lines.append(f"{'Pooling':<10} {'Best Layer':<12} {'OOD AUC':<12} {'OOD Acc':<12} {'Precision':<12} {'Recall':<12}")
-    lines.append("-" * 90)
-
-    overall_best = None
-    overall_best_auc = 0
-
     for pooling in POOLING_ORDER:
-        if pooling not in all_results or not all_results[pooling]:
+        if pooling not in all_results:
             continue
 
-        res = all_results[pooling]
-
-        auc_str = f"{res['best_auc']:.4f}"
-        acc_str = f"{res['best_accuracy']:.4f}"
-
-        marker = " ⭐" if res['best_auc'] > overall_best_auc else ""
-        if res['best_auc'] > overall_best_auc:
-            overall_best_auc = res['best_auc']
-            overall_best = pooling
-
-        lines.append(
-            f"{pooling.upper():<10} {res['best_layer']:<12} {auc_str:<12} "
-            f"{acc_str:<12} {'N/A':<12} {'N/A':<12}{marker}"
-        )
+        data = all_results[pooling]
+        lines.append(f"{pooling.upper()} Pooling:")
+        lines.append(f"  Best Layer: L{data['best_layer']}")
+        lines.append(f"  Best AUC:   {data['best_auc']:.4f}")
+        lines.append(f"  Layers:     {min(data['layers'])}-{max(data['layers'])}")
+        lines.append("")
 
     lines.append("=" * 90)
-    lines.append(f"⭐ Best overall: {overall_best.upper()} (OOD AUC: {overall_best_auc:.4f})")
-    lines.append("=" * 90)
-
     return "\n".join(lines)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate all pooling strategies on OOD dataset")
+    parser = argparse.ArgumentParser(description="Evaluate all pooling strategies on OOD")
 
-    # Auto-discovery
-    parser.add_argument("--probes_base_dir", type=str, help="Base directory containing pooling subdirectories")
+    # Probe directories
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--probes_base_dir", "--probes_base", dest="probes_base_dir", type=str,
+                      help="Base directory with mean/max/last/attn subdirectories")
+    group.add_argument("--mean_probes_dir", type=str, help="MEAN probes directory")
 
-    # Manual paths
-    parser.add_argument("--mean_probes_dir", type=str, help="Path to mean pooling probes")
-    parser.add_argument("--max_probes_dir", type=str, help="Path to max pooling probes")
-    parser.add_argument("--last_probes_dir", type=str, help="Path to last pooling probes")
-    parser.add_argument("--attn_probes_dir", type=str, help="Path to attn pooling probes")
+    parser.add_argument("--max_probes_dir", type=str, help="MAX probes directory")
+    parser.add_argument("--last_probes_dir", type=str, help="LAST probes directory")
+    parser.add_argument("--attn_probes_dir", type=str, help="ATTN probes directory")
 
     # OOD data
-    parser.add_argument("--ood_activations_dir", type=str, required=True,
-                       help="Directory with OOD activations (shard_*.safetensors)")
+    parser.add_argument("--ood_activations_dir", "--ood_activations", dest="ood_activations_dir",
+                       type=str, required=True, help="OOD activations directory")
     parser.add_argument("--ood_dataset_name", type=str, default="OOD",
-                       help="Name of OOD dataset (for plots)")
+                       help="Name for plot title")
 
     # Output
     parser.add_argument("--output_dir", type=str, default="results/ood_evaluation",
@@ -456,25 +323,8 @@ def main():
     device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Check if OOD evaluation already exists (skip if so)
-    results_path = os.path.join(args.output_dir, "ood_results_all_pooling.json")
-    logits_dir = os.path.join(args.output_dir, "logits")
-    if os.path.exists(results_path) and os.path.exists(logits_dir):
-        import glob
-        existing_logits = glob.glob(os.path.join(logits_dir, "*_logits.npy"))
-        if existing_logits:
-            print("=" * 90)
-            print("⚠️  OOD EVALUATION RESULTS ALREADY EXIST")
-            print("=" * 90)
-            print(f"Found: {results_path}")
-            print(f"Found: {len(existing_logits)} logit files in {logits_dir}")
-            print("Skipping evaluation to avoid overwriting existing results.")
-            print("To re-evaluate, delete the output directory and run again.")
-            print("=" * 90)
-            return 0
-
     print("=" * 90)
-    print("OOD EVALUATION - ALL POOLING STRATEGIES")
+    print("OOD EVALUATION - ALL POOLING STRATEGIES (PATCHED VERSION)")
     print("=" * 90)
     print()
 
@@ -506,18 +356,23 @@ def main():
     # Load OOD data
     print(f"Loading OOD activations from: {args.ood_activations_dir}")
     ood_dataset = CachedOODDataset(args.ood_activations_dir)
+
+    if len(ood_dataset) == 0:
+        print("❌ No samples loaded! Check your manifest.jsonl for valid labels (0 or 1)")
+        return 1
+
     ood_dataloader = DataLoader(ood_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    # Extract and save labels for ensemble evaluation
+    # Extract and save labels
     ood_labels = np.array([label for _, label in ood_dataset])
     print()
 
     # Evaluate each pooling strategy
     all_results = {}
     logits_dir = os.path.join(args.output_dir, "logits")
-
-    # Save labels for ensemble evaluation
     os.makedirs(logits_dir, exist_ok=True)
+
+    # Save labels
     labels_path = os.path.join(logits_dir, "labels.npy")
     np.save(labels_path, ood_labels)
     print(f"✓ Saved OOD labels: {labels_path} ({len(ood_labels)} samples)\n")
