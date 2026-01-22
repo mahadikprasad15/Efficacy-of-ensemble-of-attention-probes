@@ -228,15 +228,19 @@ fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
 # Plot 1: Weight distribution comparison
 ax1 = axes[0, 0]
+x = np.arange(len(selected_layers))  # Define x here regardless
+
+# Compute OOD stats first (always available)
+ood_mean = ood_weights.mean(axis=0)
+ood_std = ood_weights.std(axis=0)
+
 if id_weights is not None:
     id_mean = id_weights.mean(axis=0)
     id_std = id_weights.std(axis=0)
-    x = np.arange(len(selected_layers))
     ax1.bar(x - 0.2, id_mean, 0.4, yerr=id_std, label=f'ID-trained (AUC={id_auc:.3f})', color='#3498db', capsize=3, alpha=0.8)
-    
-ood_mean = ood_weights.mean(axis=0)
-ood_std = ood_weights.std(axis=0)
-ax1.bar(x + 0.2, ood_mean, 0.4, yerr=ood_std, label=f'OOD-trained (AUC={ood_auc:.3f})', color='#e74c3c', capsize=3, alpha=0.8)
+    ax1.bar(x + 0.2, ood_mean, 0.4, yerr=ood_std, label=f'OOD-trained (AUC={ood_auc:.3f})', color='#e74c3c', capsize=3, alpha=0.8)
+else:
+    ax1.bar(x, ood_mean, 0.6, yerr=ood_std, label=f'OOD-trained (AUC={ood_auc:.3f})', color='#e74c3c', capsize=3, alpha=0.8)
 
 ax1.set_xlabel('Layer')
 ax1.set_ylabel('Mean Gating Weight')
