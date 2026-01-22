@@ -137,16 +137,22 @@ samples = []
 for entry in manifest:
     eid = entry['id']
     if eid in all_tensors:
-        # Try to get text
-        text = apollo_texts.get(eid, '')
+        # Try to get text - first from manifest's generated_text, then apollo data
+        text = entry.get('generated_text', '')
+        if not text:
+            text = apollo_texts.get(eid, '')
         if not text:
             text = entry.get('text', entry.get('completion', f'[No text for {eid}]'))
+        
+        # Also get scenario for context
+        scenario = entry.get('scenario', '')
         
         samples.append({
             'id': eid,
             'tensor': all_tensors[eid],
             'label': entry['label'],
-            'text': text[:1000] if text else ''
+            'text': text[:1000] if text else '',
+            'scenario': scenario[:300] if scenario else ''
         })
 
 print(f"✓ Loaded {len(samples)} samples")
@@ -226,6 +232,7 @@ for sample in tqdm(samples, desc="Predicting"):
     result = {
         'id': sample['id'],
         'text': sample['text'],
+        'scenario': sample.get('scenario', ''),
         'gold_label': 'DECEPTIVE' if gold == 1 else 'HONEST',
         'pred_label': 'DECEPTIVE' if pred == 1 else 'HONEST',
         'category': category,
@@ -403,9 +410,13 @@ for cat in ['TP', 'TN', 'FP', 'FN']:
     for i, r in enumerate(results[cat][:50]):  # Limit to 50 per category
         conf_color = '#27ae60' if r['confidence'] > 0.7 or r['confidence'] < 0.3 else '#f39c12'
         keywords_html = ''.join([f'<span class="keyword">{kw}</span>' for kw in r['finance_keywords']])
+        # Escape HTML in text
+        import html as html_module
+        safe_text = html_module.escape(r['text'][:500]) if r['text'] else '[No text available]'
+        safe_scenario = html_module.escape(r.get('scenario', '')[:300]) if r.get('scenario') else ''
         
         html += f'''
-        <div class="sample" style="border-left-color: {color};" data-text="{r['text'].lower()[:200]}">
+        <div class="sample" style="border-left-color: {color};" data-text="{r['text'].lower()[:200].replace('"', '')}">
             <div class="sample-header">
                 <span class="label" style="color: {color};">#{i+1} | {r['id']}</span>
                 <span class="confidence" style="background: {conf_color}20; color: {conf_color};">
@@ -413,7 +424,8 @@ for cat in ['TP', 'TN', 'FP', 'FN']:
                 </span>
             </div>
             <div class="meta">Gold: {r['gold_label']} | Pred: {r['pred_label']} | Logit: {r['logit']:.3f}</div>
-            <div class="text">{r['text'][:500] if r['text'] else '[No text available]'}{'...' if len(r.get('text', '')) > 500 else ''}</div>
+            {f'<div class="scenario" style="background:#e8f4f8; padding:10px; border-radius:5px; margin:5px 0; font-size:12px;"><strong>📋 Scenario:</strong> {safe_scenario}</div>' if safe_scenario else ''}
+            <div class="text" style="font-size:14px; background:#f8f8f8; padding:15px; border-radius:5px; margin:10px 0;"><strong>💬 Response:</strong><br>{safe_text}{'...' if len(r.get('text', '')) > 500 else ''}</div>
             <div class="keywords">
                 {'<strong>Finance keywords found:</strong> ' + keywords_html if r['finance_keywords'] else '<em>No finance keywords detected</em>'}
             </div>
