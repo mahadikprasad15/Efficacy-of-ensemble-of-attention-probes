@@ -10,6 +10,7 @@ Usage:
 import argparse
 import os
 import glob
+import json
 from safetensors.torch import load_file
 from pathlib import Path
 
@@ -96,54 +97,39 @@ def diagnose_activations(activations_dir: str):
             print(f"   ... and {len(shard_data) - 10} more keys")
         print()
 
-        # Count samples (keys ending in _activations)
-        activation_keys = [k for k in shard_data.keys() if k.endswith("_activations")]
-        label_keys = [k for k in shard_data.keys() if k.endswith("_label")]
+        # Count samples (just IDs, not _activations/_label format)
+        all_keys = list(shard_data.keys())
 
         print(f"Samples in shard:")
-        print(f"   Activation keys: {len(activation_keys)}")
-        print(f"   Label keys: {len(label_keys)}")
+        print(f"   Total tensor keys: {len(all_keys)}")
         print()
 
-        if len(activation_keys) == 0:
-            print("❌ No activation keys found!")
-            print("   Expected keys ending in '_activations'")
-            print()
-            print("Actual key format:")
-            if shard_data.keys():
-                first_key = list(shard_data.keys())[0]
-                print(f"   Example: {first_key}")
-            return
+        print("Key format analysis:")
+        print(f"   Sample keys: {all_keys[:5]}")
+        if len(all_keys) > 5:
+            print(f"   ... and {len(all_keys) - 5} more")
+        print()
 
-        if len(label_keys) == 0:
-            print("❌ No label keys found!")
-            print("   Expected keys ending in '_label'")
-            return
+        # Check if using old format (_activations, _label) or new format (just ID)
+        activation_keys = [k for k in all_keys if k.endswith("_activations")]
+        label_keys = [k for k in all_keys if k.endswith("_label")]
 
-        # Check if all activations have corresponding labels
-        missing_labels = []
-        for act_key in activation_keys:
-            label_key = act_key.replace("_activations", "_label")
-            if label_key not in shard_data:
-                missing_labels.append(act_key)
-
-        if missing_labels:
-            print(f"⚠️  {len(missing_labels)} activation keys missing labels:")
-            for key in missing_labels[:5]:
-                print(f"   {key}")
-            if len(missing_labels) > 5:
-                print(f"   ... and {len(missing_labels) - 5} more")
-            print()
+        if len(activation_keys) > 0:
+            print("✓ Using OLD format (keys with _activations and _label suffixes)")
+            print(f"   Activation keys: {len(activation_keys)}")
+            print(f"   Label keys: {len(label_keys)}")
         else:
-            print("✓ All activations have corresponding labels")
-            print()
+            print("✓ Using NEW format (keys are sample IDs, labels in manifest.jsonl)")
+            print(f"   This is the correct format for deception datasets!")
+            print(f"   Tensor keys: {len(all_keys)}")
+        print()
 
         # Check activation shapes
-        first_act_key = activation_keys[0]
-        first_act = shard_data[first_act_key]
-        print(f"Sample activation shape: {first_act.shape}")
+        first_key = all_keys[0]
+        first_tensor = shard_data[first_key]
+        print(f"Sample activation shape: {first_tensor.shape}")
         print(f"   Expected: (num_layers, num_tokens, hidden_dim)")
-        print(f"   Got: {first_act.shape}")
+        print(f"   Got: {first_tensor.shape}")
         print()
 
         # Count total samples across all shards
@@ -151,28 +137,46 @@ def diagnose_activations(activations_dir: str):
         total_samples = 0
         for shard_path in shards:
             shard_data = load_file(shard_path)
-            shard_activations = [k for k in shard_data.keys() if k.endswith("_activations")]
-            shard_labels = [k for k in shard_data.keys() if k.endswith("_label")]
+            total_samples += len(shard_data.keys())
 
-            # Count valid samples (both activation and label)
-            valid_samples = 0
-            for act_key in shard_activations:
-                label_key = act_key.replace("_activations", "_label")
-                if label_key in shard_data:
-                    valid_samples += 1
-
-            total_samples += valid_samples
-
-        print(f"✓ Total valid samples: {total_samples}")
+        print(f"✓ Total tensors in shards: {total_samples}")
         print()
 
-        if total_samples == 0:
-            print("❌ No valid samples found!")
-            print("   Each sample needs both:")
-            print("   - <id>_activations tensor")
-            print("   - <id>_label tensor")
+        # Check manifest for labels
+        manifest_path = os.path.join(activations_dir, "manifest.jsonl")
+        if os.path.exists(manifest_path):
+            print("✓ Found manifest.jsonl")
+            manifest_entries = 0
+            label_counts = {"honest": 0, "deceptive": 0, "unknown": 0}
+
+            with open(manifest_path, 'r') as f:
+                for line in f:
+                    entry = json.loads(line)
+                    manifest_entries += 1
+                    label = entry.get('label', -1)
+                    if label == 0:
+                        label_counts["honest"] += 1
+                    elif label == 1:
+                        label_counts["deceptive"] += 1
+                    else:
+                        label_counts["unknown"] += 1
+
+            print(f"   Total entries: {manifest_entries}")
+            print(f"   Honest (0): {label_counts['honest']}")
+            print(f"   Deceptive (1): {label_counts['deceptive']}")
+            print(f"   Unknown (-1): {label_counts['unknown']}")
+            print()
+
+            valid_samples = label_counts["honest"] + label_counts["deceptive"]
+            if valid_samples == 0:
+                print("❌ No valid samples with labels 0 or 1!")
+                print("   All samples have unknown label (-1)")
+            else:
+                print(f"✅ Activations directory is valid with {valid_samples} labeled samples!")
         else:
-            print("✅ Activations directory is valid and ready for evaluation!")
+            print("❌ No manifest.jsonl found!")
+            print("   Labels are required for evaluation")
+            print("   This might be an old format activation cache")
 
     except Exception as e:
         print(f"❌ Error loading shard: {e}")

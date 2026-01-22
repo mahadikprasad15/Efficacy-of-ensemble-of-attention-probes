@@ -91,6 +91,20 @@ class CachedOODDataset(Dataset):
         """
         self.activations_dir = activations_dir
 
+        # Load manifest to get labels
+        manifest_path = os.path.join(activations_dir, "manifest.jsonl")
+        if not os.path.exists(manifest_path):
+            raise ValueError(f"No manifest.jsonl found in {activations_dir}")
+
+        # Build label map: {id: label}
+        label_map = {}
+        with open(manifest_path, 'r') as f:
+            for line in f:
+                entry = json.loads(line)
+                label_map[entry['id']] = entry['label']
+
+        print(f"✓ Loaded {len(label_map)} labels from manifest.jsonl")
+
         # Load all shards
         shard_pattern = os.path.join(activations_dir, "shard_*.safetensors")
         shards = sorted(glob.glob(shard_pattern))
@@ -101,21 +115,25 @@ class CachedOODDataset(Dataset):
         print(f"Loading {len(shards)} OOD shard(s)...")
 
         self.samples = []
+        skipped = 0
         for shard_path in tqdm(shards, desc="Loading shards"):
             shard_data = load_file(shard_path)
 
             for key in shard_data.keys():
-                if key.endswith("_activations"):
-                    label_key = key.replace("_activations", "_label")
-
-                    if label_key not in shard_data:
-                        continue
-
+                # Check if this sample has a label in manifest
+                if key in label_map:
                     activations = shard_data[key]
-                    label = shard_data[label_key].item()
+                    label = label_map[key]
+
+                    # Skip samples with unknown labels (-1)
+                    if label == -1:
+                        skipped += 1
+                        continue
 
                     self.samples.append((activations, label))
 
+        if skipped > 0:
+            print(f"⚠️  Skipped {skipped} samples with unknown labels")
         print(f"✓ Loaded {len(self.samples)} OOD samples")
 
     def __len__(self):
