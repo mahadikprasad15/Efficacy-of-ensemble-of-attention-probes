@@ -12,6 +12,7 @@ import sys
 import json
 import glob
 import torch
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -22,16 +23,36 @@ sys.path.append(os.path.join(os.getcwd(), 'actprobe', 'src'))
 from actprobe.probes.models import LayerProbe
 from actprobe.probes.ensemble import GatedEnsemble
 
+# ============================================================================
+# ARGUMENT PARSING
+# ============================================================================
+parser = argparse.ArgumentParser(description='Mechanistic Analysis')
+parser.add_argument('--ood_dir', type=str, 
+                    default='data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test',
+                    help='Path to OOD activations directory')
+parser.add_argument('--probes_base', type=str,
+                    default='data/probes/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying',
+                    help='Path to probes base directory')
+parser.add_argument('--gated_models_dir', type=str,
+                    default='results/ensembles/attn/gated_models_val',
+                    help='Path to gated models directory')
+parser.add_argument('--output_dir', type=str,
+                    default='results/mechanistic_analysis',
+                    help='Output directory')
+args = parser.parse_args()
+
+OOD_DIR = args.ood_dir
+PROBES_BASE = args.probes_base
+GATED_MODELS_DIR = args.gated_models_dir
+OUTPUT_DIR = args.output_dir
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
+print(f"OOD Dir: {OOD_DIR}")
+print(f"Probes Base: {PROBES_BASE}")
+print(f"Gated Models: {GATED_MODELS_DIR}")
+print(f"Output Dir: {OUTPUT_DIR}")
 
-# ============================================================================
-# PATHS - Update these to match your setup
-# ============================================================================
-OOD_DIR = "data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test"
-PROBES_BASE = "data/probes/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying"
-GATED_MODELS_DIR = "results/ensembles/attn/gated_models_val"  # Best gated model
-OUTPUT_DIR = "results/mechanistic_analysis"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ============================================================================
