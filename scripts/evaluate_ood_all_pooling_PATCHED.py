@@ -132,8 +132,8 @@ def evaluate_probe_layer(
             x = x.to(device)
             y = y.to(device)
 
-            # Extract layer
-            x_layer = x[:, layer_idx, :, :]  # (B, T, D)
+            # Extract layer and convert to float32 (activations may be float16)
+            x_layer = x[:, layer_idx, :, :].float()  # (B, T, D)
 
             # Forward pass
             logits = probe(x_layer)
@@ -206,7 +206,7 @@ def evaluate_all_layers(
         with torch.no_grad():
             for x, _ in ood_dataloader:
                 x = x.to(device)
-                x_layer = x[:, layer_idx, :, :]
+                x_layer = x[:, layer_idx, :, :].float()  # Convert to float32
                 logits = probe(x_layer).cpu().numpy().flatten()
                 layer_logits.extend(logits)
         all_layer_logits.append(np.array(layer_logits))
