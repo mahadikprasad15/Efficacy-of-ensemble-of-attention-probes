@@ -315,6 +315,96 @@ plt.savefig(conf_plot_path, dpi=150, bbox_inches='tight')
 print(f"✓ Saved: {conf_plot_path}")
 
 # ============================================================================
+# PLOT 3: PROBE DIRECTION PROJECTION (Most Important!)
+# ============================================================================
+print("\nComputing probe direction projections...")
+
+# Project all activations onto probe direction (this is what the classifier actually uses)
+# logit = w · x + b, so we compute w · x for each sample
+probe_scores = X @ probe_weights  # Raw dot product with probe weights
+
+# Decision threshold in score space: when sigmoid(score + bias) = 0.5, score = -bias
+decision_threshold = -probe_bias
+
+print(f"  Decision threshold (score): {decision_threshold:.4f}")
+print(f"  Score range: [{probe_scores.min():.4f}, {probe_scores.max():.4f}]")
+
+# Create figure with 2 subplots
+fig3, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+# Left: Histogram by gold label
+ax_hist = axes[0]
+honest_scores = probe_scores[[g == 0 for g in gold_labels]]
+deceptive_scores = probe_scores[[g == 1 for g in gold_labels]]
+
+bins = np.linspace(probe_scores.min(), probe_scores.max(), 30)
+ax_hist.hist(honest_scores, bins=bins, alpha=0.6, color='#3498db', label=f'Honest ({len(honest_scores)})', edgecolor='white')
+ax_hist.hist(deceptive_scores, bins=bins, alpha=0.6, color='#e74c3c', label=f'Deceptive ({len(deceptive_scores)})', edgecolor='white')
+ax_hist.axvline(x=decision_threshold, color='black', linestyle='--', lw=2, label=f'Decision Threshold ({decision_threshold:.2f})')
+ax_hist.set_xlabel('Probe Score (w · x)')
+ax_hist.set_ylabel('Count')
+ax_hist.set_title(f'Distribution Along Probe Direction\n{args.pooling.upper()} Layer {layer_idx}')
+ax_hist.legend()
+ax_hist.grid(True, alpha=0.3, axis='y')
+
+# Add separation metrics
+overlap_left = np.sum((honest_scores > decision_threshold))  # FP
+overlap_right = np.sum((deceptive_scores < decision_threshold))  # FN
+total_correct = len(honest_scores) - overlap_left + len(deceptive_scores) - overlap_right
+accuracy = total_correct / len(probe_scores)
+ax_hist.text(0.02, 0.98, f'FP: {overlap_left}, FN: {overlap_right}\nAccuracy: {accuracy:.1%}', 
+             transform=ax_hist.transAxes, va='top', fontsize=10, 
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+# Right: Strip plot by category
+ax_strip = axes[1]
+cat_colors_strip = {'TP': '#27ae60', 'TN': '#3498db', 'FP': '#e74c3c', 'FN': '#f39c12'}
+y_positions = {'TN': 0, 'FN': 1, 'TP': 2, 'FP': 3}
+
+for cat in ['TN', 'FN', 'TP', 'FP']:
+    mask = [c == cat for c in categories]
+    if sum(mask) > 0:
+        cat_scores = probe_scores[mask]
+        y_jitter = np.random.normal(y_positions[cat], 0.1, len(cat_scores))
+        ax_strip.scatter(cat_scores, y_jitter, c=cat_colors_strip[cat], alpha=0.6, s=50, 
+                        label=f'{cat} ({sum(mask)})', edgecolors='white', linewidths=0.5)
+
+ax_strip.axvline(x=decision_threshold, color='black', linestyle='--', lw=2, label='Threshold')
+ax_strip.set_xlabel('Probe Score (w · x)')
+ax_strip.set_yticks([0, 1, 2, 3])
+ax_strip.set_yticklabels(['TN (Honest ✓)', 'FN (Deceptive→Honest)', 'TP (Deceptive ✓)', 'FP (Honest→Deceptive)'])
+ax_strip.set_title(f'Probe Scores by Error Category\n← Honest | Deceptive →')
+ax_strip.legend(loc='upper right')
+ax_strip.grid(True, alpha=0.3, axis='x')
+
+# Shade regions
+xlim = ax_strip.get_xlim()
+ax_strip.axvspan(xlim[0], decision_threshold, alpha=0.1, color='blue', label='Predict Honest')
+ax_strip.axvspan(decision_threshold, xlim[1], alpha=0.1, color='red', label='Predict Deceptive')
+ax_strip.set_xlim(xlim)
+
+plt.tight_layout()
+probe_proj_path = os.path.join(args.output_dir, 'probe_direction_projection.png')
+plt.savefig(probe_proj_path, dpi=150, bbox_inches='tight')
+print(f"✓ Saved: {probe_proj_path}")
+
+# Print score statistics
+print("\n📊 Probe Score Statistics:")
+for cat in ['TP', 'TN', 'FP', 'FN']:
+    mask = [c == cat for c in categories]
+    if sum(mask) > 0:
+        cat_scores = probe_scores[mask]
+        print(f"  {cat}: mean={np.mean(cat_scores):.3f}, std={np.std(cat_scores):.3f}, range=[{np.min(cat_scores):.3f}, {np.max(cat_scores):.3f}]")
+
+# Separation quality
+honest_mean = np.mean(honest_scores)
+deceptive_mean = np.mean(deceptive_scores)
+pooled_std = np.sqrt((np.var(honest_scores) * len(honest_scores) + np.var(deceptive_scores) * len(deceptive_scores)) / len(probe_scores))
+d_prime = (deceptive_mean - honest_mean) / pooled_std if pooled_std > 0 else 0
+print(f"\n  d' (separability): {d_prime:.3f}")
+print(f"  Interpretation: {'Good' if d_prime > 1.5 else 'Moderate' if d_prime > 0.8 else 'Poor'} separation")
+
+# ============================================================================
 # COMPUTE CLUSTER STATISTICS
 # ============================================================================
 print("\n" + "="*70)
