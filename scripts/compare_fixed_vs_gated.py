@@ -1,12 +1,8 @@
 # ============================================================================
-# FIXED WEIGHT vs GATED ENSEMBLE COMPARISON
+# FIXED WEIGHT vs GATED ENSEMBLE COMPARISON (v2)
 # ============================================================================
-# This script:
-# 1. Loads the best gated ensemble (ATTN, K=40%)
-# 2. Extracts mean gating weights across ID samples
-# 3. Creates a Fixed Weight Ensemble with those mean weights
-# 4. Evaluates both on ID (Roleplaying) and OOD (InsiderTrading)
-# 5. Generates comparison table
+# Key fix: Uses batched logits extraction like original evaluation
+# Also loads saved OOD results as reference if available
 # ============================================================================
 
 import os
@@ -45,6 +41,9 @@ parser.add_argument('--probes_dir', type=str,
 parser.add_argument('--gated_model', type=str,
                     default='results/ensembles/attn/gated_models_val/gated_k40.pt',
                     help='Path to saved gated ensemble model')
+parser.add_argument('--saved_ood_results', type=str,
+                    default='results/ensembles/attn/ensemble_k_sweep_ood.json',
+                    help='Path to saved OOD evaluation results (for reference)')
 parser.add_argument('--k_pct', type=int, default=40,
                     help='K% for top layer selection')
 parser.add_argument('--output_dir', type=str,
@@ -55,7 +54,7 @@ args = parser.parse_args()
 os.makedirs(args.output_dir, exist_ok=True)
 
 # ============================================================================
-# HELPER: Load activations
+# HELPER FUNCTIONS
 # ============================================================================
 def load_activations(activations_dir):
     """Load activations from manifest + shards."""
@@ -82,20 +81,34 @@ def load_activations(activations_dir):
     print(f"✓ Loaded {len(samples)} samples from {activations_dir}")
     return samples, np.array(labels)
 
-# ============================================================================
-# HELPER: Compute FPR at fixed TPR
-# ============================================================================
 def fpr_at_tpr(labels, probs, target_tpr=0.99):
-    """Compute FPR when TPR = target_tpr (default 99%)."""
+    """Compute FPR when TPR = target_tpr."""
     fpr_arr, tpr_arr, _ = roc_curve(labels, probs)
-    # Find the threshold where TPR >= target_tpr
     idx = np.where(tpr_arr >= target_tpr)[0]
-    if len(idx) > 0:
-        return fpr_arr[idx[0]]
-    return fpr_arr[-1]
+    return fpr_arr[idx[0]] if len(idx) > 0 else fpr_arr[-1]
+
+def extract_logits(samples, selected_layers, probes):
+    """Extract logits from all probes for all samples. Returns (N, K) array."""
+    all_logits = []
+    for sample in tqdm(samples, desc="Extracting logits"):
+        if isinstance(sample, torch.Tensor):
+            tensor = sample.clone().detach().float().unsqueeze(0)
+        else:
+            tensor = torch.from_numpy(sample).float().unsqueeze(0)
+        
+        layer_logits = []
+        for layer_idx in selected_layers:
+            x_layer = tensor[:, layer_idx, :, :].to(device)
+            with torch.no_grad():
+                logit = probes[layer_idx](x_layer).cpu().item()
+            layer_logits.append(logit)
+        
+        all_logits.append(layer_logits)
+    
+    return np.array(all_logits)  # (N, K)
 
 # ============================================================================
-# 1. LOAD LAYER RESULTS & SELECT TOP-K
+# STEP 1: LOAD LAYER CONFIGURATION
 # ============================================================================
 print("\n" + "="*60)
 print("STEP 1: Load layer configuration")
@@ -113,13 +126,34 @@ print(f"K = {args.k_pct}% → {k_layers} layers")
 print(f"Selected layers: {selected_layers}")
 
 # ============================================================================
-# 2. LOAD PROBES FOR ALL SELECTED LAYERS
+# STEP 2: LOAD SAVED OOD RESULTS (REFERENCE)
 # ============================================================================
 print("\n" + "="*60)
-print("STEP 2: Load per-layer probes")
+print("STEP 2: Load saved OOD results for reference")
 print("="*60)
 
-# Get input dimension from first sample
+saved_gated_ood_auc = None
+if os.path.exists(args.saved_ood_results):
+    with open(args.saved_ood_results, 'r') as f:
+        saved_results = json.load(f)
+    
+    # Find K=40% result
+    for r in saved_results:
+        if r['k_pct'] == args.k_pct:
+            saved_gated_ood_auc = r['gated']['auc']
+            print(f"✓ Found saved reference: Gated OOD AUC = {saved_gated_ood_auc:.4f}")
+            print(f"  (This was the 0.914 AUC from your plots!)")
+            break
+else:
+    print(f"⚠️ No saved OOD results at {args.saved_ood_results}")
+
+# ============================================================================
+# STEP 3: LOAD PROBES
+# ============================================================================
+print("\n" + "="*60)
+print("STEP 3: Load per-layer probes")
+print("="*60)
+
 id_samples, id_labels = load_activations(args.id_activations)
 if id_samples is None:
     print("❌ Could not load ID activations")
@@ -137,10 +171,10 @@ for layer_idx in selected_layers:
 print(f"✓ Loaded {len(probes)} probes")
 
 # ============================================================================
-# 3. LOAD GATED ENSEMBLE
+# STEP 4: LOAD GATED ENSEMBLE
 # ============================================================================
 print("\n" + "="*60)
-print("STEP 3: Load Gated Ensemble")
+print("STEP 4: Load Gated Ensemble")
 print("="*60)
 
 gated = GatedEnsemble(input_dim=k_layers, num_layers=k_layers).to(device)
@@ -149,40 +183,32 @@ if os.path.exists(args.gated_model):
     print(f"✓ Loaded gated model from {args.gated_model}")
 else:
     print(f"⚠️ Gated model not found at {args.gated_model}")
-    print("  Will train a new one on ID data")
-    # We'll train it below if needed
 gated.eval()
 
 # ============================================================================
-# 4. EXTRACT GATING WEIGHTS FROM ID DATA
+# STEP 5: EXTRACT LOGITS FROM ID DATA
 # ============================================================================
 print("\n" + "="*60)
-print("STEP 4: Extract Gating Weights from ID Samples")
+print("STEP 5: Extract logits from ID samples")
 print("="*60)
 
-all_gating_weights = []
+id_logits = extract_logits(id_samples, selected_layers, probes)
+print(f"ID logits shape: {id_logits.shape}")
 
-for sample in tqdm(id_samples, desc="Extracting gating weights"):
-    tensor = torch.tensor(sample).float().unsqueeze(0)
-    
-    # Get logits from all selected layers
-    layer_logits = []
-    for layer_idx in selected_layers:
-        x_layer = tensor[:, layer_idx, :, :].to(device)
-        with torch.no_grad():
-            logit = probes[layer_idx](x_layer).cpu().item()
-        layer_logits.append(logit)
-    
-    # Get gating weights
-    layer_logits_tensor = torch.tensor(layer_logits, dtype=torch.float32).unsqueeze(0).to(device)
-    with torch.no_grad():
-        gating_weights = gated.gate_net(layer_logits_tensor).cpu().numpy().flatten()
-    
-    all_gating_weights.append(gating_weights)
+# ============================================================================
+# STEP 6: EXTRACT GATING WEIGHTS AND COMPUTE MEAN
+# ============================================================================
+print("\n" + "="*60)
+print("STEP 6: Extract gating weights from ID samples")
+print("="*60)
 
-all_gating_weights = np.array(all_gating_weights)  # (N, K)
+with torch.no_grad():
+    id_logits_tensor = torch.tensor(id_logits, dtype=torch.float32).to(device)
+    all_gating_weights = gated.gate_net(id_logits_tensor).cpu().numpy()
+
 mean_weights = all_gating_weights.mean(axis=0)
 std_weights = all_gating_weights.std(axis=0)
+fixed_weights = mean_weights / mean_weights.sum()  # Normalize
 
 print(f"\n📊 Gating Weight Statistics:")
 print(f"{'Layer':<10} {'Mean':<10} {'Std':<10}")
@@ -190,119 +216,105 @@ print("-" * 30)
 for i, layer_idx in enumerate(selected_layers):
     print(f"L{layer_idx:<9} {mean_weights[i]:.4f}     {std_weights[i]:.4f}")
 
-# ============================================================================
-# 5. CREATE FIXED WEIGHT ENSEMBLE
-# ============================================================================
-print("\n" + "="*60)
-print("STEP 5: Create Fixed Weight Ensemble")
-print("="*60)
-
-# Normalize mean weights to sum to 1
-fixed_weights = mean_weights / mean_weights.sum()
-print(f"Fixed weights (normalized): {fixed_weights}")
+print(f"\nFixed weights (normalized): {fixed_weights}")
 
 # ============================================================================
-# 6. EVALUATE BOTH ENSEMBLES ON ID AND OOD
+# STEP 7: LOAD OOD DATA AND EXTRACT LOGITS
 # ============================================================================
 print("\n" + "="*60)
-print("STEP 6: Evaluate on ID and OOD")
+print("STEP 7: Load OOD data and extract logits")
 print("="*60)
 
-def evaluate_ensemble(samples, labels, selected_layers, probes, ensemble_type, weights=None):
-    """
-    Evaluate ensemble on samples.
-    ensemble_type: 'gated', 'fixed', or 'mean'
-    """
-    all_probs = []
-    
-    for sample in tqdm(samples, desc=f"Eval {ensemble_type}", leave=False):
-        tensor = torch.tensor(sample).float().unsqueeze(0)
-        
-        # Get logits from all selected layers
-        layer_logits = []
-        for layer_idx in selected_layers:
-            x_layer = tensor[:, layer_idx, :, :].to(device)
-            with torch.no_grad():
-                logit = probes[layer_idx](x_layer).cpu().item()
-            layer_logits.append(logit)
-        
-        layer_logits = np.array(layer_logits)
-        
-        if ensemble_type == 'gated':
-            # Use gated ensemble
-            layer_logits_tensor = torch.tensor(layer_logits, dtype=torch.float32).unsqueeze(0).to(device)
-            layer_logits_3d = layer_logits_tensor.unsqueeze(-1)  # (1, K, 1)
-            with torch.no_grad():
-                ensemble_logit = gated(layer_logits_tensor, layer_logits_3d).cpu().item()
-        elif ensemble_type == 'fixed':
-            # Use fixed weights
-            ensemble_logit = (layer_logits * weights).sum()
-        else:  # 'mean'
-            ensemble_logit = layer_logits.mean()
-        
-        prob = 1 / (1 + np.exp(-ensemble_logit))
-        all_probs.append(prob)
-    
-    probs = np.array(all_probs)
-    auc = roc_auc_score(labels, probs)
-    acc = accuracy_score(labels, (probs > 0.5).astype(int))
-    fpr_1pct = fpr_at_tpr(labels, probs, target_tpr=0.99)
-    
-    return auc, acc, fpr_1pct
-
-# Evaluate on ID
-print("\n📊 Evaluating on ID (Roleplaying)...")
-id_gated_auc, id_gated_acc, id_gated_fpr = evaluate_ensemble(
-    id_samples, id_labels, selected_layers, probes, 'gated')
-id_fixed_auc, id_fixed_acc, id_fixed_fpr = evaluate_ensemble(
-    id_samples, id_labels, selected_layers, probes, 'fixed', fixed_weights)
-id_mean_auc, id_mean_acc, id_mean_fpr = evaluate_ensemble(
-    id_samples, id_labels, selected_layers, probes, 'mean')
-
-# Load and evaluate on OOD
-print("\n📊 Evaluating on OOD (InsiderTrading)...")
 ood_samples, ood_labels = load_activations(args.ood_activations)
-
-if ood_samples is not None:
-    ood_gated_auc, ood_gated_acc, ood_gated_fpr = evaluate_ensemble(
-        ood_samples, ood_labels, selected_layers, probes, 'gated')
-    ood_fixed_auc, ood_fixed_acc, ood_fixed_fpr = evaluate_ensemble(
-        ood_samples, ood_labels, selected_layers, probes, 'fixed', fixed_weights)
-    ood_mean_auc, ood_mean_acc, ood_mean_fpr = evaluate_ensemble(
-        ood_samples, ood_labels, selected_layers, probes, 'mean')
+if ood_samples is None:
+    print("❌ Could not load OOD activations")
+    ood_logits = None
 else:
-    ood_gated_auc = ood_gated_acc = ood_gated_fpr = None
-    ood_fixed_auc = ood_fixed_acc = ood_fixed_fpr = None
-    ood_mean_auc = ood_mean_acc = ood_mean_fpr = None
+    ood_logits = extract_logits(ood_samples, selected_layers, probes)
+    print(f"OOD logits shape: {ood_logits.shape}")
 
 # ============================================================================
-# 7. GENERATE RESULTS TABLE
+# STEP 8: EVALUATE ALL ENSEMBLES
+# ============================================================================
+print("\n" + "="*60)
+print("STEP 8: Evaluate ensembles on ID and OOD")
+print("="*60)
+
+def evaluate_all(logits, labels, fixed_weights, gated_model, dataset_name):
+    """Evaluate gated, fixed, and mean ensembles."""
+    logits_tensor = torch.tensor(logits, dtype=torch.float32).to(device)
+    logits_3d = logits_tensor.unsqueeze(-1)  # (N, K, 1)
+    
+    # Gated ensemble
+    with torch.no_grad():
+        gated_logits = gated_model(logits_tensor, logits_3d).cpu().numpy().flatten()
+    gated_probs = 1 / (1 + np.exp(-gated_logits))
+    
+    # Fixed weighted
+    fixed_logits = (logits * fixed_weights).sum(axis=1)
+    fixed_probs = 1 / (1 + np.exp(-fixed_logits))
+    
+    # Uniform mean
+    mean_logits = logits.mean(axis=1)
+    mean_probs = 1 / (1 + np.exp(-mean_logits))
+    
+    results = {}
+    for name, probs in [('gated', gated_probs), ('fixed', fixed_probs), ('mean', mean_probs)]:
+        auc = roc_auc_score(labels, probs)
+        acc = accuracy_score(labels, (probs > 0.5).astype(int))
+        fpr = fpr_at_tpr(labels, probs, target_tpr=0.99)
+        results[name] = {'auc': auc, 'acc': acc, 'fpr_99': fpr}
+        print(f"  {name.upper():8} AUC: {auc:.4f}, Acc: {acc:.4f}, FPR@99%: {fpr:.4f}")
+    
+    return results
+
+print("\n📊 ID (Roleplaying):")
+id_results = evaluate_all(id_logits, id_labels, fixed_weights, gated, "ID")
+
+if ood_logits is not None:
+    print("\n📊 OOD (InsiderTrading):")
+    ood_results = evaluate_all(ood_logits, ood_labels, fixed_weights, gated, "OOD")
+else:
+    ood_results = None
+
+# ============================================================================
+# STEP 9: GENERATE COMPARISON TABLE
 # ============================================================================
 print("\n" + "="*80)
 print("📊 RESULTS: FIXED vs GATED ENSEMBLE COMPARISON")
 print("="*80)
 
-header = f"{'Ensemble':<12} | {'ID AUC':<10} | {'ID Acc':<10} | {'OOD AUC':<10} | {'OOD Acc':<10} | {'OOD FPR@99%':<12}"
-print(header)
-print("-" * len(header))
+print(f"\n{'Ensemble':<15} | {'ID AUC':<10} | {'ID Acc':<10} | {'OOD AUC':<10} | {'OOD Acc':<10}")
+print("-" * 65)
+for name in ['gated', 'fixed', 'mean']:
+    label = 'Gated' if name == 'gated' else 'Fixed (Mean)' if name == 'fixed' else 'Uniform'
+    id_auc = id_results[name]['auc']
+    id_acc = id_results[name]['acc']
+    ood_auc = ood_results[name]['auc'] if ood_results else 'N/A'
+    ood_acc = ood_results[name]['acc'] if ood_results else 'N/A'
+    print(f"{label:<15} | {id_auc:.4f}     | {id_acc:.4f}     | {ood_auc if isinstance(ood_auc, str) else f'{ood_auc:.4f}':<10} | {ood_acc if isinstance(ood_acc, str) else f'{ood_acc:.4f}':<10}")
 
-print(f"{'Gated':<12} | {id_gated_auc:.4f}     | {id_gated_acc:.4f}     | {ood_gated_auc if ood_gated_auc else 'N/A':<10} | {ood_gated_acc if ood_gated_acc else 'N/A':<10} | {ood_gated_fpr if ood_gated_fpr else 'N/A':<12}")
-print(f"{'Fixed (Mean)':<12} | {id_fixed_auc:.4f}     | {id_fixed_acc:.4f}     | {ood_fixed_auc if ood_fixed_auc else 'N/A':<10} | {ood_fixed_acc if ood_fixed_acc else 'N/A':<10} | {ood_fixed_fpr if ood_fixed_fpr else 'N/A':<12}")
-print(f"{'Uniform':<12} | {id_mean_auc:.4f}     | {id_mean_acc:.4f}     | {ood_mean_auc if ood_mean_auc else 'N/A':<10} | {ood_mean_acc if ood_mean_acc else 'N/A':<10} | {ood_mean_fpr if ood_mean_fpr else 'N/A':<12}")
+# Add reference comparison
+if saved_gated_ood_auc:
+    print("\n" + "-"*65)
+    print(f"⚠️  NOTE: Saved reference Gated OOD AUC = {saved_gated_ood_auc:.4f}")
+    if ood_results:
+        print(f"   Current computed Gated OOD AUC = {ood_results['gated']['auc']:.4f}")
+        if abs(saved_gated_ood_auc - ood_results['gated']['auc']) > 0.1:
+            print("   ⚠️  Large discrepancy! The gated model may have been trained differently.")
 
 # Compute delta
-if ood_gated_auc and ood_fixed_auc:
-    delta = ood_fixed_auc - ood_gated_auc
-    print("\n" + "-"*80)
+if ood_results:
+    delta = ood_results['fixed']['auc'] - ood_results['gated']['auc']
+    print("\n" + "-"*65)
     print(f"📈 OOD AUC Delta (Fixed - Gated): {delta:+.4f}")
     if abs(delta) < 0.02:
         print("   → ✅ HUGE: Fixed weights ≈ Gated! Can simplify to fixed ensemble.")
     else:
         print(f"   → 🔬 Gated is {'better' if delta < 0 else 'worse'} by {abs(delta):.4f}")
-        print("      This suggests the ensemble benefits from per-sample adaptation.")
 
 # ============================================================================
-# 8. SAVE RESULTS
+# STEP 10: SAVE RESULTS
 # ============================================================================
 results = {
     'config': {
@@ -312,16 +324,9 @@ results = {
         'fixed_weights': fixed_weights.tolist(),
         'weight_std': std_weights.tolist()
     },
-    'id': {
-        'gated': {'auc': id_gated_auc, 'acc': id_gated_acc, 'fpr_99': id_gated_fpr},
-        'fixed': {'auc': id_fixed_auc, 'acc': id_fixed_acc, 'fpr_99': id_fixed_fpr},
-        'mean': {'auc': id_mean_auc, 'acc': id_mean_acc, 'fpr_99': id_mean_fpr}
-    },
-    'ood': {
-        'gated': {'auc': ood_gated_auc, 'acc': ood_gated_acc, 'fpr_99': ood_gated_fpr} if ood_gated_auc else None,
-        'fixed': {'auc': ood_fixed_auc, 'acc': ood_fixed_acc, 'fpr_99': ood_fixed_fpr} if ood_fixed_auc else None,
-        'mean': {'auc': ood_mean_auc, 'acc': ood_mean_acc, 'fpr_99': ood_mean_fpr} if ood_mean_auc else None
-    }
+    'id': id_results,
+    'ood': ood_results,
+    'reference_gated_ood_auc': saved_gated_ood_auc
 }
 
 results_path = f"{args.output_dir}/fixed_vs_gated_results.json"
@@ -330,14 +335,14 @@ with open(results_path, 'w') as f:
 print(f"\n✓ Saved results to {results_path}")
 
 # ============================================================================
-# 9. PLOT COMPARISON
+# STEP 11: PLOT COMPARISON
 # ============================================================================
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
 # Bar chart for AUC
-ensembles = ['Gated', 'Fixed\n(Mean Weights)', 'Uniform\n(Equal Weights)']
-id_aucs = [id_gated_auc, id_fixed_auc, id_mean_auc]
-ood_aucs = [ood_gated_auc or 0, ood_fixed_auc or 0, ood_mean_auc or 0]
+ensembles = ['Gated', 'Fixed\n(Mean Weights)', 'Uniform']
+id_aucs = [id_results['gated']['auc'], id_results['fixed']['auc'], id_results['mean']['auc']]
+ood_aucs = [ood_results['gated']['auc'], ood_results['fixed']['auc'], ood_results['mean']['auc']] if ood_results else [0, 0, 0]
 
 x = np.arange(len(ensembles))
 width = 0.35
@@ -345,6 +350,8 @@ width = 0.35
 ax = axes[0]
 bars1 = ax.bar(x - width/2, id_aucs, width, label='ID (Roleplaying)', color='#3498db')
 bars2 = ax.bar(x + width/2, ood_aucs, width, label='OOD (InsiderTrading)', color='#e74c3c')
+if saved_gated_ood_auc:
+    ax.axhline(saved_gated_ood_auc, color='green', linestyle='--', label=f'Ref Gated OOD ({saved_gated_ood_auc:.3f})', alpha=0.7)
 ax.set_ylabel('AUC')
 ax.set_title('AUC Comparison: Fixed vs Gated Ensemble')
 ax.set_xticks(x)
