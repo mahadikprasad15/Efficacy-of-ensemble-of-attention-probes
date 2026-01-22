@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import glob
+import argparse
 import torch
 import numpy as np
 from safetensors.torch import load_file
@@ -20,20 +21,34 @@ import colorsys
 sys.path.append(os.path.join(os.getcwd(), 'actprobe', 'src'))
 from actprobe.probes.models import LayerProbe
 
+# ============================================================================
+# ARGUMENT PARSING
+# ============================================================================
+parser = argparse.ArgumentParser(description='Hybrid Attention Analysis')
+parser.add_argument('--ood_dir', type=str, 
+                    default='data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test')
+parser.add_argument('--apollo_data', type=str,
+                    default='data/apollo_raw/insider_trading/llama-70b-3.3-generations.json')
+parser.add_argument('--probes_base', type=str,
+                    default='data/probes/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying')
+parser.add_argument('--output_dir', type=str, default='results/mechanistic_analysis')
+parser.add_argument('--k_pct', type=int, default=40)
+args = parser.parse_args()
+
+OOD_DIR = args.ood_dir
+APOLLO_DATA = args.apollo_data
+PROBES_BASE = args.probes_base
+OUTPUT_DIR = args.output_dir
+K_PCT = args.k_pct
+MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
+print(f"OOD Dir: {OOD_DIR}")
+print(f"Probes Base: {PROBES_BASE}")
+print(f"Output Dir: {OUTPUT_DIR}")
 
-# ============================================================================
-# PATHS & CONFIG
-# ============================================================================
-OOD_DIR = "data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test"
-APOLLO_DATA = "data/apollo_raw/insider_trading/llama-70b-3.3-generations.json"
-PROBES_BASE = "data/probes/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying"
-MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
-OUTPUT_DIR = "results/mechanistic_analysis"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-K_PCT = 40
 
 # ============================================================================
 # LOAD DATA
