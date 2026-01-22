@@ -251,6 +251,55 @@ ood_weights, ood_auc, ood_acc, _ = train_gated_and_get_weights(
 print(f"✓ OOD-trained gating: AUC={ood_auc:.4f}, Acc={ood_acc:.4f}")
 
 # ============================================================================
+# STEP 3.5: FAIR COMPARISON - Single Probe vs Gated on SAME test set
+# ============================================================================
+print("\n" + "="*60)
+print("STEP 3.5: Fair Comparison on SAME 20% OOD test set")
+print("="*60)
+
+# Get the same 20% test set
+test_ood_logits_full = ood_logits[n_train_ood:]  # Full logits (all layers)
+test_ood_labels_fair = ood_labels[n_train_ood:]
+test_ood_logits_k = ood_logits_k[n_train_ood:]
+
+print(f"Test set size: {len(test_ood_labels_fair)} samples")
+
+# Find L16 index (best single probe)
+l16_idx = 16  # Layer 16 had best OOD AUC (0.786)
+l16_logits_test = test_ood_logits_full[:, l16_idx]
+l16_probs_test = 1 / (1 + np.exp(-l16_logits_test))
+l16_auc_fair = roc_auc_score(test_ood_labels_fair, l16_probs_test)
+l16_acc_fair = accuracy_score(test_ood_labels_fair, (l16_probs_test > 0.5).astype(int))
+
+# Evaluate gated on same test set (already have ood_auc from above)
+# Also evaluate mean ensemble on same test set
+mean_logits_test = test_ood_logits_k.mean(axis=1)
+mean_probs_test = 1 / (1 + np.exp(-mean_logits_test))
+mean_auc_fair = roc_auc_score(test_ood_labels_fair, mean_probs_test)
+
+print(f"\n📊 FAIR COMPARISON (same 20% OOD test set: N={len(test_ood_labels_fair)}):")
+print(f"{'Method':<25} {'AUC':<10} {'Note'}")
+print("-" * 50)
+print(f"{'Single L16 Probe':<25} {l16_auc_fair:.4f}     Best single attn probe")
+print(f"{'Mean Ensemble (11 layers)':<25} {mean_auc_fair:.4f}     No learning")
+print(f"{'Gated Ensemble (OOD-80%)':<25} {ood_auc:.4f}     Learned on 80% OOD")
+
+# Compare to full dataset evaluation
+print(f"\n📊 For reference - L16 on FULL OOD set:")
+l16_logits_full = ood_logits[:, l16_idx]
+l16_probs_full = 1 / (1 + np.exp(-l16_logits_full))
+l16_auc_full = roc_auc_score(ood_labels, l16_probs_full)
+print(f"L16 on ALL 200 samples: AUC = {l16_auc_full:.4f}")
+print(f"L16 on 20% test ({len(test_ood_labels_fair)}): AUC = {l16_auc_fair:.4f}")
+
+if ood_auc > l16_auc_fair + 0.02:
+    print(f"\n🔬 FINDING: Gated ({ood_auc:.3f}) > Single L16 ({l16_auc_fair:.3f}) even on SAME test set!")
+    print("   → This suggests ensemble provides REAL complementary information")
+else:
+    print(f"\n🔬 FINDING: Difference is small on same test set")
+    print("   → Previous gap may have been due to different test splits")
+
+# ============================================================================
 # STEP 4: SWEEP OOD TRAINING PERCENTAGE
 # ============================================================================
 print("\n" + "="*60)
