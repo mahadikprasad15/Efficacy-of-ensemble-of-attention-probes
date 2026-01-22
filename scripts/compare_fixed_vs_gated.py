@@ -34,7 +34,7 @@ print(f"Device: {device}")
 # ============================================================================
 parser = argparse.ArgumentParser(description='Compare Fixed vs Gated Ensemble')
 parser.add_argument('--id_activations', type=str, 
-                    default='data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/val',
+                    default='data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation',
                     help='Path to ID (validation) activations')
 parser.add_argument('--ood_activations', type=str,
                     default='data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test',
