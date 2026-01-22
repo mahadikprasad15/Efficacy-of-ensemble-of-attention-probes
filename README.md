@@ -4,25 +4,6 @@
 
 This project investigates whether learned pooling strategies (mean, max, last, **attention**) combined with layer ensembling (static, weighted, **gated**) can create robust probes that generalize from in-distribution to out-of-distribution scenarios.
 
----
-
-## Results
-
-| Method | Validation AUC | OOD AUC | Generalization Gap |
-|--------|---------------|---------|-------------------|
-| **ATTN + Gated** | 1.000 | **0.914** | 8.6% ⭐ |
-| MEAN + Gated | 0.977 | 0.492 | 49.6% 🚨 |
-| Single-layer (ATTN L16) | 0.790 | 0.786 | 0.5% |
-| Random baseline | 0.500 | 0.500 | - |
-
-**Main findings:**
-1. **ATTN pooling + Gated ensemble achieves 0.914 OOD AUC** (16.3% improvement over single-layer)
-2. **MEAN pooling catastrophically overfits** (0.977 val → 0.492 OOD)
-3. **Middle layers (11-16) generalize best** across pooling strategies
-4. **Fewer layers (K=30-40%) outperform more layers** for OOD
-
----
-
 ## Experimental Setup
 
 ### Datasets
