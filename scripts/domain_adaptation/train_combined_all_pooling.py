@@ -46,34 +46,24 @@ POOLING_COLORS = {
 }
 
 # ============================================================================
-# MODELS
+# MODELS - Using LINEAR probes to match actprobe's LayerProbe architecture
 # ============================================================================
-class SimpleProbe(nn.Module):
-    """Simple 2-layer probe for a single pooling type."""
-    def __init__(self, input_dim, hidden_dim=256):
+class LinearProbe(nn.Module):
+    """Linear probe matching LayerProbe from actprobe: just Pooling -> Linear."""
+    def __init__(self, input_dim):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, 1)
-        )
+        self.classifier = nn.Linear(input_dim, 1)
     
     def forward(self, x):
-        return self.net(x).squeeze(-1)
+        return self.classifier(x).squeeze(-1)
 
 
 class AttentionPoolingProbe(nn.Module):
-    """Probe with learned attention pooling over tokens."""
-    def __init__(self, input_dim, hidden_dim=256):
+    """Probe with learned attention pooling over tokens + linear classifier."""
+    def __init__(self, input_dim):
         super().__init__()
         self.attn = nn.Linear(input_dim, 1)
-        self.classifier = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, 1)
-        )
+        self.classifier = nn.Linear(input_dim, 1)  # Linear, not MLP!
     
     def forward(self, x):
         # x: (B, T, D) -> attention -> (B, D)
@@ -167,7 +157,7 @@ def train_probe(
     else:
         # X is (N, D)
         D = X_train.shape[1]
-        model = SimpleProbe(D).to(device)
+        model = LinearProbe(D).to(device)  # Use LINEAR probe, not MLP!
         
         mean = X_train.mean(axis=0)
         std = X_train.std(axis=0) + 1e-8
