@@ -91,9 +91,10 @@ def load_activations(act_dir, layer, pooling):
 
 
 def load_probe(probe_path, input_dim, pooling='mean'):
-    """Load a probe from disk."""
+    """Load a probe from disk. Handles multiple architectures."""
     device = torch.device('cpu')
     
+    # First, try LayerProbe from actprobe
     if HAS_LAYERPROBE:
         try:
             probe = LayerProbe(input_dim=input_dim, pooling_type=pooling)
@@ -101,25 +102,42 @@ def load_probe(probe_path, input_dim, pooling='mean'):
             print(f"  ✓ Loaded LayerProbe from {probe_path}")
             return probe
         except Exception as e:
-            print(f"  Warning: Failed to load as LayerProbe: {e}")
+            pass  # Try other options
     
-    # Fallback to simple probe
-    try:
-        state_dict = torch.load(probe_path, map_location=device)
-        # Try to infer structure from state dict
-        if 'fc1.weight' in state_dict:
-            hidden_dim = state_dict['fc1.weight'].shape[0]
-            probe = SimpleProbe(input_dim, hidden_dim)
-            probe.load_state_dict(state_dict)
-        else:
-            # Try loading directly
-            probe = SimpleProbe(input_dim)
-            probe.load_state_dict(state_dict)
+    # Load state dict and check architecture
+    state_dict = torch.load(probe_path, map_location=device)
+    
+    # Check for nn.Sequential architecture (net.0.weight, net.3.weight)
+    if 'net.0.weight' in state_dict:
+        hidden_dim = state_dict['net.0.weight'].shape[0]
+        
+        class SequentialProbe(nn.Module):
+            def __init__(self, input_dim, hidden_dim):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.3),
+                    nn.Linear(hidden_dim, 1)
+                )
+            def forward(self, x):
+                return self.net(x).squeeze(-1)
+        
+        probe = SequentialProbe(input_dim, hidden_dim)
+        probe.load_state_dict(state_dict)
+        print(f"  ✓ Loaded SequentialProbe from {probe_path}")
+        return probe
+    
+    # Check for SimpleProbe architecture (fc1.weight, fc2.weight)
+    if 'fc1.weight' in state_dict:
+        hidden_dim = state_dict['fc1.weight'].shape[0]
+        probe = SimpleProbe(input_dim, hidden_dim)
+        probe.load_state_dict(state_dict)
         print(f"  ✓ Loaded SimpleProbe from {probe_path}")
         return probe
-    except Exception as e:
-        print(f"  ✗ Failed to load probe: {e}")
-        return None
+    
+    print(f"  ✗ Unknown probe architecture. Keys: {list(state_dict.keys())}")
+    return None
 
 
 def get_probe_direction(probe):
