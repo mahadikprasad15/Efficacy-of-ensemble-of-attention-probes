@@ -86,12 +86,15 @@ def load_activations(act_dir, layer, pooling):
         if eid in all_tensors:
             tensor = all_tensors[eid]
             x_layer = tensor[layer, :, :]
-            if pooling == 'mean':
+            # Apply pooling (attn uses mean for direction analysis)
+            if pooling == 'mean' or pooling == 'attn':
                 pooled = x_layer.mean(dim=0)
             elif pooling == 'max':
                 pooled = x_layer.max(dim=0)[0]
             elif pooling == 'last':
                 pooled = x_layer[-1, :]
+            else:
+                pooled = x_layer.mean(dim=0)  # Default to mean
             activations.append(pooled.numpy())
             labels.append(entry['label'])
     
@@ -140,34 +143,59 @@ def get_probe_direction(probe):
 def find_best_probe_from_ood_json(json_path, target_domain='ood'):
     """
     Parse ood_results_all_pooling.json to find the best probe.
-    Returns: (pooling, layer, auc)
+    Returns: dict with pooling, layer, auc
     """
     with open(json_path, 'r') as f:
         data = json.load(f)
     
-    best = {'pooling': None, 'layer': None, 'auc': 0}
+    best = {'pooling': 'mean', 'layer': 20, 'auc': 0}  # Default values
     
-    # Handle different JSON structures
+    # Try different JSON structures
+    
+    # Structure 1: {pooling_type: {layer_N: {metrics}}}
+    for pooling in ['mean', 'max', 'last', 'attn']:
+        if pooling in data and isinstance(data[pooling], dict):
+            for layer_key, metrics in data[pooling].items():
+                if isinstance(metrics, dict):
+                    # Try various AUC key names
+                    auc = metrics.get('ood_auc', metrics.get('auc', metrics.get('val_auc', 0)))
+                    try:
+                        layer = int(layer_key.replace('layer_', '').replace('layer', ''))
+                    except:
+                        layer = 20
+                    if auc > best['auc']:
+                        best = {'pooling': pooling, 'layer': layer, 'auc': auc}
+    
+    # Structure 2: 'results' key with nested structure
     if 'results' in data:
-        # New format with 'results' key
         for pooling, layers_data in data['results'].items():
-            for layer_str, metrics in layers_data.items():
-                auc = metrics.get('ood_auc', metrics.get('auc', 0))
-                if auc > best['auc']:
-                    best = {'pooling': pooling, 'layer': int(layer_str.replace('layer_', '')), 'auc': auc}
-    elif 'per_layer_results' in data:
-        # Combined results format
+            if isinstance(layers_data, dict):
+                for layer_str, metrics in layers_data.items():
+                    if isinstance(metrics, dict):
+                        auc = metrics.get('ood_auc', metrics.get('auc', 0))
+                        try:
+                            layer = int(layer_str.replace('layer_', ''))
+                        except:
+                            layer = 20
+                        if auc > best['auc']:
+                            best = {'pooling': pooling, 'layer': layer, 'auc': auc}
+    
+    # Structure 3: 'per_layer_results' (combined format)
+    if 'per_layer_results' in data:
         for pooling, layer_results in data['per_layer_results'].items():
-            for result in layer_results:
-                auc = result.get('auc_a', 0) + result.get('auc_b', 0)  # Combined score
-                if auc > best['auc']:
-                    best = {'pooling': pooling, 'layer': result['layer'], 'auc': auc}
-    else:
-        # Try flat structure
-        for key, value in data.items():
-            if isinstance(value, dict) and 'auc' in value:
-                if value['auc'] > best['auc']:
-                    best = {'pooling': key, 'layer': value.get('layer', 20), 'auc': value['auc']}
+            if isinstance(layer_results, list):
+                for result in layer_results:
+                    auc = result.get('auc_a', 0) + result.get('auc_b', 0)
+                    if auc > best['auc']:
+                        best = {'pooling': pooling, 'layer': result.get('layer', 20), 'auc': auc}
+    
+    # Structure 4: 'summary' key
+    if 'summary' in data:
+        for pooling, summary in data['summary'].items():
+            auc = summary.get('best_id_auc', summary.get('best_auc', summary.get('auc', 0)))
+            layer = summary.get('best_layer', summary.get('layer', 20))
+            if auc > best['auc']:
+                best = {'pooling': pooling, 'layer': layer, 'auc': auc}
     
     return best
 
