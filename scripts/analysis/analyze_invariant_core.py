@@ -57,6 +57,20 @@ class SequentialProbe(nn.Module):
         return self.net(x).squeeze(-1)
 
 
+class AttentionPoolingProbe(nn.Module):
+    """Probe with learned attention pooling (has pooling.query key)"""
+    def __init__(self, input_dim, hidden_dim=256):
+        super().__init__()
+        self.pooling = nn.Linear(input_dim, 1)  # This produces "pooling.weight" and "pooling.bias"
+        self.classifier = nn.Linear(input_dim, 1)
+    
+    def forward(self, x):
+        # x: (B, T, D) -> attention -> (B, D)
+        attn_weights = torch.softmax(self.pooling(x), dim=1)
+        pooled = (x * attn_weights).sum(dim=1)
+        return self.classifier(pooled).squeeze(-1)
+
+
 # Add path for LayerProbe
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../actprobe/src'))
 try:
@@ -106,35 +120,66 @@ def load_probe(probe_path, input_dim):
     device = torch.device('cpu')
     state_dict = torch.load(probe_path, map_location=device)
     
-    # Check architecture from keys
+    # Check for attention pooling probe (has pooling.query or pooling.weight)
+    if 'pooling.query' in state_dict or 'pooling.weight' in state_dict:
+        # Get the direction from classifier weights instead of loading full model
+        print(f"  ✓ Found attention probe, extracting direction from weights")
+        return state_dict  # Return state_dict directly, we'll extract direction from it
+    
+    # Sequential probe (net.0.weight, net.3.weight)
     if 'net.0.weight' in state_dict:
         hidden_dim = state_dict['net.0.weight'].shape[0]
         probe = SequentialProbe(input_dim, hidden_dim)
         probe.load_state_dict(state_dict)
+        print(f"  ✓ Loaded SequentialProbe from {probe_path}")
         return probe
     
-    if HAS_LAYERPROBE and 'classifier.weight' in state_dict:
-        hidden_dim = state_dict['classifier.weight'].shape[0] if 'classifier.weight' in state_dict else 256
-        probe = LayerProbe(input_dim=input_dim, pooling_type='mean')
-        probe.load_state_dict(state_dict)
-        return probe
+    # LayerProbe from actprobe (classifier.weight)
+    if 'classifier.weight' in state_dict:
+        if HAS_LAYERPROBE:
+            try:
+                probe = LayerProbe(input_dim=input_dim, pooling_type='mean')
+                probe.load_state_dict(state_dict)
+                print(f"  ✓ Loaded LayerProbe from {probe_path}")
+                return probe
+            except:
+                pass
+        # Fallback: return state_dict for direction extraction
+        print(f"  ✓ Found classifier weights, will extract direction")
+        return state_dict
     
-    print(f"  Warning: Unknown architecture for {probe_path}")
-    return None
+    print(f"  Warning: Unknown architecture for {probe_path}, keys: {list(state_dict.keys())[:5]}")
+    return state_dict  # Return state_dict anyway
 
 
-def get_probe_direction(probe):
+def get_probe_direction(probe_or_state_dict):
     """Extract the first layer weights as the probe direction."""
-    state_dict = probe.state_dict()
+    # Handle state_dict directly
+    if isinstance(probe_or_state_dict, dict):
+        state_dict = probe_or_state_dict
+    else:
+        state_dict = probe_or_state_dict.state_dict()
     
+    # Priority order for finding the weight matrix
+    priority_keys = ['classifier.weight', 'net.0.weight', 'pooling.weight', 'pooling.query']
+    
+    for key in priority_keys:
+        if key in state_dict:
+            W = state_dict[key].cpu().numpy()
+            if len(W.shape) == 2:
+                u, s, vt = np.linalg.svd(W, full_matrices=False)
+                return vt[0]
+            elif len(W.shape) == 1:
+                return W  # 1D case
+    
+    # Fallback: find any weight matrix
     for key in sorted(state_dict.keys()):
         if 'weight' in key and len(state_dict[key].shape) == 2:
             W = state_dict[key].cpu().numpy()
-            # Use SVD to get principal direction
             u, s, vt = np.linalg.svd(W, full_matrices=False)
-            return vt[0]  # First right singular vector
+            return vt[0]
     
-    raise ValueError("Could not extract direction from probe")
+    raise ValueError(f"Could not extract direction, keys: {list(state_dict.keys())}")
 
 
 # ============================================================================
@@ -150,21 +195,21 @@ def find_best_probe_from_ood_json(json_path, target_domain='ood'):
     
     best = {'pooling': 'mean', 'layer': 20, 'auc': 0}  # Default values
     
-    # Try different JSON structures
-    
-    # Structure 1: {pooling_type: {layer_N: {metrics}}}
+    # Structure 1: Direct {pooling: {best_layer, best_auc, ...}}
+    # This is the format from OOD evaluation scripts
     for pooling in ['mean', 'max', 'last', 'attn']:
         if pooling in data and isinstance(data[pooling], dict):
-            for layer_key, metrics in data[pooling].items():
-                if isinstance(metrics, dict):
-                    # Try various AUC key names
-                    auc = metrics.get('ood_auc', metrics.get('auc', metrics.get('val_auc', 0)))
-                    try:
-                        layer = int(layer_key.replace('layer_', '').replace('layer', ''))
-                    except:
-                        layer = 20
-                    if auc > best['auc']:
-                        best = {'pooling': pooling, 'layer': layer, 'auc': auc}
+            pooling_data = data[pooling]
+            # Check for direct best_layer/best_auc keys
+            if 'best_layer' in pooling_data and 'best_auc' in pooling_data:
+                auc = pooling_data['best_auc']
+                layer = pooling_data['best_layer']
+                if auc > best['auc']:
+                    best = {'pooling': pooling, 'layer': layer, 'auc': auc}
+    
+    # If we found results, return
+    if best['auc'] > 0:
+        return best
     
     # Structure 2: 'results' key with nested structure
     if 'results' in data:
