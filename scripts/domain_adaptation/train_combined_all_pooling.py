@@ -437,8 +437,14 @@ def main():
     parser.add_argument('--label_b', type=str, default='InsiderTrading', help='Label for domain B')
     parser.add_argument('--layers', type=str, default='0-27', help='Layer range (e.g., 0-27 or 5,10,15)')
     parser.add_argument('--epochs', type=int, default=20, help='Training epochs per probe')
-    parser.add_argument('--output_dir', type=str, default='results/combined_all_pooling')
+    parser.add_argument('--output_dir', type=str, default='results/combined_all_pooling', help='Output dir for plots/results')
+    parser.add_argument('--probes_dir', type=str, default=None, help='Directory to save probes (default: {output_dir}/probes)')
+    parser.add_argument('--model', type=str, default='meta-llama_Llama-3.2-3B-Instruct', help='Model name for probe dir structure')
     args = parser.parse_args()
+    
+    # Set probes_dir default
+    if args.probes_dir is None:
+        args.probes_dir = os.path.join(args.output_dir, 'probes')
     
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -504,7 +510,7 @@ def main():
             )
             
             # Save the trained probe
-            probe_dir = os.path.join(args.output_dir, 'probes', pooling)
+            probe_dir = os.path.join(args.probes_dir, args.model, 'Deception-Combined', pooling)
             os.makedirs(probe_dir, exist_ok=True)
             probe_path = os.path.join(probe_dir, f'probe_layer_{layer}.pt')
             torch.save(metrics['model'].state_dict(), probe_path)
