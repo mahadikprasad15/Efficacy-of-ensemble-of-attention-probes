@@ -2,19 +2,20 @@
 """
 Subspace Analysis Sweep: Analyze Existing Bootstrap Probes with Different N
 ============================================================================
-Loads previously trained probes and sweeps across different N values
-to test how subspace dimension affects principal angle results.
+Loads previously trained probes and sweeps across different N values.
+Compatible with analyze_bootstrap_subspaces_v2.py probes.
 
-This is the analysis-only companion to analyze_bootstrap_subspaces.py.
-It loads probes from disk (no training) and computes subspaces.
+Fixes applied (matching v2):
+- Sign-aligns weights before stacking
+- No centering in SVD (avoids sign issues)
 
 Usage:
     # First train probes with N=15 (the max):
-    python scripts/analysis/analyze_bootstrap_subspaces.py --n_probes 15 ...
+    python scripts/analysis/analyze_bootstrap_subspaces_v2.py --n_probes 15 ...
     
     # Then sweep across N values:
     python scripts/analysis/sweep_subspace_n.py \
-        --probes_dir /path/to/probes_subspaces \
+        --probes_dir /path/to/probes_subspaces_v2 \
         --layers 12,14,16,18,20 \
         --n_values 5,8,10,15 \
         --subspace_dim 5 \
@@ -33,12 +34,27 @@ import torch
 # ============================================================================
 # PROBE LOADING
 # ============================================================================
+def sign_align_weights(W, reference_idx=0):
+    """
+    Sign-align all weight vectors to the first one.
+    Prevents SVD from being messed up by random sign flips.
+    """
+    W_aligned = W.copy()
+    ref = W[:, reference_idx]
+    
+    for i in range(W.shape[1]):
+        if np.dot(W[:, i], ref) < 0:
+            W_aligned[:, i] = -W[:, i]
+    
+    return W_aligned
+
+
 def load_bootstrap_probes(probes_dir, domain, layer, max_n=None):
     """
-    Load bootstrap probes from disk.
+    Load bootstrap probes from disk and sign-align them.
     
     Returns:
-        W: (input_dim, n_probes) matrix of weight vectors
+        W: (input_dim, n_probes) matrix of weight vectors (sign-aligned)
         n_loaded: number of probes loaded
     """
     probe_dir = os.path.join(probes_dir, domain, f'layer_{layer}')
@@ -67,6 +83,10 @@ def load_bootstrap_probes(probes_dir, domain, layer, max_n=None):
         return None, 0
     
     W = np.column_stack(weight_vectors)
+    
+    # Sign-align all weights to first one (matching v2)
+    W = sign_align_weights(W, reference_idx=0)
+    
     return W, len(weight_vectors)
 
 
@@ -74,9 +94,9 @@ def load_bootstrap_probes(probes_dir, domain, layer, max_n=None):
 # SUBSPACE ANALYSIS
 # ============================================================================
 def build_orthonormal_basis(W, k=None):
-    """Build orthonormal basis from weight matrix using SVD."""
-    W_centered = W - W.mean(axis=1, keepdims=True)
-    U, s, Vt = np.linalg.svd(W_centered, full_matrices=False)
+    """Build orthonormal basis using SVD (no centering - matching v2)."""
+    # DON'T center - just use raw SVD to get principal directions
+    U, s, Vt = np.linalg.svd(W, full_matrices=False)
     
     total_var = np.sum(s ** 2)
     explained_variance = (s ** 2) / total_var if total_var > 0 else s * 0
