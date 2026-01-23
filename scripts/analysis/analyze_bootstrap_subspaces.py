@@ -141,19 +141,21 @@ def train_probe(X_train, y_train, seed, epochs=30, lr=1e-2, weight_decay=1e-4):
     except:
         auc = 0.5
     
-    return w, auc
+    return model, w, auc, mean, std  # Return model and normalization stats
 
 
-def train_bootstrap_probes(X, y, n_probes, bootstrap_frac=0.8, **train_kwargs):
+def train_bootstrap_probes(X, y, n_probes, bootstrap_frac=0.8, save_dir=None, domain_name=None, layer=None, **train_kwargs):
     """
     Train multiple probes with different seeds and bootstrapped samples.
     
     Returns:
         W: (input_dim, n_probes) matrix of weight vectors
         aucs: list of training AUCs
+        models: list of trained models (if save_dir is provided, they're saved there)
     """
     weight_vectors = []
     aucs = []
+    models = []
     
     n_samples = len(X)
     n_bootstrap = int(n_samples * bootstrap_frac)
@@ -168,12 +170,24 @@ def train_bootstrap_probes(X, y, n_probes, bootstrap_frac=0.8, **train_kwargs):
         y_boot = y[indices]
         
         # Train probe
-        w, auc = train_probe(X_boot, y_boot, seed, **train_kwargs)
+        model, w, auc, mean, std = train_probe(X_boot, y_boot, seed, **train_kwargs)
         weight_vectors.append(w)
         aucs.append(auc)
+        models.append(model)
+        
+        # Save probe if save_dir is provided
+        if save_dir is not None and domain_name is not None and layer is not None:
+            probe_dir = os.path.join(save_dir, domain_name, f'layer_{layer}')
+            os.makedirs(probe_dir, exist_ok=True)
+            
+            probe_path = os.path.join(probe_dir, f'probe_seed_{i}.pt')
+            torch.save(model.state_dict(), probe_path)
+            
+            norm_path = os.path.join(probe_dir, f'norm_seed_{i}.npz')
+            np.savez(norm_path, mean=mean.numpy(), std=std.numpy())
     
     W = np.column_stack(weight_vectors)  # (input_dim, n_probes)
-    return W, aucs
+    return W, aucs, models
 
 
 # ============================================================================
@@ -338,7 +352,14 @@ def main():
     parser.add_argument('--label_a', type=str, default='Roleplaying')
     parser.add_argument('--label_b', type=str, default='InsiderTrading')
     parser.add_argument('--output_dir', type=str, default='results/bootstrap_subspace_analysis')
+    parser.add_argument('--probes_dir', type=str, default=None, help='Directory to save probes (default: {output_dir}/probes)')
     args = parser.parse_args()
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Set probes_dir default
+    if args.probes_dir is None:
+        args.probes_dir = os.path.join(args.output_dir, 'probes')
     
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -373,21 +394,28 @@ def main():
         print(f"\n2. Training {args.n_probes} bootstrap probes per domain...")
         
         print(f"   Training {args.label_a} probes...")
-        W_a, aucs_a = train_bootstrap_probes(
+        W_a, aucs_a, _ = train_bootstrap_probes(
             X_a, y_a, args.n_probes, 
             bootstrap_frac=args.bootstrap_frac, 
-            epochs=args.epochs
+            epochs=args.epochs,
+            save_dir=args.probes_dir,
+            domain_name=args.label_a,
+            layer=layer
         )
         print(f"      Mean AUC: {np.mean(aucs_a):.4f} ± {np.std(aucs_a):.4f}")
+        print(f"      ✓ Saved to: {args.probes_dir}/{args.label_a}/layer_{layer}/")
         
         print(f"   Training {args.label_b} probes...")
-        W_b, aucs_b = train_bootstrap_probes(
+        W_b, aucs_b, _ = train_bootstrap_probes(
             X_b, y_b, args.n_probes, 
             bootstrap_frac=args.bootstrap_frac, 
-            epochs=args.epochs
+            epochs=args.epochs,
+            save_dir=args.probes_dir,
+            domain_name=args.label_b,
+            layer=layer
         )
         print(f"      Mean AUC: {np.mean(aucs_b):.4f} ± {np.std(aucs_b):.4f}")
-        
+        print(f"      ✓ Saved to: {args.probes_dir}/{args.label_b}/layer_{layer}/")        
         # 3. Build subspaces
         print(f"\n3. Building {args.subspace_dim}-dim subspaces...")
         k = min(args.subspace_dim, args.n_probes)
