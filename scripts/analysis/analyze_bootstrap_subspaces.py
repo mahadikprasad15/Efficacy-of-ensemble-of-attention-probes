@@ -107,8 +107,8 @@ def train_probe(X_train, y_train, seed, epochs=30, lr=1e-2, weight_decay=1e-4):
     
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.BCEWithLogitsLoss()
-    
-    # Normalize
+    # Normalize - convert to float32 (activations may be float16)
+    X_train = X_train.float()
     mean = X_train.mean(dim=0)
     std = X_train.std(dim=0).clamp(min=1e-8)
     X_norm = (X_train - mean) / std
