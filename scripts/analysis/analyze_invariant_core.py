@@ -682,12 +682,12 @@ def main():
         'conclusion': {
             'best_component': best_component,
             'best_avg_auc': float(avg_aucs[best_component]),
-            'invariant_core_supported': residual_auc > projection_auc and residual_auc > 0.6
+            'invariant_core_supported': bool(residual_auc > projection_auc and residual_auc > 0.6)
         }
     }
     
     with open(os.path.join(args.output_dir, 'invariant_core_summary.json'), 'w') as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary, f, indent=2, default=str)
     
     print(f"\n✓ Results saved to: {args.output_dir}")
     print("=" * 70)
