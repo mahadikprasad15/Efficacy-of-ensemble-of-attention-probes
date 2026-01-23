@@ -2,26 +2,22 @@
 """
 Analyze Probe Directions: Why Do Some Probes Generalize?
 =========================================================
-This script addresses the question:
-- PCA shows domains are separated, but ATTN probe gets 0.81 OOD AUC
-- How can this be if there's no shared space?
-
-Answer: PCA captures VARIANCE, not CLASSIFICATION signal!
-The probe finds a hyperplane that may be orthogonal to PCA directions.
+LOADS EXISTING TRAINED PROBES - does NOT train new ones!
 
 This script:
-1. Loads probes trained on Domain A, Domain B, and Combined
+1. LOADS existing probes from disk (not training new ones)
 2. Computes cosine similarity between probe weight vectors
-3. Projects activations onto the probe directions (not PCA)
+3. Projects activations onto probe directions (not PCA)
 4. Shows if deception is separable along the probe direction
 
 Usage:
     python scripts/analysis/analyze_probe_directions.py \
-        --act_a /path/to/Deception-Roleplaying/train \
-        --act_b /path/to/Deception-InsiderTrading/train \
-        --probe_a /path/to/probe_a.pt \
-        --probe_b /path/to/probe_b.pt \
-        --probe_combined /path/to/probe_combined.pt \
+        --act_a /path/to/Deception-Roleplaying/validation \
+        --act_b /path/to/Deception-InsiderTrading/validation \
+        --probe_a /path/to/probes/mean/probe_layer_20.pt \
+        --probe_b /path/to/probes_flipped/mean/probe_layer_20.pt \
+        --probe_combined /path/to/combined_probes/probe.pt \
+        --layer 20 --pooling mean \
         --output_dir results/probe_direction_analysis
 """
 
@@ -38,23 +34,31 @@ from safetensors.torch import load_file
 from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score
 
-# Simple probe model to load weights
+# Add path for LayerProbe
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../actprobe/src'))
+
+try:
+    from actprobe.probes.models import LayerProbe
+    HAS_LAYERPROBE = True
+except ImportError:
+    HAS_LAYERPROBE = False
+    print("Warning: Could not import LayerProbe, will use simple probe structure")
+
+
+# Simple probe for fallback
 class SimpleProbe(nn.Module):
     def __init__(self, input_dim, hidden_dim=256):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, 1)
-        )
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(hidden_dim, 1)
     
     def forward(self, x):
-        return self.net(x).squeeze(-1)
-    
-    def get_first_layer_weights(self):
-        """Get the first layer weight matrix (hidden_dim x input_dim)"""
-        return self.net[0].weight.data.cpu().numpy()
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        return self.fc2(x).squeeze(-1)
 
 
 def load_activations(act_dir, layer, pooling):
@@ -86,44 +90,55 @@ def load_activations(act_dir, layer, pooling):
     return np.array(activations), np.array(labels)
 
 
-def train_simple_probe(X_train, y_train, device, epochs=30):
-    """Train a simple probe and return it."""
-    mean, std = X_train.mean(0), X_train.std(0) + 1e-8
-    X_train_n = (X_train - mean) / std
+def load_probe(probe_path, input_dim, pooling='mean'):
+    """Load a probe from disk."""
+    device = torch.device('cpu')
     
-    model = SimpleProbe(X_train.shape[1]).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    criterion = nn.BCEWithLogitsLoss()
+    if HAS_LAYERPROBE:
+        try:
+            probe = LayerProbe(input_dim=input_dim, pooling_type=pooling)
+            probe.load_state_dict(torch.load(probe_path, map_location=device))
+            print(f"  ✓ Loaded LayerProbe from {probe_path}")
+            return probe
+        except Exception as e:
+            print(f"  Warning: Failed to load as LayerProbe: {e}")
     
-    X_t = torch.tensor(X_train_n, dtype=torch.float32)
-    y_t = torch.tensor(y_train, dtype=torch.float32)
-    
-    for _ in range(epochs):
-        model.train()
-        perm = torch.randperm(len(X_t))
-        for i in range(0, len(X_t), 32):
-            batch_x = X_t[perm[i:i+32]].to(device)
-            batch_y = y_t[perm[i:i+32]].to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(batch_x), batch_y)
-            loss.backward()
-            optimizer.step()
-    
-    model.eval()
-    return model, mean, std
+    # Fallback to simple probe
+    try:
+        state_dict = torch.load(probe_path, map_location=device)
+        # Try to infer structure from state dict
+        if 'fc1.weight' in state_dict:
+            hidden_dim = state_dict['fc1.weight'].shape[0]
+            probe = SimpleProbe(input_dim, hidden_dim)
+            probe.load_state_dict(state_dict)
+        else:
+            # Try loading directly
+            probe = SimpleProbe(input_dim)
+            probe.load_state_dict(state_dict)
+        print(f"  ✓ Loaded SimpleProbe from {probe_path}")
+        return probe
+    except Exception as e:
+        print(f"  ✗ Failed to load probe: {e}")
+        return None
 
 
-def get_probe_direction(model):
+def get_probe_direction(probe):
     """
-    Get the effective "probe direction" from the model.
-    For a 2-layer MLP, we use the first layer weights averaged across hidden units.
-    This gives a rough sense of what input directions matter most.
+    Extract the primary direction the probe uses for classification.
+    For a 2-layer MLP, we use SVD of the first layer weights.
     """
-    W1 = model.net[0].weight.data.cpu().numpy()  # (hidden_dim, input_dim)
-    # Use the principal direction of W1
-    u, s, vt = np.linalg.svd(W1, full_matrices=False)
-    # The first right singular vector is the most important input direction
-    return vt[0]
+    state_dict = probe.state_dict()
+    
+    # Find the first linear layer weights
+    for key in state_dict:
+        if 'weight' in key and len(state_dict[key].shape) == 2:
+            W = state_dict[key].cpu().numpy()
+            # Use SVD to get the principal direction
+            u, s, vt = np.linalg.svd(W, full_matrices=False)
+            # Return the first right singular vector (most important input direction)
+            return vt[0]
+    
+    raise ValueError("Could not find weight matrix in probe")
 
 
 def project_onto_direction(X, direction):
@@ -132,90 +147,17 @@ def project_onto_direction(X, direction):
     return X @ direction
 
 
-def plot_probe_direction_comparison(X_a, y_a, X_b, y_b, probe_a, probe_b, probe_comb, 
-                                    mean_a, std_a, mean_b, std_b, mean_comb, std_comb,
-                                    output_path, label_a, label_b):
-    """
-    Project all activations onto each probe's direction and show distributions.
-    """
-    # Get probe directions
-    dir_a = get_probe_direction(probe_a)
-    dir_b = get_probe_direction(probe_b)
-    dir_comb = get_probe_direction(probe_comb)
-    
-    # Normalize all data with combined stats for fair comparison
-    X_all = np.vstack([X_a, X_b])
-    mean_all = X_all.mean(0)
-    std_all = X_all.std(0) + 1e-8
-    
-    X_a_norm = (X_a - mean_all) / std_all
-    X_b_norm = (X_b - mean_all) / std_all
-    
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    
-    probes = [
-        (dir_a, f'Probe trained on {label_a}'),
-        (dir_b, f'Probe trained on {label_b}'),
-        (dir_comb, f'Probe trained on Combined')
-    ]
-    
-    for col, (direction, title) in enumerate(probes):
-        # Project onto this direction
-        proj_a = project_onto_direction(X_a_norm, direction)
-        proj_b = project_onto_direction(X_b_norm, direction)
-        
-        # Top row: histogram by domain
-        ax = axes[0, col]
-        ax.hist(proj_a, bins=30, alpha=0.6, label=label_a, color='blue', density=True)
-        ax.hist(proj_b, bins=30, alpha=0.6, label=label_b, color='red', density=True)
-        ax.set_xlabel('Projection onto Probe Direction', fontsize=11)
-        ax.set_ylabel('Density', fontsize=11)
-        ax.set_title(f'{title}\n(Colored by Domain)', fontsize=12, fontweight='bold')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Bottom row: histogram by deception label (both domains combined)
-        ax = axes[1, col]
-        proj_all = np.concatenate([proj_a, proj_b])
-        y_all = np.concatenate([y_a, y_b])
-        
-        ax.hist(proj_all[y_all == 0], bins=30, alpha=0.6, label='Truthful', color='green', density=True)
-        ax.hist(proj_all[y_all == 1], bins=30, alpha=0.6, label='Deceptive', color='purple', density=True)
-        ax.set_xlabel('Projection onto Probe Direction', fontsize=11)
-        ax.set_ylabel('Density', fontsize=11)
-        ax.set_title(f'{title}\n(Colored by Deception Label)', fontsize=12, fontweight='bold')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-    
-    fig.suptitle('Activation Projections onto Different Probe Directions\n' +
-                 '(If deception is separable, Truthful and Deceptive should be separated)',
-                 fontsize=14, fontweight='bold', y=1.02)
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  ✓ Saved: {output_path}")
-
-
-def plot_cosine_similarity_matrix(probe_a, probe_b, probe_comb, output_path, label_a, label_b):
-    """
-    Compute and visualize cosine similarity between probe directions.
-    """
-    dir_a = get_probe_direction(probe_a)
-    dir_b = get_probe_direction(probe_b)
-    dir_comb = get_probe_direction(probe_comb)
-    
+def plot_cosine_similarity_matrix(dir_a, dir_b, dir_comb, output_path, label_a, label_b):
+    """Compute and visualize cosine similarity between probe directions."""
     # Normalize
     dir_a = dir_a / (np.linalg.norm(dir_a) + 1e-8)
     dir_b = dir_b / (np.linalg.norm(dir_b) + 1e-8)
     dir_comb = dir_comb / (np.linalg.norm(dir_comb) + 1e-8)
     
-    # Compute cosine similarities
     sim_ab = np.dot(dir_a, dir_b)
     sim_ac = np.dot(dir_a, dir_comb)
     sim_bc = np.dot(dir_b, dir_comb)
     
-    # Create matrix
     labels = [f'{label_a}\nProbe', f'{label_b}\nProbe', 'Combined\nProbe']
     sim_matrix = np.array([
         [1.0, sim_ab, sim_ac],
@@ -231,17 +173,14 @@ def plot_cosine_similarity_matrix(probe_a, probe_b, probe_comb, output_path, lab
     ax.set_xticklabels(labels, fontsize=11)
     ax.set_yticklabels(labels, fontsize=11)
     
-    # Add text annotations
     for i in range(3):
         for j in range(3):
-            text = f'{sim_matrix[i, j]:.3f}'
             color = 'white' if abs(sim_matrix[i, j]) > 0.5 else 'black'
-            ax.text(j, i, text, ha='center', va='center', color=color, fontsize=14, fontweight='bold')
+            ax.text(j, i, f'{sim_matrix[i, j]:.3f}', ha='center', va='center', 
+                    color=color, fontsize=14, fontweight='bold')
     
     ax.set_title('Cosine Similarity Between Probe Directions\n' +
-                 '(+1 = same direction, 0 = orthogonal, -1 = opposite)',
-                 fontsize=13, fontweight='bold')
-    
+                 '(+1 = same, 0 = orthogonal, -1 = opposite)', fontsize=13, fontweight='bold')
     plt.colorbar(im, ax=ax, label='Cosine Similarity')
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -256,196 +195,196 @@ def plot_cosine_similarity_matrix(probe_a, probe_b, probe_comb, output_path, lab
     return {'a_b': sim_ab, 'a_comb': sim_ac, 'b_comb': sim_bc}
 
 
-def plot_pca_vs_probe_directions(X_a, X_b, probe_a, probe_b, probe_comb, output_path, label_a, label_b):
-    """
-    Show where probe directions lie relative to PCA directions.
-    """
+def plot_projection_histograms(X_a, y_a, X_b, y_b, dir_a, dir_b, dir_comb, 
+                                output_path, label_a, label_b):
+    """Project activations onto each probe direction and show distributions."""
+    # Normalize data
+    X_all = np.vstack([X_a, X_b])
+    mean_all = X_all.mean(0)
+    std_all = X_all.std(0) + 1e-8
+    X_a_norm = (X_a - mean_all) / std_all
+    X_b_norm = (X_b - mean_all) / std_all
+    
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    
+    probes = [
+        (dir_a, f'{label_a} Probe'),
+        (dir_b, f'{label_b} Probe'),
+        (dir_comb, 'Combined Probe')
+    ]
+    
+    for col, (direction, title) in enumerate(probes):
+        proj_a = project_onto_direction(X_a_norm, direction)
+        proj_b = project_onto_direction(X_b_norm, direction)
+        
+        # Top: by domain
+        ax = axes[0, col]
+        ax.hist(proj_a, bins=30, alpha=0.6, label=label_a, color='blue', density=True)
+        ax.hist(proj_b, bins=30, alpha=0.6, label=label_b, color='red', density=True)
+        ax.set_xlabel('Projection', fontsize=11)
+        ax.set_ylabel('Density', fontsize=11)
+        ax.set_title(f'{title}\n(by Domain)', fontsize=12, fontweight='bold')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Bottom: by label
+        ax = axes[1, col]
+        proj_all = np.concatenate([proj_a, proj_b])
+        y_all = np.concatenate([y_a, y_b])
+        
+        ax.hist(proj_all[y_all == 0], bins=30, alpha=0.6, label='Truthful', color='green', density=True)
+        ax.hist(proj_all[y_all == 1], bins=30, alpha=0.6, label='Deceptive', color='purple', density=True)
+        ax.set_xlabel('Projection', fontsize=11)
+        ax.set_ylabel('Density', fontsize=11)
+        ax.set_title(f'{title}\n(by Deception Label)', fontsize=12, fontweight='bold')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    fig.suptitle('Activation Projections onto Probe Directions', fontsize=14, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  ✓ Saved: {output_path}")
+
+
+def plot_pca_vs_probe(X_a, X_b, dir_a, dir_b, dir_comb, output_path, label_a, label_b):
+    """Show probe directions relative to PCA directions."""
     X_all = np.vstack([X_a, X_b])
     mean_all = X_all.mean(0)
     std_all = X_all.std(0) + 1e-8
     X_all_norm = (X_all - mean_all) / std_all
     
-    # Fit PCA
     pca = PCA(n_components=2)
     pca.fit(X_all_norm)
+    X_pca = pca.transform(X_all_norm)
     
-    # Get probe directions
-    dir_a = get_probe_direction(probe_a)
-    dir_b = get_probe_direction(probe_b)
-    dir_comb = get_probe_direction(probe_comb)
-    
-    # Normalize
+    # Normalize probe directions
     dir_a = dir_a / np.linalg.norm(dir_a)
     dir_b = dir_b / np.linalg.norm(dir_b)
     dir_comb = dir_comb / np.linalg.norm(dir_comb)
     
-    # Project probe directions onto PCA components
-    pc1 = pca.components_[0]
-    pc2 = pca.components_[1]
+    pc1, pc2 = pca.components_[0], pca.components_[1]
     
-    # Compute angles
-    def angle_with_pca(direction, pc1, pc2):
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    domain_labels = np.array(['A'] * len(X_a) + ['B'] * len(X_b))
+    for domain, color, marker, label in [('A', '#3498db', 'o', label_a), ('B', '#e74c3c', 's', label_b)]:
+        mask = domain_labels == domain
+        ax.scatter(X_pca[mask, 0], X_pca[mask, 1], c=color, marker=marker, alpha=0.3, s=30, label=label)
+    
+    # Project probe directions onto PCA plane and draw arrows
+    scale = 15
+    for direction, color, label in [(dir_a, 'blue', f'{label_a} Probe'), 
+                                     (dir_b, 'red', f'{label_b} Probe'),
+                                     (dir_comb, 'green', 'Combined Probe')]:
         proj1 = np.dot(direction, pc1)
         proj2 = np.dot(direction, pc2)
-        # Also compute component orthogonal to PCA plane
-        in_pca_plane = proj1 * pc1 + proj2 * pc2
-        orthogonal = np.linalg.norm(direction - in_pca_plane)
-        return proj1, proj2, orthogonal
-    
-    proj_a = angle_with_pca(dir_a, pc1, pc2)
-    proj_b = angle_with_pca(dir_b, pc1, pc2)
-    proj_comb = angle_with_pca(dir_comb, pc1, pc2)
-    
-    # Create visualization
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    
-    # Left: PCA scatter with probe direction arrows
-    ax = axes[0]
-    X_pca = pca.transform(X_all_norm)
-    domain_labels = np.array(['A'] * len(X_a) + ['B'] * len(X_b))
-    
-    for domain, color, marker in [('A', '#3498db', 'o'), ('B', '#e74c3c', 's')]:
-        mask = domain_labels == domain
-        ax.scatter(X_pca[mask, 0], X_pca[mask, 1], c=color, marker=marker, 
-                   alpha=0.3, s=30, label=f'{label_a if domain == "A" else label_b}')
-    
-    # Draw arrows for probe directions (projected onto PCA plane)
-    arrow_scale = 20
-    ax.annotate('', xy=(proj_a[0]*arrow_scale, proj_a[1]*arrow_scale), xytext=(0, 0),
-                arrowprops=dict(arrowstyle='->', color='blue', lw=3))
-    ax.annotate('', xy=(proj_b[0]*arrow_scale, proj_b[1]*arrow_scale), xytext=(0, 0),
-                arrowprops=dict(arrowstyle='->', color='red', lw=3))
-    ax.annotate('', xy=(proj_comb[0]*arrow_scale, proj_comb[1]*arrow_scale), xytext=(0, 0),
-                arrowprops=dict(arrowstyle='->', color='green', lw=3))
+        ax.annotate('', xy=(proj1*scale, proj2*scale), xytext=(0, 0),
+                    arrowprops=dict(arrowstyle='->', color=color, lw=3))
+        ax.text(proj1*scale*1.1, proj2*scale*1.1, label, fontsize=10, color=color, fontweight='bold')
     
     ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=12)
     ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=12)
-    ax.set_title('Probe Directions in PCA Space', fontsize=13, fontweight='bold')
-    ax.legend()
+    ax.set_title('Probe Directions Projected onto PCA Space\n(arrows show where each probe "looks")', 
+                 fontsize=13, fontweight='bold')
+    ax.legend(loc='best')
     ax.grid(True, alpha=0.3)
-    
-    # Right: Bar chart showing how much of probe is orthogonal to PCA
-    ax = axes[1]
-    probes_names = [f'{label_a}\nProbe', f'{label_b}\nProbe', 'Combined\nProbe']
-    orthogonal_components = [proj_a[2], proj_b[2], proj_comb[2]]
-    in_plane = [np.sqrt(proj_a[0]**2 + proj_a[1]**2),
-                np.sqrt(proj_b[0]**2 + proj_b[1]**2),
-                np.sqrt(proj_comb[0]**2 + proj_comb[1]**2)]
-    
-    x = np.arange(3)
-    width = 0.35
-    ax.bar(x - width/2, in_plane, width, label='In PCA plane', color='#3498db')
-    ax.bar(x + width/2, orthogonal_components, width, label='Orthogonal to PCA', color='#e74c3c')
-    ax.set_xticks(x)
-    ax.set_xticklabels(probes_names)
-    ax.set_ylabel('Magnitude', fontsize=12)
-    ax.set_title('Probe Direction: In PCA Plane vs Orthogonal\n' +
-                 '(High orthogonal = probe looks at different features than PCA)',
-                 fontsize=12, fontweight='bold')
-    ax.legend()
-    ax.grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"  ✓ Saved: {output_path}")
-    
-    print(f"\n  Probe direction analysis:")
-    print(f"    {label_a} probe: {in_plane[0]:.3f} in PCA plane, {orthogonal_components[0]:.3f} orthogonal")
-    print(f"    {label_b} probe: {in_plane[1]:.3f} in PCA plane, {orthogonal_components[1]:.3f} orthogonal")
-    print(f"    Combined probe: {in_plane[2]:.3f} in PCA plane, {orthogonal_components[2]:.3f} orthogonal")
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--act_a', type=str, required=True)
-    parser.add_argument('--act_b', type=str, required=True)
+    parser = argparse.ArgumentParser(description="Analyze probe directions from existing trained probes")
+    parser.add_argument('--act_a', type=str, required=True, help='Domain A activations dir')
+    parser.add_argument('--act_b', type=str, required=True, help='Domain B activations dir')
+    parser.add_argument('--probe_a', type=str, required=True, help='Path to probe trained on Domain A')
+    parser.add_argument('--probe_b', type=str, required=True, help='Path to probe trained on Domain B')
+    parser.add_argument('--probe_combined', type=str, required=True, help='Path to probe trained on Combined')
     parser.add_argument('--label_a', type=str, default='Roleplaying')
     parser.add_argument('--label_b', type=str, default='InsiderTrading')
     parser.add_argument('--layer', type=int, default=20)
     parser.add_argument('--pooling', type=str, default='mean')
-    parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--output_dir', type=str, default='results/probe_direction_analysis')
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     print("=" * 70)
-    print("PROBE DIRECTION ANALYSIS")
-    print("Why can probes generalize if domains are separated in PCA?")
+    print("PROBE DIRECTION ANALYSIS (Loading Existing Probes)")
     print("=" * 70)
     print(f"Layer: {args.layer}, Pooling: {args.pooling}")
-    print()
     
-    # Load data
-    print("Loading activations...")
+    # Load activations
+    print("\n1. Loading activations...")
     X_a, y_a = load_activations(args.act_a, args.layer, args.pooling)
     X_b, y_b = load_activations(args.act_b, args.layer, args.pooling)
-    print(f"  {args.label_a}: {len(X_a)} samples")
-    print(f"  {args.label_b}: {len(X_b)} samples")
+    print(f"   {args.label_a}: {len(X_a)} samples, dim={X_a.shape[1]}")
+    print(f"   {args.label_b}: {len(X_b)} samples")
     
-    # Train probes
-    print("\nTraining probes...")
-    print(f"  Training on {args.label_a} only...")
-    probe_a, mean_a, std_a = train_simple_probe(X_a, y_a, device, args.epochs)
+    input_dim = X_a.shape[1]
     
-    print(f"  Training on {args.label_b} only...")
-    probe_b, mean_b, std_b = train_simple_probe(X_b, y_b, device, args.epochs)
+    # Load probes
+    print("\n2. Loading probes...")
+    probe_a = load_probe(args.probe_a, input_dim, args.pooling)
+    probe_b = load_probe(args.probe_b, input_dim, args.pooling)
+    probe_comb = load_probe(args.probe_combined, input_dim, args.pooling)
     
-    print(f"  Training on Combined...")
-    X_comb = np.vstack([X_a, X_b])
-    y_comb = np.concatenate([y_a, y_b])
-    probe_comb, mean_comb, std_comb = train_simple_probe(X_comb, y_comb, device, args.epochs)
+    if probe_a is None or probe_b is None or probe_comb is None:
+        print("ERROR: Could not load all probes!")
+        return 1
     
-    # Analysis 1: Cosine similarity between probe directions
+    # Get probe directions
+    print("\n3. Extracting probe directions...")
+    dir_a = get_probe_direction(probe_a)
+    dir_b = get_probe_direction(probe_b)
+    dir_comb = get_probe_direction(probe_comb)
+    
+    # Cosine similarity
     print("\n" + "=" * 70)
-    print("ANALYSIS 1: Cosine Similarity Between Probe Directions")
+    print("ANALYSIS 1: Cosine Similarity")
     print("=" * 70)
     cosine_sims = plot_cosine_similarity_matrix(
-        probe_a, probe_b, probe_comb,
+        dir_a, dir_b, dir_comb,
         os.path.join(args.output_dir, 'probe_cosine_similarity.png'),
         args.label_a, args.label_b
     )
     
-    # Analysis 2: Project activations onto probe directions
+    # Projection histograms
     print("\n" + "=" * 70)
-    print("ANALYSIS 2: Activation Projections onto Probe Directions")
+    print("ANALYSIS 2: Projection Histograms")
     print("=" * 70)
-    plot_probe_direction_comparison(
-        X_a, y_a, X_b, y_b,
-        probe_a, probe_b, probe_comb,
-        mean_a, std_a, mean_b, std_b, mean_comb, std_comb,
-        os.path.join(args.output_dir, 'probe_direction_projections.png'),
+    plot_projection_histograms(
+        X_a, y_a, X_b, y_b, dir_a, dir_b, dir_comb,
+        os.path.join(args.output_dir, 'probe_projections.png'),
         args.label_a, args.label_b
     )
     
-    # Analysis 3: PCA vs Probe directions
+    # PCA comparison
     print("\n" + "=" * 70)
-    print("ANALYSIS 3: Probe Directions vs PCA Directions")
+    print("ANALYSIS 3: PCA vs Probe Directions")
     print("=" * 70)
-    plot_pca_vs_probe_directions(
-        X_a, X_b, probe_a, probe_b, probe_comb,
-        os.path.join(args.output_dir, 'pca_vs_probe_directions.png'),
+    plot_pca_vs_probe(
+        X_a, X_b, dir_a, dir_b, dir_comb,
+        os.path.join(args.output_dir, 'pca_vs_probe.png'),
         args.label_a, args.label_b
     )
     
-    # Summary
-    print("\n" + "=" * 70)
-    print("KEY INSIGHTS")
-    print("=" * 70)
-    
-    if abs(cosine_sims['a_b']) < 0.3:
-        print("• Single-domain probes point in DIFFERENT directions (low cosine similarity)")
-        print("  → Each domain has its own 'deception' direction")
-    else:
-        print("• Single-domain probes point in SIMILAR directions")
-        print("  → There may be a shared 'deception' direction")
-    
-    if abs(cosine_sims['a_comb']) > 0.5 or abs(cosine_sims['b_comb']) > 0.5:
-        print("• Combined probe is similar to one of the single-domain probes")
-    else:
-        print("• Combined probe finds a COMPROMISE direction between the two domains")
+    # Save summary
+    summary = {
+        'probes': {
+            'probe_a': args.probe_a,
+            'probe_b': args.probe_b,
+            'probe_combined': args.probe_combined
+        },
+        'cosine_similarities': cosine_sims,
+        'layer': args.layer,
+        'pooling': args.pooling
+    }
+    with open(os.path.join(args.output_dir, 'analysis_summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2, default=float)
     
     print("\n" + "=" * 70)
     print("✅ COMPLETE")
