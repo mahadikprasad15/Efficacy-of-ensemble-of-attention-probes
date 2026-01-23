@@ -224,7 +224,10 @@ def train_probe(
         'auc_a': auc_a,
         'auc_b': auc_b,
         'acc_a': acc_a,
-        'acc_b': acc_b
+        'acc_b': acc_b,
+        'model': model,  # Return model for saving
+        'mean': mean,
+        'std': std
     }
 
 
@@ -500,11 +503,25 @@ def main():
                 pooling, device, args.epochs
             )
             
+            # Save the trained probe
+            probe_dir = os.path.join(args.output_dir, 'probes', pooling)
+            os.makedirs(probe_dir, exist_ok=True)
+            probe_path = os.path.join(probe_dir, f'probe_layer_{layer}.pt')
+            torch.save(metrics['model'].state_dict(), probe_path)
+            
+            # Save normalization stats
+            norm_path = os.path.join(probe_dir, f'norm_layer_{layer}.npz')
+            np.savez(norm_path, mean=metrics['mean'], std=metrics['std'])
+            
             metrics['layer'] = layer
-            all_results[pooling].append(metrics)
+            # Remove model from metrics before storing (can't serialize nn.Module to JSON)
+            metrics_to_store = {k: v for k, v in metrics.items() if k not in ['model', 'mean', 'std']}
+            metrics_to_store['layer'] = layer
+            all_results[pooling].append(metrics_to_store)
             
             print(f"    {args.label_a}: AUC={metrics['auc_a']:.4f}, Acc={metrics['acc_a']:.4f}")
             print(f"    {args.label_b}: AUC={metrics['auc_b']:.4f}, Acc={metrics['acc_b']:.4f}")
+            print(f"    ✓ Saved: {probe_path}")
     
     # ========================================================================
     # GENERATE PLOTS
