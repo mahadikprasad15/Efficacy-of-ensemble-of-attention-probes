@@ -424,9 +424,13 @@ def main():
     parser.add_argument('--probes_combined', type=str, required=True, help='Combined per-token probes dir')
     parser.add_argument('--val_a', type=str, required=True, help='Domain A validation activations')
     parser.add_argument('--val_b', type=str, required=True, help='Domain B validation activations')
+    parser.add_argument('--ood_results_a', type=str, default=None, 
+                        help='Optional: OOD summary JSON for domain A probes (auto-detect best layer)')
+    parser.add_argument('--ood_results_b', type=str, default=None,
+                        help='Optional: OOD summary JSON for domain B probes (auto-detect best layer)')
     parser.add_argument('--label_a', type=str, default='Roleplaying')
     parser.add_argument('--label_b', type=str, default='InsiderTrading')
-    parser.add_argument('--layer', type=int, default=20)
+    parser.add_argument('--layer', type=int, default=None, help='Layer to use (auto-detected if ood_results provided)')
     parser.add_argument('--output_dir', type=str, default='results/invariant_core_per_token')
     args = parser.parse_args()
     
@@ -436,16 +440,47 @@ def main():
     print("INVARIANT CORE ANALYSIS - PER-TOKEN PROBES")
     print("Decomposing combined probe to find domain-invariant direction")
     print("=" * 70)
-    print(f"Layer: {args.layer}")
+    
+    # ========================================================================
+    # AUTO-DETECT BEST LAYER FROM OOD RESULTS
+    # ========================================================================
+    layer = args.layer
+    
+    if args.ood_results_a and os.path.exists(args.ood_results_a):
+        with open(args.ood_results_a, 'r') as f:
+            ood_a = json.load(f)
+        best_a = ood_a.get('overall_best', {})
+        print(f"OOD Results A: Best layer {best_a.get('layer', '?')} ({best_a.get('aggregation', '?')}) AUC={best_a.get('auc', 0):.4f}")
+        if layer is None:
+            layer = best_a.get('layer', 20)
+    
+    if args.ood_results_b and os.path.exists(args.ood_results_b):
+        with open(args.ood_results_b, 'r') as f:
+            ood_b = json.load(f)
+        best_b = ood_b.get('overall_best', {})
+        print(f"OOD Results B: Best layer {best_b.get('layer', '?')} ({best_b.get('aggregation', '?')}) AUC={best_b.get('auc', 0):.4f}")
+        # Use average of best layers if both provided
+        if args.ood_results_a and os.path.exists(args.ood_results_a):
+            layer = (best_a.get('layer', 20) + best_b.get('layer', 20)) // 2
+            print(f"Using average layer: {layer}")
+        elif layer is None:
+            layer = best_b.get('layer', 20)
+    
+    if layer is None:
+        layer = 20
+        print(f"Using default layer: {layer}")
+    
+    print(f"\nLayer for analysis: {layer}")
+
     
     # ========================================================================
     # 1. LOAD PROBES
     # ========================================================================
     print("\n1. Loading per-token probes...")
     
-    probe_a = load_per_token_probe(args.probes_a, args.layer)
-    probe_b = load_per_token_probe(args.probes_b, args.layer)
-    probe_comb = load_per_token_probe(args.probes_combined, args.layer)
+    probe_a = load_per_token_probe(args.probes_a, layer)
+    probe_b = load_per_token_probe(args.probes_b, layer)
+    probe_comb = load_per_token_probe(args.probes_combined, layer)
     
     if probe_a is None or probe_b is None or probe_comb is None:
         print("ERROR: Could not load all required probes!")
@@ -469,18 +504,18 @@ def main():
     # ========================================================================
     print("\n2. Loading validation activations...")
     
-    acts_a, y_a = load_activations_with_tokens(args.val_a, args.layer)
-    acts_b, y_b = load_activations_with_tokens(args.val_b, args.layer)
+    acts_a, y_a = load_activations_with_tokens(args.val_a, layer)
+    acts_b, y_b = load_activations_with_tokens(args.val_b, layer)
     
     # Also load pooled for direction evaluation
-    X_a, _ = load_pooled_activations(args.val_a, args.layer)
-    X_b, _ = load_pooled_activations(args.val_b, args.layer)
+    X_a, _ = load_pooled_activations(args.val_a, layer)
+    X_b, _ = load_pooled_activations(args.val_b, layer)
     
     print(f"   {args.label_a}: {len(acts_a)} samples")
     print(f"   {args.label_b}: {len(acts_b)} samples")
     
     # Normalize (use combined norm stats if available)
-    mean_comb, std_comb = load_norm_stats(args.probes_combined, args.layer)
+    mean_comb, std_comb = load_norm_stats(args.probes_combined, layer)
     if mean_comb is not None:
         X_a = (X_a - mean_comb) / std_comb
         X_b = (X_b - mean_comb) / std_comb
@@ -569,7 +604,7 @@ def main():
     # Save summary
     summary = {
         'config': {
-            'layer': args.layer,
+            'layer': layer,
             'label_a': args.label_a,
             'label_b': args.label_b
         },

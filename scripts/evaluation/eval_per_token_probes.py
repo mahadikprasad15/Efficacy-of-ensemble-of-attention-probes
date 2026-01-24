@@ -403,6 +403,38 @@ def main():
             plot_combined_aggregations(ood_combined, 'ood', args.output_dir)
             plot_aggregation_comparison_bar(ood_combined, 'ood', args.output_dir)
     
+    # ========================================================================
+    # Save OOD Summary (for use by invariant_core analysis)
+    # ========================================================================
+    overall_best_auc = 0
+    overall_best = {'aggregation': 'mean', 'layer': 20, 'auc': 0.5}
+    
+    if args.ood_activations:
+        ood_summary = {
+            'probes_dir': args.probes_dir,
+            'ood_activations': args.ood_activations,
+            'aggregations': {}
+        }
+        
+        for agg in aggregations:
+            if all_results[agg]['ood']:
+                best = max(all_results[agg]['ood'], key=lambda x: x['auc'])
+                ood_summary['aggregations'][agg] = {
+                    'best_layer': best['layer'],
+                    'best_auc': best['auc'],
+                    'best_acc': best['acc']
+                }
+                if best['auc'] > overall_best_auc:
+                    overall_best_auc = best['auc']
+                    overall_best = {'aggregation': agg, 'layer': best['layer'], 'auc': best['auc']}
+        
+        ood_summary['overall_best'] = overall_best
+        
+        summary_path = os.path.join(args.output_dir, 'ood_summary.json')
+        with open(summary_path, 'w') as f:
+            json.dump(ood_summary, f, indent=2)
+        logger.info(f"Saved OOD summary: {summary_path}")
+    
     # Summary
     logger.info("\n" + "=" * 70)
     logger.info("EVALUATION COMPLETE")
@@ -417,8 +449,12 @@ def main():
             best_ood = max(all_results[agg]['ood'], key=lambda x: x['auc'])
             logger.info(f"  Best OOD: Layer {best_ood['layer']} (AUC: {best_ood['auc']:.4f})")
     
+    if args.ood_activations:
+        logger.info(f"\n*** Overall Best OOD: {overall_best['aggregation'].upper()} Layer {overall_best['layer']} (AUC: {overall_best_auc:.4f}) ***")
+    
     logger.info(f"\nSaved to: {args.output_dir}")
     logger.info("=" * 70)
+
 
 
 if __name__ == "__main__":
