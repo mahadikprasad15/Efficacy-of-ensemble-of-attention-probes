@@ -360,14 +360,58 @@ def main():
     logger.info("TRAINING COMPLETE")
     logger.info("=" * 70)
     
+    # Find best layer for combined performance (average of both domains)
+    best_combined = {'aggregation': 'mean', 'layer': 20, 'auc_avg': 0, 'auc_a': 0, 'auc_b': 0}
+    
     for agg in AGGREGATION_METHODS:
         best_a = max(all_results[agg], key=lambda r: r['auc_a'])
         best_b = max(all_results[agg], key=lambda r: r['auc_b'])
         logger.info(f"{agg.upper()}: Best {args.label_a}={best_a['auc_a']:.4f} (L{best_a['layer']}), "
                    f"Best {args.label_b}={best_b['auc_b']:.4f} (L{best_b['layer']})")
+        
+        # Find layer with best average performance on both domains
+        for r in all_results[agg]:
+            avg = (r['auc_a'] + r['auc_b']) / 2
+            if avg > best_combined['auc_avg']:
+                best_combined = {
+                    'aggregation': agg,
+                    'layer': r['layer'],
+                    'auc_avg': avg,
+                    'auc_a': r['auc_a'],
+                    'auc_b': r['auc_b']
+                }
+    
+    logger.info(f"\n*** Best Combined: {best_combined['aggregation'].upper()} Layer {best_combined['layer']} "
+               f"(Avg={best_combined['auc_avg']:.4f}, {args.label_a}={best_combined['auc_a']:.4f}, "
+               f"{args.label_b}={best_combined['auc_b']:.4f}) ***")
+    
+    # Save summary JSON for invariant core analysis
+    summary = {
+        'probes_dir': probe_dir,
+        'label_a': args.label_a,
+        'label_b': args.label_b,
+        'best_combined': best_combined,
+        'best_per_aggregation': {}
+    }
+    
+    for agg in AGGREGATION_METHODS:
+        # Best layer for average of both domains
+        best = max(all_results[agg], key=lambda r: (r['auc_a'] + r['auc_b']) / 2)
+        summary['best_per_aggregation'][agg] = {
+            'layer': best['layer'],
+            'auc_avg': (best['auc_a'] + best['auc_b']) / 2,
+            'auc_a': best['auc_a'],
+            'auc_b': best['auc_b']
+        }
+    
+    summary_path = os.path.join(probe_dir, 'combined_summary.json')
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    logger.info(f"Saved summary: {summary_path}")
     
     logger.info(f"\nSaved to: {probe_dir}")
     logger.info("=" * 70)
+
 
 
 if __name__ == "__main__":

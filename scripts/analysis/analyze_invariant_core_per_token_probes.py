@@ -442,35 +442,48 @@ def main():
     print("=" * 70)
     
     # ========================================================================
-    # AUTO-DETECT BEST LAYER FROM OOD RESULTS
+    # AUTO-DETECT BEST LAYER
     # ========================================================================
+    # Priority: 1. Manual --layer, 2. Combined probe's best layer, 3. OOD results, 4. Default
     layer = args.layer
     
-    if args.ood_results_a and os.path.exists(args.ood_results_a):
-        with open(args.ood_results_a, 'r') as f:
-            ood_a = json.load(f)
-        best_a = ood_a.get('overall_best', {})
-        print(f"OOD Results A: Best layer {best_a.get('layer', '?')} ({best_a.get('aggregation', '?')}) AUC={best_a.get('auc', 0):.4f}")
-        if layer is None:
-            layer = best_a.get('layer', 20)
+    # Try to load combined_summary.json for best combined layer
+    combined_summary_path = os.path.join(args.probes_combined, 'combined_summary.json')
+    if layer is None and os.path.exists(combined_summary_path):
+        with open(combined_summary_path, 'r') as f:
+            combined_data = json.load(f)
+        best_comb = combined_data.get('best_combined', {})
+        layer = best_comb.get('layer', None)
+        print(f"Combined Summary: Best layer {layer} ({best_comb.get('aggregation', '?')}) "
+              f"Avg AUC={best_comb.get('auc_avg', 0):.4f}")
     
-    if args.ood_results_b and os.path.exists(args.ood_results_b):
-        with open(args.ood_results_b, 'r') as f:
-            ood_b = json.load(f)
-        best_b = ood_b.get('overall_best', {})
-        print(f"OOD Results B: Best layer {best_b.get('layer', '?')} ({best_b.get('aggregation', '?')}) AUC={best_b.get('auc', 0):.4f}")
-        # Use average of best layers if both provided
+    # Fallback: use OOD results if provided
+    if layer is None:
         if args.ood_results_a and os.path.exists(args.ood_results_a):
-            layer = (best_a.get('layer', 20) + best_b.get('layer', 20)) // 2
-            print(f"Using average layer: {layer}")
-        elif layer is None:
-            layer = best_b.get('layer', 20)
+            with open(args.ood_results_a, 'r') as f:
+                ood_a = json.load(f)
+            best_a = ood_a.get('overall_best', {})
+            print(f"OOD Results A: Best layer {best_a.get('layer', '?')} ({best_a.get('aggregation', '?')}) AUC={best_a.get('auc', 0):.4f}")
+            layer = best_a.get('layer', 20)
+        
+        if args.ood_results_b and os.path.exists(args.ood_results_b):
+            with open(args.ood_results_b, 'r') as f:
+                ood_b = json.load(f)
+            best_b = ood_b.get('overall_best', {})
+            print(f"OOD Results B: Best layer {best_b.get('layer', '?')} ({best_b.get('aggregation', '?')}) AUC={best_b.get('auc', 0):.4f}")
+            # If we already have layer from A, average with B
+            if args.ood_results_a and os.path.exists(args.ood_results_a):
+                layer = (best_a.get('layer', 20) + best_b.get('layer', 20)) // 2
+                print(f"Using average of OOD layers: {layer}")
+            else:
+                layer = best_b.get('layer', 20)
     
     if layer is None:
         layer = 20
         print(f"Using default layer: {layer}")
     
     print(f"\nLayer for analysis: {layer}")
+
 
     
     # ========================================================================
