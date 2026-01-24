@@ -3,25 +3,27 @@
 Per-Token Probe Evaluation
 ==========================
 
-Evaluate per-token probes on ID and OOD datasets.
+Evaluate per-token probes on ID and OOD datasets with multiple aggregation methods.
 
 For each sample:
 1. Apply probe to all tokens → get (T,) logits
-2. Aggregate token predictions to sample level via mean/max/vote
+2. Aggregate token predictions to sample level via mean/max/last/vote
 3. Compute AUC at sample level
 
+By default, evaluates ALL aggregation methods and saves separate results for each.
+
 Usage:
-    # Evaluate on OOD dataset
+    # Evaluate on OOD dataset (all aggregations)
     python scripts/evaluation/eval_per_token_probes.py \
         --probes_dir data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying \
         --ood_activations data/activations/.../Deception-InsiderTrading/validation \
         --output_dir results/per_token_ood
 
-    # Evaluate on ID validation
+    # Evaluate with specific aggregation only
     python scripts/evaluation/eval_per_token_probes.py \
-        --probes_dir data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying \
-        --id_activations data/activations/.../Deception-Roleplaying/validation \
-        --output_dir results/per_token_id
+        --probes_dir ... \
+        --ood_activations ... \
+        --aggregation mean
 """
 
 import os
@@ -43,6 +45,15 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# All aggregation methods
+AGGREGATION_METHODS = ['mean', 'max', 'last', 'vote']
+AGGREGATION_COLORS = {
+    'mean': '#2E86AB',
+    'max': '#A23B72',
+    'last': '#F18F01',
+    'vote': '#06A77D'
+}
 
 
 # ============================================================================
@@ -112,7 +123,6 @@ def load_probe(probes_dir: str, layer: int, device):
     if not os.path.exists(probe_path):
         return None, None, None
     
-    # Load probe
     state_dict = torch.load(probe_path, map_location=device)
     input_dim = state_dict['classifier.weight'].shape[1]
     
@@ -120,7 +130,6 @@ def load_probe(probes_dir: str, layer: int, device):
     model.load_state_dict(state_dict)
     model.eval()
     
-    # Load normalization stats
     if os.path.exists(norm_path):
         norm = np.load(norm_path)
         mean = norm['mean']
@@ -140,7 +149,7 @@ def evaluate_sample_level(model, activations, labels, mean, std, device, aggrega
     Evaluate at sample level by aggregating token predictions.
     
     Args:
-        aggregation: 'mean', 'max', or 'vote'
+        aggregation: 'mean', 'max', 'last', or 'vote'
     """
     model.eval()
     sample_probs = []
@@ -161,8 +170,10 @@ def evaluate_sample_level(model, activations, labels, mean, std, device, aggrega
                 sample_probs.append(probs.mean())
             elif aggregation == 'max':
                 sample_probs.append(probs.max())
+            elif aggregation == 'last':
+                sample_probs.append(probs[-1])  # Last token
             elif aggregation == 'vote':
-                sample_probs.append((probs > 0.5).mean())  # Fraction voting positive
+                sample_probs.append((probs > 0.5).mean())
             else:
                 sample_probs.append(probs.mean())
     
@@ -179,6 +190,122 @@ def evaluate_sample_level(model, activations, labels, mean, std, device, aggrega
     return auc, acc, sample_probs
 
 
+def evaluate_all_aggregations(model, activations, labels, mean, std, device):
+    """Evaluate with all aggregation methods."""
+    results = {}
+    for agg in AGGREGATION_METHODS:
+        auc, acc, probs = evaluate_sample_level(model, activations, labels, mean, std, device, agg)
+        results[agg] = {'auc': auc, 'acc': acc}
+    return results
+
+
+# ============================================================================
+# PLOTTING
+# ============================================================================
+def plot_single_aggregation(results, eval_type, aggregation, output_dir):
+    """Plot layerwise results for a single aggregation method."""
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    layers = [r['layer'] for r in results]
+    aucs = [r['auc'] for r in results]
+    
+    color = AGGREGATION_COLORS.get(aggregation, 'blue')
+    ax.plot(layers, aucs, '-o', color=color, linewidth=2, markersize=6, label=eval_type.upper())
+    
+    best = max(results, key=lambda x: x['auc'])
+    ax.scatter([best['layer']], [best['auc']], color=color, s=200, zorder=5, marker='*')
+    
+    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Random')
+    ax.set_xlabel('Layer', fontsize=12)
+    ax.set_ylabel('AUC', fontsize=12)
+    ax.set_title(f'Per-Token Probe: {aggregation.upper()} Aggregation\n({eval_type.upper()} Evaluation)', fontsize=14)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0.4, 1.0)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'eval_{eval_type}_{aggregation}.png'), dpi=150)
+    plt.close()
+
+
+def plot_combined_aggregations(all_results, eval_type, output_dir):
+    """Plot all aggregation methods on the same chart."""
+    fig, ax = plt.subplots(figsize=(14, 7))
+    
+    for agg in AGGREGATION_METHODS:
+        if agg not in all_results:
+            continue
+        
+        results = all_results[agg]
+        layers = [r['layer'] for r in results]
+        aucs = [r['auc'] for r in results]
+        color = AGGREGATION_COLORS.get(agg, 'gray')
+        
+        ax.plot(layers, aucs, '-o', color=color, linewidth=2, markersize=5, 
+                label=f'{agg.upper()}', alpha=0.85)
+        
+        # Mark best
+        best = max(results, key=lambda x: x['auc'])
+        ax.scatter([best['layer']], [best['auc']], color=color, s=150, zorder=5, 
+                   marker='*', edgecolors='black', linewidths=1)
+    
+    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Random')
+    ax.set_xlabel('Layer', fontsize=12)
+    ax.set_ylabel('AUC', fontsize=12)
+    ax.set_title(f'Per-Token Probe: All Aggregation Methods\n({eval_type.upper()} Evaluation)', fontsize=14)
+    ax.legend(loc='best', fontsize=11)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0.4, 1.0)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'eval_{eval_type}_all_aggregations.png'), dpi=150)
+    plt.close()
+
+
+def plot_aggregation_comparison_bar(all_results, eval_type, output_dir):
+    """Bar chart comparing best AUC per aggregation method."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    methods = []
+    best_aucs = []
+    best_layers = []
+    colors = []
+    
+    for agg in AGGREGATION_METHODS:
+        if agg not in all_results or not all_results[agg]:
+            continue
+        
+        best = max(all_results[agg], key=lambda x: x['auc'])
+        methods.append(agg.upper())
+        best_aucs.append(best['auc'])
+        best_layers.append(best['layer'])
+        colors.append(AGGREGATION_COLORS.get(agg, 'gray'))
+    
+    x = np.arange(len(methods))
+    bars = ax.bar(x, best_aucs, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
+    
+    # Add value labels
+    for i, (bar, layer) in enumerate(zip(bars, best_layers)):
+        h = bar.get_height()
+        ax.annotate(f'{h:.3f}\n(L{layer})', 
+                    xy=(bar.get_x() + bar.get_width()/2, h),
+                    xytext=(0, 5), textcoords='offset points',
+                    ha='center', fontsize=10, fontweight='bold')
+    
+    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
+    ax.set_xlabel('Aggregation Method', fontsize=12)
+    ax.set_ylabel('Best Layer AUC', fontsize=12)
+    ax.set_title(f'Per-Token Probe: Aggregation Method Comparison\n({eval_type.upper()} Evaluation)', fontsize=14)
+    ax.set_xticks(x)
+    ax.set_xticklabels(methods)
+    ax.set_ylim(0.4, 1.05)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'eval_{eval_type}_aggregation_bar.png'), dpi=150)
+    plt.close()
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -189,7 +316,9 @@ def main():
     parser.add_argument('--ood_activations', type=str, default=None)
     parser.add_argument('--output_dir', type=str, default='results/per_token_eval')
     parser.add_argument('--layers', type=str, default='0-27')
-    parser.add_argument('--aggregation', type=str, default='mean', choices=['mean', 'max', 'vote'])
+    parser.add_argument('--aggregation', type=str, default='all', 
+                        choices=['all', 'mean', 'max', 'last', 'vote'],
+                        help="Aggregation method ('all' runs all methods)")
     args = parser.parse_args()
     
     if args.id_activations is None and args.ood_activations is None:
@@ -206,19 +335,23 @@ def main():
     else:
         layers = list(map(int, args.layers.split(',')))
     
+    # Determine which aggregations to run
+    if args.aggregation == 'all':
+        aggregations = AGGREGATION_METHODS
+    else:
+        aggregations = [args.aggregation]
+    
     logger.info("=" * 70)
     logger.info("PER-TOKEN PROBE EVALUATION")
     logger.info("=" * 70)
     logger.info(f"Probes: {args.probes_dir}")
     logger.info(f"ID: {args.id_activations}")
     logger.info(f"OOD: {args.ood_activations}")
-    logger.info(f"Aggregation: {args.aggregation}")
+    logger.info(f"Aggregations: {aggregations}")
     logger.info("=" * 70)
     
-    results = {
-        'id': [],
-        'ood': []
-    }
+    # Results structure: {aggregation: {eval_type: [{layer, auc, acc}]}}
+    all_results = {agg: {'id': [], 'ood': []} for agg in aggregations}
     
     for layer in tqdm(layers, desc="Evaluating Layers"):
         model, mean, std = load_probe(args.probes_dir, layer, device)
@@ -227,80 +360,64 @@ def main():
             logger.warning(f"Probe not found for layer {layer}, skipping")
             continue
         
-        layer_results = {'layer': layer}
-        
         # ID evaluation
         if args.id_activations:
             acts, labels, _ = load_activations_with_tokens(args.id_activations, layer)
-            auc, acc, _ = evaluate_sample_level(model, acts, labels, mean, std, device, args.aggregation)
-            layer_results['id_auc'] = auc
-            layer_results['id_acc'] = acc
-            results['id'].append({'layer': layer, 'auc': auc, 'acc': acc})
+            for agg in aggregations:
+                auc, acc, _ = evaluate_sample_level(model, acts, labels, mean, std, device, agg)
+                all_results[agg]['id'].append({'layer': layer, 'auc': auc, 'acc': acc})
         
         # OOD evaluation
         if args.ood_activations:
             acts, labels, _ = load_activations_with_tokens(args.ood_activations, layer)
-            auc, acc, _ = evaluate_sample_level(model, acts, labels, mean, std, device, args.aggregation)
-            layer_results['ood_auc'] = auc
-            layer_results['ood_acc'] = acc
-            results['ood'].append({'layer': layer, 'auc': auc, 'acc': acc})
+            for agg in aggregations:
+                auc, acc, _ = evaluate_sample_level(model, acts, labels, mean, std, device, agg)
+                all_results[agg]['ood'].append({'layer': layer, 'auc': auc, 'acc': acc})
+    
+    # Save results for each aggregation
+    for agg in aggregations:
+        agg_dir = os.path.join(args.output_dir, agg)
+        os.makedirs(agg_dir, exist_ok=True)
         
-        if args.id_activations and args.ood_activations:
-            logger.info(f"  Layer {layer}: ID={layer_results.get('id_auc', 0):.4f}, OOD={layer_results.get('ood_auc', 0):.4f}")
-        elif args.id_activations:
-            logger.info(f"  Layer {layer}: ID={layer_results.get('id_auc', 0):.4f}")
-        else:
-            logger.info(f"  Layer {layer}: OOD={layer_results.get('ood_auc', 0):.4f}")
-    
-    # Save results
-    results_path = os.path.join(args.output_dir, 'eval_results.json')
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    # Plot
-    fig, ax = plt.subplots(figsize=(12, 6))
-    
-    if results['id']:
-        id_layers = [r['layer'] for r in results['id']]
-        id_aucs = [r['auc'] for r in results['id']]
-        ax.plot(id_layers, id_aucs, 'b-o', label='ID', linewidth=2, markersize=6)
+        results_path = os.path.join(agg_dir, 'eval_results.json')
+        with open(results_path, 'w') as f:
+            json.dump(all_results[agg], f, indent=2)
         
-        best_id = max(results['id'], key=lambda x: x['auc'])
-        ax.scatter([best_id['layer']], [best_id['auc']], color='blue', s=200, zorder=5, marker='*')
+        # Plot per-aggregation results
+        if all_results[agg]['id']:
+            plot_single_aggregation(all_results[agg]['id'], 'id', agg, agg_dir)
+        if all_results[agg]['ood']:
+            plot_single_aggregation(all_results[agg]['ood'], 'ood', agg, agg_dir)
     
-    if results['ood']:
-        ood_layers = [r['layer'] for r in results['ood']]
-        ood_aucs = [r['auc'] for r in results['ood']]
-        ax.plot(ood_layers, ood_aucs, 'r-s', label='OOD', linewidth=2, markersize=6)
+    # Combined plots (if running all aggregations)
+    if len(aggregations) > 1:
+        # ID combined
+        if args.id_activations:
+            id_combined = {agg: all_results[agg]['id'] for agg in aggregations}
+            plot_combined_aggregations(id_combined, 'id', args.output_dir)
+            plot_aggregation_comparison_bar(id_combined, 'id', args.output_dir)
         
-        best_ood = max(results['ood'], key=lambda x: x['auc'])
-        ax.scatter([best_ood['layer']], [best_ood['auc']], color='red', s=200, zorder=5, marker='*')
-    
-    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Random')
-    ax.set_xlabel('Layer', fontsize=12)
-    ax.set_ylabel('AUC', fontsize=12)
-    ax.set_title(f'Per-Token Probe Evaluation\n(Aggregation: {args.aggregation})', fontsize=14)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim(0.4, 1.0)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, 'eval_layerwise.png'), dpi=150)
+        # OOD combined
+        if args.ood_activations:
+            ood_combined = {agg: all_results[agg]['ood'] for agg in aggregations}
+            plot_combined_aggregations(ood_combined, 'ood', args.output_dir)
+            plot_aggregation_comparison_bar(ood_combined, 'ood', args.output_dir)
     
     # Summary
     logger.info("\n" + "=" * 70)
     logger.info("EVALUATION COMPLETE")
     logger.info("=" * 70)
     
-    if results['id']:
-        best_id = max(results['id'], key=lambda x: x['auc'])
-        logger.info(f"Best ID: Layer {best_id['layer']} (AUC: {best_id['auc']:.4f})")
+    for agg in aggregations:
+        logger.info(f"\n{agg.upper()} Aggregation:")
+        if all_results[agg]['id']:
+            best_id = max(all_results[agg]['id'], key=lambda x: x['auc'])
+            logger.info(f"  Best ID: Layer {best_id['layer']} (AUC: {best_id['auc']:.4f})")
+        if all_results[agg]['ood']:
+            best_ood = max(all_results[agg]['ood'], key=lambda x: x['auc'])
+            logger.info(f"  Best OOD: Layer {best_ood['layer']} (AUC: {best_ood['auc']:.4f})")
     
-    if results['ood']:
-        best_ood = max(results['ood'], key=lambda x: x['auc'])
-        logger.info(f"Best OOD: Layer {best_ood['layer']} (AUC: {best_ood['auc']:.4f})")
-    
-    logger.info(f"Saved to: {args.output_dir}")
+    logger.info(f"\nSaved to: {args.output_dir}")
     logger.info("=" * 70)
 
 

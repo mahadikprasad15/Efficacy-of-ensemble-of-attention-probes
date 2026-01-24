@@ -25,18 +25,24 @@ This guide explains how to train and evaluate probes using the Apollo Research p
     --dataset Deception-Roleplaying
 ```
 
-**Output**: `data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/`
-
 ---
 
-### Step 2: Evaluate on OOD Dataset
+### Step 2: Evaluate on OOD Dataset (All Aggregations)
 
 ```python
-# Evaluate on InsiderTrading (OOD)
+# Runs all 4 aggregations (mean/max/last/vote) by default
 !python scripts/evaluation/eval_per_token_probes.py \
     --probes_dir data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying \
     --ood_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
     --output_dir results/per_token_ood
+```
+
+**Or run a specific aggregation:**
+```python
+!python scripts/evaluation/eval_per_token_probes.py \
+    --probes_dir ... \
+    --ood_activations ... \
+    --aggregation last  # Only run 'last' aggregation
 ```
 
 ---
@@ -58,10 +64,9 @@ This guide explains how to train and evaluate probes using the Apollo Research p
 ### Step 4: Compare Per-Token vs Pooled
 
 ```python
-# Compare results
 !python scripts/comparison/compare_per_token_vs_pooled.py \
-    --pooled_results data/probes/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/mean/layer_results.json \
-    --per_token_results data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/layer_results.json \
+    --pooled_results data/probes/.../mean/layer_results.json \
+    --per_token_results data/probes_per_token/.../layer_results.json \
     --output_dir results/per_token_comparison
 ```
 
@@ -69,34 +74,30 @@ This guide explains how to train and evaluate probes using the Apollo Research p
 
 ## Aggregation Methods
 
-When evaluating per-token probes, token predictions are aggregated to sample level:
-
-| Method | Description | Usage |
-|--------|-------------|-------|
-| `mean` | Average probability across tokens | Default, stable |
-| `max` | Maximum probability (most confident token) | Catches deception anywhere |
-| `vote` | Majority vote (>50% tokens) | Robust to outliers |
-
-```python
-# Use different aggregation
-!python scripts/evaluation/eval_per_token_probes.py \
-    --probes_dir ... \
-    --ood_activations ... \
-    --aggregation max  # or 'vote'
-```
+| Method | Description | When to Use |
+|--------|-------------|-------------|
+| `mean` | Average probability across tokens | Default, most stable |
+| `max` | Maximum probability (most confident) | Catches deception anywhere |
+| `last` | Last token's probability | Matches next-token prediction |
+| `vote` | Majority vote (fraction >50%) | Robust to outliers |
 
 ---
 
 ## Output Structure
 
+When running with `--aggregation all` (default):
+
 ```
-data/probes_per_token/
-└── meta-llama_Llama-3.2-3B-Instruct/
-    └── Deception-Roleplaying/
-        ├── probe_layer_0.pt
-        ├── probe_layer_1.pt
-        ├── ...
-        ├── probe_layer_27.pt
-        ├── norm_layer_0.npz      # Normalization stats
-        └── layer_results.json    # Per-layer metrics
+results/per_token_ood/
+├── mean/
+│   ├── eval_results.json
+│   └── eval_ood_mean.png
+├── max/
+│   └── ...
+├── last/
+│   └── ...
+├── vote/
+│   └── ...
+├── eval_ood_all_aggregations.png   # Combined layerwise plot
+└── eval_ood_aggregation_bar.png    # Bar chart comparison
 ```
