@@ -13,7 +13,7 @@ This guide explains how to train and evaluate probes using the Apollo Research p
 
 ## 🚀 Colab Commands
 
-### Step 1: Train Per-Token Probes on ID Dataset
+### Step 1: Train Per-Token Probes on Single Domain
 
 ```python
 # Train on Roleplaying (ID)
@@ -23,34 +23,8 @@ This guide explains how to train and evaluate probes using the Apollo Research p
     --output_dir data/probes_per_token \
     --model meta-llama_Llama-3.2-3B-Instruct \
     --dataset Deception-Roleplaying
-```
 
----
-
-### Step 2: Evaluate on OOD Dataset (All Aggregations)
-
-```python
-# Runs all 4 aggregations (mean/max/last/vote) by default
-!python scripts/evaluation/eval_per_token_probes.py \
-    --probes_dir data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying \
-    --ood_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --output_dir results/per_token_ood
-```
-
-**Or run a specific aggregation:**
-```python
-!python scripts/evaluation/eval_per_token_probes.py \
-    --probes_dir ... \
-    --ood_activations ... \
-    --aggregation last  # Only run 'last' aggregation
-```
-
----
-
-### Step 3: Flipped Training (OOD as ID)
-
-```python
-# Train on InsiderTrading (for flipped experiment)
+# Train on InsiderTrading (flipped)
 !python scripts/training/train_per_token_probes.py \
     --train_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/train \
     --val_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
@@ -61,12 +35,69 @@ This guide explains how to train and evaluate probes using the Apollo Research p
 
 ---
 
-### Step 4: Compare Per-Token vs Pooled
+### Step 2: Train Combined Per-Token Probes
+
+```python
+# Train on combined domains (A+B)
+!python scripts/training/train_combined_per_token_probes.py \
+    --train_a data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/train \
+    --val_a data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
+    --train_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/train \
+    --val_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
+    --output_dir data/probes_combined_per_token \
+    --model meta-llama_Llama-3.2-3B-Instruct \
+    --label_a Roleplaying \
+    --label_b InsiderTrading
+```
+
+**Output**: 
+- Probes: `data/probes_combined_per_token/.../Deception-Combined/`
+- Plots: `layerwise_mean.png`, `layerwise_max.png`, `layerwise_last.png`, `aggregation_comparison.png`
+
+---
+
+### Step 3: Evaluate on OOD Dataset (All Aggregations)
+
+```python
+# Runs all 4 aggregations (mean/max/last/vote) by default
+!python scripts/evaluation/eval_per_token_probes.py \
+    --probes_dir data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying \
+    --ood_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
+    --output_dir results/per_token_ood
+```
+
+---
+
+### Step 4: Invariant Core Analysis
+
+```python
+# Is there a domain-invariant deception direction?
+!python scripts/analysis/analyze_invariant_core_per_token_probes.py \
+    --probes_a data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying \
+    --probes_b data/probes_per_token_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading \
+    --probes_combined data/probes_combined_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Combined \
+    --val_a data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
+    --val_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
+    --layer 20 \
+    --label_a Roleplaying \
+    --label_b InsiderTrading \
+    --output_dir results/invariant_core_per_token
+```
+
+**Outputs**:
+- `decomposition_analysis.png` - Component magnitudes and per-domain AUCs
+- `generalization_comparison.png` - Which component generalizes best
+- `aggregation_comparison.png` - Results for mean/max/last aggregation
+- `invariant_core_summary.json` - Full results
+
+---
+
+### Step 5: Compare Per-Token vs Pooled
 
 ```python
 !python scripts/comparison/compare_per_token_vs_pooled.py \
-    --pooled_results data/probes/.../mean/layer_results.json \
-    --per_token_results data/probes_per_token/.../layer_results.json \
+    --pooled_results data/probes/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/mean/layer_results.json \
+    --per_token_results data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/layer_results.json \
     --output_dir results/per_token_comparison
 ```
 
@@ -74,30 +105,30 @@ This guide explains how to train and evaluate probes using the Apollo Research p
 
 ## Aggregation Methods
 
-| Method | Description | When to Use |
-|--------|-------------|-------------|
-| `mean` | Average probability across tokens | Default, most stable |
-| `max` | Maximum probability (most confident) | Catches deception anywhere |
-| `last` | Last token's probability | Matches next-token prediction |
-| `vote` | Majority vote (fraction >50%) | Robust to outliers |
+| Method | Description |
+|--------|-------------|
+| `mean` | Average probability across tokens (default, stable) |
+| `max` | Maximum probability (catches deception anywhere) |
+| `last` | Last token's probability (matches next-token prediction) |
+| `vote` | Majority vote fraction (robust to outliers) |
 
 ---
 
 ## Output Structure
 
-When running with `--aggregation all` (default):
-
 ```
-results/per_token_ood/
-├── mean/
-│   ├── eval_results.json
-│   └── eval_ood_mean.png
-├── max/
-│   └── ...
-├── last/
-│   └── ...
-├── vote/
-│   └── ...
-├── eval_ood_all_aggregations.png   # Combined layerwise plot
-└── eval_ood_aggregation_bar.png    # Bar chart comparison
+data/
+├── probes_per_token/                    # Single domain A training
+├── probes_per_token_flipped/            # Single domain B training  
+└── probes_combined_per_token/           # Combined A+B training
+
+results/
+├── per_token_ood/                       # OOD evaluation
+│   ├── mean/, max/, last/, vote/        # Per-aggregation results
+│   ├── eval_ood_all_aggregations.png    # Combined plot
+│   └── eval_ood_aggregation_bar.png     # Bar chart
+└── invariant_core_per_token/            # Direction analysis
+    ├── decomposition_analysis.png
+    ├── generalization_comparison.png
+    └── invariant_core_summary.json
 ```
