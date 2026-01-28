@@ -368,6 +368,21 @@ def load_from_raw_insider_trading(json_path: str, split: str = "train") -> List[
             skipped["no_trade_message"] += 1
             continue
         
+        # CONSISTENCY ASSERTIONS - catch data corruption early
+        # Assert made_trade is exactly "yes" or "no" (not "invalid" or other)
+        made_trade_normalized = made_trade.lower().strip()
+        if made_trade_normalized not in {"yes", "no"}:
+            skipped["invalid"] += 1
+            logger.debug(f"insider_{idx}: skipping made_trade='{made_trade}'")
+            continue
+        
+        # Optional: check trade_message is consistent with label
+        has_trade_action = "execute_trade" in trade_message.lower() or "buy" in trade_message.lower() or "sell" in trade_message.lower()
+        if label == 1 and not has_trade_action:
+            logger.warning(f"insider_{idx}: label=deceptive but no trade action in message")
+        if label == 0 and has_trade_action:
+            logger.warning(f"insider_{idx}: label=honest but trade action found in message")
+        
         passage = build_passage_insider(scenario, trade_message)
         
         all_items.append({
