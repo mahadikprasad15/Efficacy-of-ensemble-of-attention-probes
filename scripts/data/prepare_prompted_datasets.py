@@ -57,6 +57,7 @@ from actprobe.datasets.templates import (
     PROMPTED_PROBING_SUFFIX_DECEPTION,
     PROMPTED_PROBING_SUFFIX_FABRICATED,
     PROMPTED_PROBING_SUFFIX_INCONSISTENCY,
+    PROMPTED_PROBING_SUFFIX_STRATEGIC_AB,
 )
 
 logging.basicConfig(
@@ -73,6 +74,7 @@ SUFFIX_CONFIG = {
     "suffix_deception_yesno": PROMPTED_PROBING_SUFFIX_DECEPTION,
     "suffix_deception_fabricated": PROMPTED_PROBING_SUFFIX_FABRICATED,
     "suffix_inconsistency": PROMPTED_PROBING_SUFFIX_INCONSISTENCY,
+    "suffix_strategic_ab": PROMPTED_PROBING_SUFFIX_STRATEGIC_AB,
 }
 
 # ============================================================================
