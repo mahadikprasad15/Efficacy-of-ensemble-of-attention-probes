@@ -103,20 +103,167 @@ def build_passage_insider(scenario: str, trade_message: str) -> str:
 
 
 def build_model_input(passage: str, suffix: str) -> str:
-    """Construct full MODEL_INPUT = PASSAGE + DELIM + SUFFIX"""
-    return passage + PROMPTED_PROBING_DELIM + suffix
+    """
+    Construct full MODEL_INPUT with explicit markup.
+    
+    Format:
+        <passage>
+        {passage}
+        </passage>
+        {suffix}
+        Answer:
+    
+    This is explicit and doesn't rely on magic delimiter constants.
+    """
+    # Ensure suffix doesn't already have Answer: (avoid double-insertion)
+    suffix = suffix.rstrip()
+    if suffix.endswith("Answer:"):
+        suffix = suffix[:-7].rstrip()  # Remove trailing Answer:
+    
+    return f"<passage>\n{passage}\n</passage>\n{suffix}\nAnswer:"
 
 
 # ============================================================================
 # Source loaders
 # ============================================================================
 
+def load_from_cached_manifest_with_yaml(
+    manifest_dir: str, 
+    raw_yaml_path: str, 
+    dataset_type: str
+) -> List[Dict[str, Any]]:
+    """
+    Load data by matching cached manifest (for completions/labels) with raw YAML (for full prompts).
+    
+    This is the **correct** approach for roleplaying data:
+    - Raw YAML has: scenario, question, answer_prefix, honest_completion, deceptive_completion
+    - Manifest has: generated_text (completion), label, id
+    
+    The passage is built faithfully from the original generation format:
+        {scenario}\n\n{question}\n{answer_prefix} {completion}
+    
+    CRITICAL: We must NOT truncate or modify the scenario in any way.
+    """
+    import yaml
+    
+    manifest_path = os.path.join(manifest_dir, "manifest.jsonl")
+    
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+    
+    if not os.path.exists(raw_yaml_path):
+        raise FileNotFoundError(
+            f"Raw YAML not found: {raw_yaml_path}\n"
+            "For roleplaying data, you MUST provide --raw_yaml pointing to the original dataset.yaml"
+        )
+    
+    logger.info(f"Loading from cached manifest: {manifest_path}")
+    logger.info(f"Matching with raw YAML: {raw_yaml_path}")
+    
+    # Load raw YAML to get full scenario/question/answer_prefix
+    with open(raw_yaml_path, 'r') as f:
+        raw_data = yaml.safe_load(f)
+    logger.info(f"  Loaded {len(raw_data)} scenarios from raw YAML")
+    
+    # Build lookup by index (manifest uses roleplaying_{idx} format)
+    yaml_lookup = {}
+    for idx, item in enumerate(raw_data):
+        yaml_lookup[f"roleplaying_{idx}"] = {
+            'scenario': item.get('scenario', ''),
+            'question': item.get('question', ''),
+            'answer_prefix': item.get('answer_prefix', ''),
+            'honest_completion': item.get('honest_completion', ''),
+            'deceptive_completion': item.get('deceptive_completion', ''),
+        }
+    
+    # Load manifest for completions and labels
+    manifest_items = []
+    with open(manifest_path, 'r') as f:
+        for line in f:
+            entry = json.loads(line)
+            manifest_items.append(entry)
+    
+    logger.info(f"  Loaded {len(manifest_items)} entries from manifest")
+    
+    # Match and build passages
+    prepared = []
+    matched = 0
+    skipped = {'no_match': 0, 'no_label': 0, 'no_completion': 0}
+    
+    for entry in manifest_items:
+        try:
+            example_id = entry.get('id')
+            completion = entry.get('generated_text', '')
+            label = entry.get('label', -1)
+            
+            if label == -1:
+                skipped['no_label'] += 1
+                continue
+            
+            if not completion:
+                skipped['no_completion'] += 1
+                continue
+            
+            # Look up full prompt info from YAML
+            if example_id not in yaml_lookup:
+                skipped['no_match'] += 1
+                logger.warning(f"No YAML match for {example_id}")
+                continue
+            
+            yaml_info = yaml_lookup[example_id]
+            
+            # Build passage with FULL scenario, question, answer_prefix
+            # This is the faithful reconstruction of the original generation prompt
+            passage = build_passage_roleplaying(
+                scenario=yaml_info['scenario'],  # NO TRUNCATION!
+                question=yaml_info['question'],
+                answer_prefix=yaml_info['answer_prefix'],
+                completion=completion
+            )
+            
+            # Sanity check: ensure no truncation artifacts
+            if '...' in yaml_info['scenario']:
+                logger.warning(f"{example_id}: Scenario contains '...' - possible truncation in source")
+            
+            prepared.append({
+                'id': example_id,
+                'completion': completion,
+                'label': label,
+                'passage': passage,
+                'metadata': {
+                    'scenario': yaml_info['scenario'],  # Full scenario
+                    'question': yaml_info['question'],
+                    'answer_prefix': yaml_info['answer_prefix'],
+                    'source': 'raw_yaml_with_cached_completion',
+                    'original_generation_length': entry.get('generation_length'),
+                }
+            })
+            matched += 1
+            
+        except Exception as e:
+            logger.warning(f"Error processing {entry.get('id')}: {e}")
+            continue
+    
+    logger.info(f"  Successfully matched: {matched}")
+    logger.info(f"  Skipped: {skipped}")
+    
+    return prepared
+
+
 def load_from_cached_manifest(manifest_dir: str, dataset_type: str) -> List[Dict[str, Any]]:
     """
-    Load data from existing cached activations manifest.
+    DEPRECATED for roleplaying data - use load_from_cached_manifest_with_yaml instead.
     
-    Expects manifest.jsonl with 'generated_text' (completion) and metadata.
+    This function is kept for backward compatibility with InsiderTrading data only,
+    where the manifest contains sufficient information.
     """
+    if dataset_type == "roleplaying":
+        raise ValueError(
+            "For roleplaying data, you MUST provide --raw_yaml pointing to the original YAML file.\n"
+            "The cached manifest lacks the full scenario, question, and answer_prefix fields.\n"
+            "Example: --source_type cached --source_path <manifest_dir> --raw_yaml /path/to/dataset.yaml"
+        )
+    
     manifest_path = os.path.join(manifest_dir, "manifest.jsonl")
     
     if not os.path.exists(manifest_path):
@@ -132,7 +279,7 @@ def load_from_cached_manifest(manifest_dir: str, dataset_type: str) -> List[Dict
     
     logger.info(f"  Loaded {len(items)} entries from manifest")
     
-    # Convert to standardized format
+    # Convert to standardized format (InsiderTrading only)
     prepared = []
     for entry in items:
         try:
@@ -147,25 +294,8 @@ def load_from_cached_manifest(manifest_dir: str, dataset_type: str) -> List[Dict
                 logger.warning(f"Skipping {entry.get('id')}: empty completion")
                 continue
             
-            # Build metadata based on dataset type
-            if dataset_type == "roleplaying":
-                # For roleplaying, we need scenario from metadata
-                # The manifest should have 'scenario' truncated; we may need to reconstruct
-                scenario = entry.get('scenario', '')
-                
-                # We don't have question/answer_prefix in the manifest
-                # Fall back to using completion directly with scenario
-                passage = build_passage_roleplaying(
-                    scenario=scenario,
-                    question="",  # Not available in manifest
-                    answer_prefix="",
-                    completion=completion
-                )
-            elif dataset_type == "insider":
-                scenario = entry.get('scenario', '')
-                passage = build_passage_insider(scenario, completion)
-            else:
-                raise ValueError(f"Unknown dataset_type: {dataset_type}")
+            scenario = entry.get('scenario', '')
+            passage = build_passage_insider(scenario, completion)
             
             prepared.append({
                 'id': entry.get('id'),
@@ -173,7 +303,7 @@ def load_from_cached_manifest(manifest_dir: str, dataset_type: str) -> List[Dict
                 'label': label,
                 'passage': passage,
                 'metadata': {
-                    'scenario': scenario[:500],
+                    'scenario': scenario,
                     'source': 'cached_manifest',
                     'original_generation_length': entry.get('generation_length'),
                 }
@@ -246,7 +376,7 @@ def load_from_raw_insider_trading(json_path: str, split: str = "train") -> List[
             'label': label,
             'passage': passage,
             'metadata': {
-                'scenario': scenario[:500],
+                'scenario': scenario,  # FULL scenario, no truncation
                 'made_trade': made_trade,
                 'source': 'raw_apollo',
             }
@@ -332,7 +462,7 @@ def load_from_raw_roleplaying(yaml_path: str, cached_manifest_path: Optional[str
             'label': label,
             'passage': passage,
             'metadata': {
-                'scenario': scenario[:500],
+                'scenario': scenario,  # Full scenario, NO truncation
                 'question': question,
                 'answer_prefix': answer_prefix,
                 'source': 'raw_yaml_with_cached_completion',
@@ -407,6 +537,12 @@ def main():
         help="Path to cached manifest with completions (for roleplaying + raw source)"
     )
     parser.add_argument(
+        "--raw_yaml",
+        type=str,
+        default=None,
+        help="Path to raw YAML dataset file (REQUIRED for roleplaying to get full scenario/question/answer_prefix)"
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="data/prepared_datasets",
@@ -436,8 +572,22 @@ def main():
     
     # Load data based on source type
     if args.source_type == "cached":
-        items = load_from_cached_manifest(args.source_path, args.dataset_type)
-    else:  # raw
+        if args.dataset_type == "roleplaying":
+            # For roleplaying, we MUST have raw_yaml to get full scenario/question/answer_prefix
+            if not args.raw_yaml:
+                raise ValueError(
+                    "For roleplaying data, you MUST provide --raw_yaml pointing to the original YAML file.\n"
+                    "The cached manifest lacks the full scenario, question, and answer_prefix fields.\n"
+                    "Example: --source_type cached --source_path <manifest_dir> --raw_yaml /path/to/dataset.yaml"
+                )
+            items = load_from_cached_manifest_with_yaml(
+                args.source_path, 
+                args.raw_yaml, 
+                args.dataset_type
+            )
+        else:
+            items = load_from_cached_manifest(args.source_path, args.dataset_type)
+    else:  # raw source
         if args.dataset_type == "insider":
             items = load_from_raw_insider_trading(args.source_path, args.split)
         elif args.dataset_type == "roleplaying":
@@ -458,8 +608,46 @@ def main():
     logger.info(f"\nBuilding MODEL_INPUT for {len(items)} items...")
     
     prepared_items = []
+    truncation_warnings = 0
+    ending_issues = 0
+    tag_issues = 0
+    question_missing = 0
+    
     for item in items:
         model_input = build_model_input(item['passage'], suffix)
+        
+        # SANITY CHECK 1: Detect truncation artifacts in ACTUAL passage (not metadata)
+        if '...' in item['passage']:
+            truncation_warnings += 1
+            if truncation_warnings <= 3:
+                logger.warning(f"TRUNCATION DETECTED in {item['id']}: '...' found in passage")
+        
+        # SANITY CHECK 2: Validate tag structure
+        if model_input.count('<passage>') != 1:
+            tag_issues += 1
+            if tag_issues <= 3:
+                logger.error(f"{item['id']}: Wrong number of <passage> tags: {model_input.count('<passage>')}")
+        if model_input.count('</passage>') != 1:
+            tag_issues += 1
+            if tag_issues <= 3:
+                logger.error(f"{item['id']}: Wrong number of </passage> tags: {model_input.count('</passage>')}")
+        
+        # SANITY CHECK 3: Ensure model_input ends with Answer:
+        if not model_input.strip().endswith("Answer:"):
+            ending_issues += 1
+            if ending_issues <= 3:
+                logger.error(f"{item['id']}: model_input doesn't end with 'Answer:'")
+        
+        # SANITY CHECK 4: For roleplaying, ensure question AND answer_prefix are in passage
+        if args.dataset_type == "roleplaying":
+            question = item.get('metadata', {}).get('question', '')
+            answer_prefix = item.get('metadata', {}).get('answer_prefix', '')
+            if question and question not in item['passage']:
+                question_missing += 1
+                if question_missing <= 3:
+                    logger.warning(f"{item['id']}: question line missing from passage!")
+            if answer_prefix and answer_prefix not in item['passage']:
+                logger.warning(f"{item['id']}: answer_prefix missing from passage!")
         
         prepared_items.append({
             'id': item['id'],
@@ -470,6 +658,14 @@ def main():
             'char_count': len(model_input),
             'metadata': item['metadata']
         })
+    
+    # Summary of issues
+    if truncation_warnings > 0:
+        logger.warning(f"\n⚠️  {truncation_warnings} items have '...' in passage (possible truncation)")
+    if tag_issues > 0:
+        logger.error(f"\n❌ {tag_issues} items have tag structure issues")
+    if ending_issues > 0:
+        logger.error(f"\n❌ {ending_issues} items don't end with 'Answer:'")
     
     # Create output directory
     dataset_name = "Deception-Roleplaying" if args.dataset_type == "roleplaying" else "Deception-InsiderTrading"
