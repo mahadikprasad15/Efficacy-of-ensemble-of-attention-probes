@@ -334,7 +334,20 @@ def main():
 
     if not os.path.exists(eval_dir):
         logger.error(f"Evaluation data not found: {eval_dir}")
-        logger.error(f"Run cache_deception_activations.py first to create this split.")
+        
+        # Check parent directory (dataset level)
+        parent = os.path.dirname(eval_dir)
+        if os.path.exists(parent):
+            siblings = os.listdir(parent)
+            logger.info(f"Available splits in {parent}: {siblings}")
+        else:
+            # Check suffix level
+            suffix_parent = os.path.dirname(os.path.dirname(parent))
+            if os.path.exists(suffix_parent):
+                suffixes = os.listdir(suffix_parent)
+                logger.info(f"Available suffixes in {suffix_parent}: {suffixes}")
+                
+        logger.error(f"Run cache_prompted_activations.py first to create this split.")
         return 1
 
     # Load dataset
