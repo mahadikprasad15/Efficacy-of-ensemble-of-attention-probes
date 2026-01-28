@@ -355,6 +355,11 @@ def main():
         default="data/probes",
         help="Output directory for trained probes"
     )
+    parser.add_argument(
+        "--split_train_for_test",
+        action="store_true",
+        help="If set, splits 20%% of training data for validation (if validation split missing)"
+    )
 
     args = parser.parse_args()
 
@@ -402,8 +407,26 @@ def main():
     if splits_exist['validation']:
         val_dataset = CachedDeceptionDataset(val_dir)
     else:
-        logger.warning("Validation split not found, using train for validation")
-        val_dataset = train_dataset
+        if args.split_train_for_test:
+            logger.warning("Validation split not found. splitting 20% from TRAIN.")
+            # Splitting logic
+            total = len(train_dataset.items)
+            val_size = int(total * 0.2)
+            if val_size < 1: val_size = 1
+            
+            # Split items
+            val_items = train_dataset.items[-val_size:]
+            train_dataset.items = train_dataset.items[:-val_size]
+            
+            # Create val dataset
+            val_dataset = CachedDeceptionDataset.__new__(CachedDeceptionDataset)
+            val_dataset.items = val_items
+            val_dataset.input_format = train_dataset.input_format
+            
+            logger.info(f"  Train: {len(train_dataset)} | Val (split): {len(val_dataset)}")
+        else:
+            logger.warning("Validation split not found, using train for validation")
+            val_dataset = train_dataset
 
     if splits_exist['test']:
         test_dataset = CachedDeceptionDataset(test_dir)
