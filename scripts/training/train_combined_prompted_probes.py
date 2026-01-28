@@ -260,7 +260,10 @@ def main():
     parser.add_argument("--limit_b", type=int, default=None,
                         help="Limit samples from dataset B")
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--output_dir", type=str, default="data/probes_combined_prompted")
+    parser.add_argument("--probes_dir", type=str, default="data/prompted_probes_combined",
+                        help="Directory to save trained probes")
+    parser.add_argument("--results_dir", type=str, default="results/prompted_probes_combined",
+                        help="Directory to save results and plots")
     
     args = parser.parse_args()
     
@@ -320,11 +323,19 @@ def main():
     results_a = []
     results_b = []
     
-    output_dir = os.path.join(
-        args.output_dir, model_dir, args.suffix_condition,
+    # Probes directory
+    probes_dir = os.path.join(
+        args.probes_dir, model_dir, args.suffix_condition,
         f"{args.dataset_a}+{args.dataset_b}"
     )
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(probes_dir, exist_ok=True)
+    
+    # Results directory
+    results_output_dir = os.path.join(
+        args.results_dir, model_dir, args.suffix_condition,
+        f"{args.dataset_a}+{args.dataset_b}"
+    )
+    os.makedirs(results_output_dir, exist_ok=True)
     
     for layer_idx in range(num_layers):
         logger.info(f"Training Layer {layer_idx}...")
@@ -352,7 +363,7 @@ def main():
         print(f"  L{layer_idx}: {args.dataset_a} AUC={metrics_a['auc']:.4f} | {args.dataset_b} AUC={metrics_b['auc']:.4f}")
         
         # Save probe
-        probe_path = os.path.join(output_dir, f"probe_layer_{layer_idx}.pt")
+        probe_path = os.path.join(probes_dir, f"probe_layer_{layer_idx}.pt")
         torch.save(model.state_dict(), probe_path)
     
     # ========================================================================
@@ -374,12 +385,12 @@ def main():
         "results_b": results_b
     }
     
-    results_path = os.path.join(output_dir, "combined_results.json")
+    results_path = os.path.join(results_output_dir, "combined_results.json")
     with open(results_path, 'w') as f:
         json.dump(summary, f, indent=2)
     
     # Plot
-    plot_path = os.path.join(output_dir, "combined_layerwise_auc.png")
+    plot_path = os.path.join(results_output_dir, "combined_layerwise_auc.png")
     plot_results(results_a, results_b, args.dataset_a, args.dataset_b, plot_path)
     
     print("\n" + "=" * 70)
