@@ -264,6 +264,8 @@ def main():
                         help="Directory to save trained probes")
     parser.add_argument("--results_dir", type=str, default="results/prompted_probes_combined",
                         help="Directory to save results and plots")
+    parser.add_argument("--split_train_for_test", action="store_true",
+                        help="If set, uses a portion of train data for testing if test split is missing")
     
     args = parser.parse_args()
     
@@ -308,8 +310,33 @@ def main():
     )
     
     logger.info(f"Loading validation data...")
-    val_dataset_a = CachedPromptedDataset(val_dir_a, limit=None)
-    val_dataset_b = CachedPromptedDataset(val_dir_b, limit=None)
+    
+    # helper to load or split
+    def load_or_split(data_dir, train_dataset, limit_split):
+        try:
+            return CachedPromptedDataset(data_dir, limit=None)
+        except (FileNotFoundError, IndexError):
+            if args.split_train_for_test:
+                logger.warning(f"Validation data not found at {data_dir}. Splitting from TRAIN.")
+                if len(train_dataset.items) < 20:
+                    raise ValueError("Train dataset too small to split.")
+                
+                # Take last N samples for validation
+                split_size = limit_split if limit_split else min(100, int(len(train_dataset.items) * 0.2))
+                val_items = train_dataset.items[-split_size:]
+                train_dataset.items = train_dataset.items[:-split_size]
+                
+                logger.info(f"  Split {len(val_items)} samples for validation. Train now has {len(train_dataset.items)}.")
+                
+                # Create new dataset object manually
+                val_ds = CachedPromptedDataset.__new__(CachedPromptedDataset)
+                val_ds.items = val_items
+                return val_ds
+            else:
+                raise
+
+    val_dataset_a = load_or_split(val_dir_a, train_dataset_a, args.limit_a)
+    val_dataset_b = load_or_split(val_dir_b, train_dataset_b, args.limit_b)
     
     # Get dimensions
     sample_tensor = train_dataset_a.items[0]['tensor']
