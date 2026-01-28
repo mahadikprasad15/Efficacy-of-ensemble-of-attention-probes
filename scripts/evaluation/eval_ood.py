@@ -268,7 +268,7 @@ def main():
     logger.info(f"Using device: {device}\n")
 
     # ========================================================================
-    # 1. Load best probe info
+    # 1. Load best probe info & Identify all probes
     # ========================================================================
 
     logger.info(f"Loading best probe info from {args.best_probe_json}...")
@@ -276,13 +276,34 @@ def main():
     with open(args.best_probe_json, 'r') as f:
         best_info = json.load(f)
 
-    # Handle both 'layer' and 'best_layer' keys for backward compatibility
-    layer_key = 'best_layer' if 'best_layer' in best_info else 'layer'
-    auc_key = 'best_val_auc' if 'best_val_auc' in best_info else 'val_auc'
-    
-    logger.info(f"✓ Best probe: Layer {best_info[layer_key]} (Val AUC: {best_info[auc_key]:.4f})")
-    logger.info(f"  Probe path: {best_info['probe_path']}\n")
+    # Infer probe directory
+    probe_dir = os.path.dirname(args.best_probe_json)
+    logger.info(f"Probe directory: {probe_dir}")
 
+    # Find all probe checkpoints
+    probe_files = glob.glob(os.path.join(probe_dir, "probe_layer_*.pt"))
+    if not probe_files:
+        logger.error(f"No probe files found in {probe_dir}")
+        return 1
+    
+    # Parse layers
+    probes_by_layer = {}
+    for p in probe_files:
+        try:
+            # Extract layer index from filename "probe_layer_X.pt"
+            fname = os.path.basename(p)
+            layer_idx = int(fname.replace("probe_layer_", "").replace(".pt", ""))
+            probes_by_layer[layer_idx] = p
+        except ValueError:
+            continue
+    
+    sorted_layers = sorted(probes_by_layer.keys())
+    logger.info(f"Found {len(sorted_layers)} trained probes (Layers {min(sorted_layers)} to {max(sorted_layers)})")
+
+    # Handle backward compatibility keys
+    best_layer_key = 'best_layer' if 'best_layer' in best_info else 'layer'
+    best_auc_key = 'best_val_auc' if 'best_val_auc' in best_info else 'val_auc'
+    
     # ========================================================================
     # 2. Load evaluation dataset
     # ========================================================================
@@ -319,7 +340,7 @@ def main():
     # Load dataset
     eval_dataset = CachedDeceptionDataset(eval_dir)
 
-    # Extract specific layer
+    # Helper class for layer extraction
     class LayerDataset(Dataset):
         def __init__(self, base_dataset, layer_idx):
             self.base = base_dataset
@@ -332,106 +353,142 @@ def main():
             x, y = self.base[idx]
             return x[self.layer_idx], y
 
-    layer_dataset = LayerDataset(eval_dataset, best_info[layer_key])
-    eval_loader = DataLoader(
-        layer_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0
-    )
-
     # ========================================================================
-    # 3. Load probe model
+    # 3. Evaluate All Layers
     # ========================================================================
 
-    logger.info(f"Loading probe model...")
+    # Infer pooling from directory name (usually the parent folder name)
+    pooling = os.path.basename(probe_dir)
+    logger.info(f"Inferring pooling from directory: {pooling}")
 
-    # Get tensor shape and input format from first batch
-    sample_x, _ = next(iter(eval_loader))
+    # Determine dimensions from dataset
     input_format = eval_dataset.input_format
     
-    if input_format == 'final_token':
-        # (B, D) for final-token format
-        D = sample_x.shape[1]
-        T = 1
-        logger.info(f"  Tensor shape: ({D} dim) - final_token format")
-    else:
-        # (B, T, D) for pooled format
-        T, D = sample_x.shape[1], sample_x.shape[2]
-        logger.info(f"  Tensor shape: ({T} tokens, {D} dim) - pooled format")
-
-    # Infer pooling from probe directory
-    pooling = os.path.basename(os.path.dirname(best_info['probe_path']))
-    logger.info(f"  Pooling: {pooling}")
+    # Peek at first item to get D
+    sample_x = eval_dataset.items[0]['tensor']
+    D = sample_x.shape[-1]
     
     # Override pooling for final_token format
     if input_format == 'final_token' and pooling not in ['none', 'last']:
-        logger.warning(f"Input is final_token format but probe was trained with {pooling} pooling")
-        logger.warning(f"Overriding to 'none' for compatibility")
+        logger.warning(f"Input is final_token format but probe dir is {pooling}. Overriding to 'none'.")
         pooling = 'none'
 
-    # Create model
-    model = LayerProbe(
-        input_dim=D,
-        pooling_type=pooling
-    ).to(device)
-
-    # Load weights
-    model.load_state_dict(torch.load(best_info['probe_path'], map_location=device))
-    logger.info(f"✓ Loaded probe weights\n")
+    logger.info(f"Starting evaluation of {len(sorted_layers)} layers...")
+    
+    layer_results = []
+    
+    for layer_idx in sorted_layers:
+        logger.info(f"Evaluating Layer {layer_idx}...")
+        
+        # specific loader/dataset for this layer
+        layer_ds = LayerDataset(eval_dataset, layer_idx)
+        layer_loader = DataLoader(layer_ds, batch_size=args.batch_size, shuffle=False)
+        
+        # Load probe
+        probe_path = probes_by_layer[layer_idx]
+        model = LayerProbe(input_dim=D, pooling_type=pooling).to(device)
+        model.load_state_dict(torch.load(probe_path, map_location=device))
+        
+        # Eval
+        metrics, _, _, _ = evaluate_probe(model, layer_loader, device)
+        
+        layer_results.append({
+            "layer": layer_idx,
+            "auc": metrics['auc'],
+            "accuracy": metrics['accuracy']
+        })
+        
+        # Log brief result
+        print(f"  L{layer_idx}: AUC={metrics['auc']:.4f} Acc={metrics['accuracy']:.4f}")
 
     # ========================================================================
-    # 4. Evaluate
+    # 4. Analyze & Plot
     # ========================================================================
+    
+    # Find best OOD layer
+    best_ood = max(layer_results, key=lambda x: x['auc'])
+    logger.info(f"\nBest OOD Performance: Layer {best_ood['layer']} (AUC: {best_ood['auc']:.4f})")
 
-    logger.info(f"Evaluating...")
-    metrics, preds, targets, probs = evaluate_probe(model, eval_loader, device)
-
-    # Print report
-    print_evaluation_report(metrics, args.eval_dataset, args.eval_split)
+    # Plot
+    try:
+        plot_ood_performance(layer_results, args.eval_dataset, probe_dir)
+    except Exception as e:
+        logger.warning(f"Failed to generate plot: {e}")
 
     # ========================================================================
     # 5. Save results
     # ========================================================================
 
-    output_dir = args.output_dir if args.output_dir else os.path.dirname(best_info['probe_path'])
+    output_dir = args.output_dir if args.output_dir else probe_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    # Save metrics
     results_file = os.path.join(
         output_dir,
-        f"eval_{args.eval_dataset}_{args.eval_split}.json"
+        f"eval_ood_{args.eval_dataset}_{args.eval_split}.json"
     )
 
-    results = {
-        "probe_layer": best_info[layer_key],
+    full_results = {
         "eval_dataset": args.eval_dataset,
         "eval_split": args.eval_split,
-        "num_examples": len(eval_dataset),
-        "metrics": {k: float(v) if isinstance(v, (np.floating, float)) else v
-                    for k, v in metrics.items()}
+        "best_ood_layer": best_ood['layer'],
+        "best_ood_auc": best_ood['auc'],
+        "best_ood_acc": best_ood['accuracy'],
+        "layer_results": layer_results
     }
 
     with open(results_file, 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(full_results, f, indent=2)
 
     logger.info(f"✓ Saved results to {results_file}")
-
-    # ========================================================================
-    # 6. Summary
-    # ========================================================================
 
     print("\n" + "=" * 70)
     print("✓ EVALUATION COMPLETE")
     print("=" * 70)
-    print(f"Dataset: {args.eval_dataset} ({args.eval_split})")
-    print(f"Probe: Layer {best_info[layer_key]}")
-    print(f"AUROC: {metrics['auc']:.4f}")
-    print(f"Accuracy: {metrics['accuracy']:.4f}")
-    print(f"Results saved to: {results_file}")
+    print(f"Best OOD Layer: {best_ood['layer']}")
+    print(f"AUROC: {best_ood['auc']:.4f}")
+    print(f"Accuracy: {best_ood['accuracy']:.4f}")
     print("=" * 70)
 
     return 0
+
+def plot_ood_performance(results, dataset_name, output_dir):
+    """Generate AUC/Accuracy vs Layer plot"""
+    import matplotlib.pyplot as plt
+    
+    layers = [r['layer'] for r in results]
+    aucs = [r['auc'] for r in results]
+    accs = [r['accuracy'] for r in results]
+    
+    plt.figure(figsize=(12, 6))
+    
+    # Plot AUC
+    plt.plot(layers, aucs, 'o-', label='AUC', color='#1f77b4', linewidth=2)
+    # Plot Accuracy
+    plt.plot(layers, accs, 's--', label='Accuracy', color='#2ca02c', linewidth=2, alpha=0.7)
+    
+    # Highlight best AUC
+    best_idx = np.argmax(aucs)
+    plt.plot(layers[best_idx], aucs[best_idx], 'r*', markersize=15, label=f'Best (L{layers[best_idx]})')
+    
+    plt.title(f"OOD Performance on {dataset_name}", fontsize=14)
+    plt.xlabel("Layer", fontsize=12)
+    plt.ylabel("Metric Score", fontsize=12)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Add text annotation for best score
+    plt.annotate(
+        f"Best AUC: {aucs[best_idx]:.4f}\nLayer {layers[best_idx]}",
+        xy=(layers[best_idx], aucs[best_idx]),
+        xytext=(0, 10), textcoords='offset points',
+        ha='center', va='bottom',
+        bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.5)
+    )
+    
+    save_path = os.path.join(output_dir, f"ood_metrics_{dataset_name}.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved plot to {save_path}")
 
 if __name__ == "__main__":
     exit(main())
