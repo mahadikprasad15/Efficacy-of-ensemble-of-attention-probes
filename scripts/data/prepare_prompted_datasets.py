@@ -56,6 +56,7 @@ from actprobe.datasets.templates import (
     PROMPTED_PROBING_DELIM,
     PROMPTED_PROBING_SUFFIX_DECEPTION,
     PROMPTED_PROBING_SUFFIX_FABRICATED,
+    PROMPTED_PROBING_SUFFIX_INCONSISTENCY,
 )
 
 logging.basicConfig(
@@ -69,10 +70,9 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 SUFFIX_CONFIG = {
-    "deception_yesno": PROMPTED_PROBING_SUFFIX_DECEPTION,
-    "deception_fabricated": PROMPTED_PROBING_SUFFIX_FABRICATED,
-    # Add more suffixes here as needed:
-    # "fabricated_excuse": PROMPTED_PROBING_SUFFIX_FABRICATED,
+    "suffix_deception_yesno": PROMPTED_PROBING_SUFFIX_DECEPTION,
+    "suffix_deception_fabricated": PROMPTED_PROBING_SUFFIX_FABRICATED,
+    "suffix_inconsistency": PROMPTED_PROBING_SUFFIX_INCONSISTENCY,
 }
 
 # ============================================================================
