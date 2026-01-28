@@ -7,11 +7,22 @@ import torch
 import torch.nn as nn
 from .pooling import MeanPooling, MaxPooling, LastTokenPooling, LearnedAttentionPooling
 
+
+class IdentityPooling(nn.Module):
+    """No-op pooling for final-token activations that are already (B, D)."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, D) or (B, T, D) where T=1
+        if x.dim() == 3:
+            return x.squeeze(1)  # (B, 1, D) -> (B, D)
+        return x  # (B, D) -> (B, D)
+
+
 POOLING_MAP = {
     "mean": MeanPooling,
     "max": MaxPooling,
     "last": LastTokenPooling,
-    "attn": LearnedAttentionPooling
+    "attn": LearnedAttentionPooling,
+    "none": IdentityPooling
 }
 
 class LayerProbe(nn.Module):

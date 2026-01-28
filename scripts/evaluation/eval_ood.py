@@ -1,26 +1,26 @@
 """
 Evaluate best probe on out-of-distribution (OOD) datasets.
 
-This script:
-    1. Loads best probe from analysis
-    2. Evaluates on OOD test sets (different splits or datasets)
-    3. Generates confusion matrix and metrics
-    4. Saves results for comparison
+Supports both:
+    - Standard activations: (L, T, D)
+    - Prompted-probing activations: (L, D)
 
 Usage:
-    # Evaluate on test split of same dataset
-    python scripts/eval_ood.py \
-        --best_probe_json data/probes/.../mean/best_probe.json \
-        --model meta-llama/Llama-3.2-3B-Instruct \
-        --eval_dataset Deception-Roleplaying \
-        --eval_split test
-
-    # Evaluate on different dataset (if you have multiple cached)
+    # Standard evaluation
     python scripts/eval_ood.py \
         --best_probe_json data/probes/.../mean/best_probe.json \
         --model meta-llama/Llama-3.2-3B-Instruct \
         --eval_dataset Deception-InsiderTrading \
         --eval_split test
+
+    # Prompted-probing evaluation
+    python scripts/eval_ood.py \
+        --best_probe_json data/probes/.../suffix_deception_yesno/.../none/best_probe.json \
+        --model meta-llama/Llama-3.2-3B-Instruct \
+        --eval_dataset Deception-InsiderTrading \
+        --suffix_condition suffix_deception_yesno \
+        --activations_dir data/prompted_activations \
+        --eval_split validation
 """
 
 import argparse
@@ -101,6 +101,16 @@ class CachedDeceptionDataset(Dataset):
                 logger.error(f"Error loading {shard_path}: {e}")
 
         logger.info(f"✓ Loaded {len(self.items)} examples")
+        
+        # Detect input format from tensor shape
+        if self.items:
+            sample_shape = self.items[0]['tensor'].shape
+            if len(sample_shape) == 2:
+                self.input_format = 'final_token'  # (L, D)
+            elif len(sample_shape) == 3:
+                self.input_format = 'pooled'  # (L, T, D)
+            else:
+                raise ValueError(f"Unexpected tensor shape: {sample_shape}")
 
         # Log distribution
         labels = [item['label'] for item in self.items]
@@ -108,6 +118,7 @@ class CachedDeceptionDataset(Dataset):
         deceptive = sum(1 for l in labels if l == 1)
         logger.info(f"  • Honest: {honest} ({100*honest/len(labels):.1f}%)")
         logger.info(f"  • Deceptive: {deceptive} ({100*deceptive/len(labels):.1f}%)")
+        logger.info(f"  • Input format: {self.input_format}")
 
     def __len__(self):
         return len(self.items)
@@ -244,6 +255,12 @@ def main():
         default=32,
         help="Batch size for evaluation"
     )
+    parser.add_argument(
+        "--suffix_condition",
+        type=str,
+        default=None,
+        help="Suffix condition subdirectory (e.g., suffix_deception_yesno) for prompted activations"
+    )
 
     args = parser.parse_args()
 
@@ -267,12 +284,23 @@ def main():
     # ========================================================================
 
     model_dir = args.model.replace("/", "_")
-    eval_dir = os.path.join(
-        args.activations_dir,
-        model_dir,
-        args.eval_dataset,
-        args.eval_split
-    )
+    
+    # Build path - handle prompted activations with suffix_condition
+    if args.suffix_condition:
+        eval_dir = os.path.join(
+            args.activations_dir,
+            model_dir,
+            args.suffix_condition,
+            args.eval_dataset,
+            args.eval_split
+        )
+    else:
+        eval_dir = os.path.join(
+            args.activations_dir,
+            model_dir,
+            args.eval_dataset,
+            args.eval_split
+        )
 
     logger.info(f"Loading evaluation data...")
     logger.info(f"  Dataset: {args.eval_dataset}")
@@ -314,15 +342,29 @@ def main():
 
     logger.info(f"Loading probe model...")
 
-    # Get tensor shape from first batch
+    # Get tensor shape and input format from first batch
     sample_x, _ = next(iter(eval_loader))
-    T, D = sample_x.shape[1], sample_x.shape[2]
-
-    logger.info(f"  Tensor shape: ({T} tokens, {D} dim)")
+    input_format = eval_dataset.input_format
+    
+    if input_format == 'final_token':
+        # (B, D) for final-token format
+        D = sample_x.shape[1]
+        T = 1
+        logger.info(f"  Tensor shape: ({D} dim) - final_token format")
+    else:
+        # (B, T, D) for pooled format
+        T, D = sample_x.shape[1], sample_x.shape[2]
+        logger.info(f"  Tensor shape: ({T} tokens, {D} dim) - pooled format")
 
     # Infer pooling from probe directory
     pooling = os.path.basename(os.path.dirname(best_info['probe_path']))
     logger.info(f"  Pooling: {pooling}")
+    
+    # Override pooling for final_token format
+    if input_format == 'final_token' and pooling not in ['none', 'last']:
+        logger.warning(f"Input is final_token format but probe was trained with {pooling} pooling")
+        logger.warning(f"Overriding to 'none' for compatibility")
+        pooling = 'none'
 
     # Create model
     model = LayerProbe(

@@ -45,7 +45,12 @@ POOLING_COLORS = {
 
 
 def load_activations(act_dir, layer, pooling):
-    """Load and pool activations from a directory."""
+    """Load and pool activations from a directory.
+    
+    Supports both:
+    - Standard activations: (L, T, D) - requires pooling
+    - Prompted-probing activations: (L, D) - no pooling needed
+    """
     manifest_path = os.path.join(act_dir, 'manifest.jsonl')
     with open(manifest_path, 'r') as f:
         manifest = [json.loads(line) for line in f]
@@ -60,16 +65,26 @@ def load_activations(act_dir, layer, pooling):
         eid = entry['id']
         if eid in all_tensors:
             tensor = all_tensors[eid]
-            x_layer = tensor[layer, :, :]  # (T, D)
             
-            if pooling == 'mean':
-                pooled = x_layer.mean(dim=0)
-            elif pooling == 'max':
-                pooled = x_layer.max(dim=0)[0]
-            elif pooling == 'last':
-                pooled = x_layer[-1, :]
+            # Auto-detect format based on tensor shape
+            if len(tensor.shape) == 2:
+                # Prompted-probing format: (L, D)
+                pooled = tensor[layer, :]  # (D,)
+            elif len(tensor.shape) == 3:
+                # Standard format: (L, T, D)
+                x_layer = tensor[layer, :, :]  # (T, D)
+                
+                if pooling == 'mean':
+                    pooled = x_layer.mean(dim=0)
+                elif pooling == 'max':
+                    pooled = x_layer.max(dim=0)[0]
+                elif pooling == 'last':
+                    pooled = x_layer[-1, :]
+                else:
+                    pooled = x_layer.mean(dim=0)  # Default to mean
             else:
-                pooled = x_layer.mean(dim=0)  # Default to mean
+                print(f"Unexpected tensor shape for {eid}: {tensor.shape}")
+                continue
             
             activations.append(pooled.numpy())
             labels.append(entry['label'])

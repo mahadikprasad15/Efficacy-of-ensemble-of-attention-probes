@@ -1,24 +1,24 @@
 """
 Train probes for deception detection using cached activations.
 
-Simple training script (no LODO):
-    - Train on one dataset (e.g., Deception-Roleplaying)
-    - Validate on same dataset
-    - Test on same dataset or different split
+Supports two input formats:
+    - 'pooled': Standard activations with shape (L, T, D), requires pooling
+    - 'final_token': Prompted-probing activations with shape (L, D), no pooling needed
 
 Usage:
-    # Train mean pooling probe on single dataset
+    # Train with standard pooled activations
     python scripts/train_deception_probes.py \
         --model meta-llama/Llama-3.2-3B-Instruct \
         --dataset Deception-Roleplaying \
         --pooling mean
 
-    # Train with attention pooling
+    # Train with prompted-probing final-token activations
     python scripts/train_deception_probes.py \
         --model meta-llama/Llama-3.2-3B-Instruct \
         --dataset Deception-Roleplaying \
-        --pooling attn \
-        --epochs 20
+        --activations_dir data/prompted_activations \
+        --suffix_condition suffix_deception_yesno \
+        --input_format final_token
 
     # Train on specific layer only
     python scripts/train_deception_probes.py \
@@ -120,7 +120,7 @@ class CachedDeceptionDataset(Dataset):
 
                     self.items.append({
                         "id": eid,
-                        "tensor": tensor,  # (L, T, D)
+                        "tensor": tensor,  # (L, T, D) or (L, D)
                         "label": label
                     })
 
@@ -128,6 +128,18 @@ class CachedDeceptionDataset(Dataset):
                 logger.error(f"Error loading shard {shard_path}: {e}")
 
         logger.info(f"✓ Loaded {len(self.items)} examples")
+        
+        # Detect input format from tensor shape
+        if self.items:
+            sample_shape = self.items[0]['tensor'].shape
+            if len(sample_shape) == 2:
+                self.input_format = 'final_token'  # (L, D)
+                logger.info(f"  • Input format: final_token (L={sample_shape[0]}, D={sample_shape[1]})")
+            elif len(sample_shape) == 3:
+                self.input_format = 'pooled'  # (L, T, D)
+                logger.info(f"  • Input format: pooled (L={sample_shape[0]}, T={sample_shape[1]}, D={sample_shape[2]})")
+            else:
+                raise ValueError(f"Unexpected tensor shape: {sample_shape}")
 
         # Log label distribution
         labels = [item['label'] for item in self.items]
@@ -306,14 +318,27 @@ def main():
         "--pooling",
         type=str,
         default="mean",
-        choices=["mean", "max", "last", "attn"],
-        help="Token pooling strategy"
+        choices=["mean", "max", "last", "attn", "none"],
+        help="Token pooling strategy ('none' for final_token input format)"
     )
     parser.add_argument(
         "--layer",
         type=int,
         default=None,
         help="Specific layer to probe (if None, trains on all layers)"
+    )
+    parser.add_argument(
+        "--input_format",
+        type=str,
+        default="auto",
+        choices=["auto", "pooled", "final_token"],
+        help="Input format: 'pooled' (L,T,D), 'final_token' (L,D), or 'auto' to detect"
+    )
+    parser.add_argument(
+        "--suffix_condition",
+        type=str,
+        default=None,
+        help="Suffix condition subdirectory (e.g., suffix_deception_yesno) for prompted activations"
     )
 
     # Training hyperparameters
@@ -342,9 +367,15 @@ def main():
 
     model_dir = args.model.replace("/", "_")
 
-    train_dir = os.path.join(args.activations_dir, model_dir, args.dataset, "train")
-    val_dir = os.path.join(args.activations_dir, model_dir, args.dataset, "validation")
-    test_dir = os.path.join(args.activations_dir, model_dir, args.dataset, "test")
+    # Build paths - handle prompted activations with suffix_condition subdirectory
+    if args.suffix_condition:
+        train_dir = os.path.join(args.activations_dir, model_dir, args.suffix_condition, args.dataset, "train")
+        val_dir = os.path.join(args.activations_dir, model_dir, args.suffix_condition, args.dataset, "validation")
+        test_dir = os.path.join(args.activations_dir, model_dir, args.suffix_condition, args.dataset, "test")
+    else:
+        train_dir = os.path.join(args.activations_dir, model_dir, args.dataset, "train")
+        val_dir = os.path.join(args.activations_dir, model_dir, args.dataset, "validation")
+        test_dir = os.path.join(args.activations_dir, model_dir, args.dataset, "test")
 
     logger.info(f"{'='*70}")
     logger.info(f"Loading datasets...")
@@ -401,10 +432,24 @@ def main():
             num_workers=0
         )
 
-    # Get tensor shape from first batch
+    # Get tensor shape and input format from first batch
     sample_x, _ = next(iter(train_loader))
-    L, T, D = sample_x.shape[1], sample_x.shape[2], sample_x.shape[3]
-    logger.info(f"\nTensor shape: (batch, {L} layers, {T} tokens, {D} dim)")
+    input_format = train_dataset.input_format
+    
+    if input_format == 'final_token':
+        # (B, L, D)
+        L, D = sample_x.shape[1], sample_x.shape[2]
+        T = 1  # No token dimension
+        logger.info(f"\nTensor shape: (batch, {L} layers, {D} dim) - final_token format")
+        
+        # Force pooling to 'none' for final_token format
+        if args.pooling not in ['none', 'last']:
+            logger.warning(f"Overriding pooling '{args.pooling}' -> 'none' for final_token format")
+            args.pooling = 'none'
+    else:
+        # (B, L, T, D)
+        L, T, D = sample_x.shape[1], sample_x.shape[2], sample_x.shape[3]
+        logger.info(f"\nTensor shape: (batch, {L} layers, {T} tokens, {D} dim) - pooled format")
 
     # ========================================================================
     # Training
@@ -422,12 +467,21 @@ def main():
     logger.info(f"{'='*70}\n")
 
     # Prepare output directory
-    output_dir = os.path.join(
-        args.output_dir,
-        model_dir,
-        args.dataset,
-        args.pooling
-    )
+    if args.suffix_condition:
+        output_dir = os.path.join(
+            args.output_dir,
+            model_dir,
+            args.suffix_condition,
+            args.dataset,
+            args.pooling
+        )
+    else:
+        output_dir = os.path.join(
+            args.output_dir,
+            model_dir,
+            args.dataset,
+            args.pooling
+        )
     os.makedirs(output_dir, exist_ok=True)
 
     # Check if probes already exist (skip if so, unless training single layer)

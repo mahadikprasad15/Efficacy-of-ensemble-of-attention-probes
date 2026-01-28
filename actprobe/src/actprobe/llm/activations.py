@@ -129,3 +129,80 @@ class ActivationRunner:
         activations = self.get_activations(full_texts, prompt_end_indices=prompt_end_indices)
 
         return clean_completions, activations
+
+    @torch.no_grad()
+    def get_final_token_activations(self, texts: List[str]) -> List[torch.Tensor]:
+        """
+        Run forward pass and return hidden states at the FINAL token only.
+        
+        This is for prompted-probing (Tillman & Mossing 2025 style) where we want 
+        the "decision state" at the end of MODEL_INPUT = PASSAGE + DELIM + SUFFIX.
+        
+        Args:
+            texts: List of full model inputs (already contains PASSAGE + DELIM + SUFFIX)
+        
+        Returns:
+            List of tensors shape (L, D) for each input text, where:
+            - L = number of layers (excluding embeddings)
+            - D = hidden dimension
+        """
+        inputs = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(self.device)
+        
+        # Forward pass with output_hidden_states
+        outputs = self.model(**inputs, output_hidden_states=True)
+        
+        # hidden_states is tuple of (L+1) tensors of shape (B, T, D)
+        # We take hidden_states[1:] to exclude embeddings
+        hs_tuple = outputs.hidden_states[1:]
+        stacked = torch.stack(hs_tuple, dim=1)  # (B, L, T, D)
+        
+        results = []
+        for i in range(len(texts)):
+            # Get actual length (excluding padding)
+            real_len = inputs.attention_mask[i].sum().item()
+            
+            # Get final token (last non-padded token)
+            final_token_idx = int(real_len) - 1
+            
+            # Extract activation at final token across all layers: (L, D)
+            tensor = stacked[i, :, final_token_idx, :]
+            results.append(tensor.cpu())
+        
+        return results
+
+    @torch.no_grad()
+    def get_activations_at_position(self, texts: List[str], positions: List[int]) -> List[torch.Tensor]:
+        """
+        Get hidden states at specified token positions for each text.
+        
+        Useful for extracting activations at specific points, e.g., 
+        at the end of PASSAGE (before DELIM) for delta vector analysis.
+        
+        Args:
+            texts: List of texts
+            positions: List of token positions (one per text). Use -1 for final token.
+        
+        Returns:
+            List of tensors shape (L, D) for each input text
+        """
+        inputs = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(self.device)
+        outputs = self.model(**inputs, output_hidden_states=True)
+        
+        hs_tuple = outputs.hidden_states[1:]
+        stacked = torch.stack(hs_tuple, dim=1)  # (B, L, T, D)
+        
+        results = []
+        for i in range(len(texts)):
+            real_len = inputs.attention_mask[i].sum().item()
+            
+            pos = positions[i]
+            if pos < 0:
+                pos = int(real_len) + pos  # Handle negative indexing
+            
+            # Clamp to valid range
+            pos = max(0, min(pos, int(real_len) - 1))
+            
+            tensor = stacked[i, :, pos, :]
+            results.append(tensor.cpu())
+        
+        return results
