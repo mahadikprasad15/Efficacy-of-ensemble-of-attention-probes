@@ -321,8 +321,17 @@ def main():
                 if len(train_dataset.items) < 20:
                     raise ValueError("Train dataset too small to split.")
                 
-                # Take last N samples for validation
-                split_size = limit_split if limit_split else min(100, int(len(train_dataset.items) * 0.2))
+                # Take last N samples for validation (max 20% of total)
+                total_samples = len(train_dataset.items)
+                max_split = int(total_samples * 0.2)
+                
+                if limit_split and limit_split <= max_split:
+                    split_size = limit_split
+                else:
+                    if limit_split:
+                        logger.warning(f"Requested split {limit_split} is > 20% of {total_samples}. Capping at {max_split} to preserve training data.")
+                    split_size = max(1, max_split)
+                
                 val_items = train_dataset.items[-split_size:]
                 train_dataset.items = train_dataset.items[:-split_size]
                 
