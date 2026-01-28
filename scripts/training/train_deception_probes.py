@@ -602,6 +602,24 @@ def main():
             json.dump(results, f, indent=2)
         logger.info(f"Saved results to {results_path}")
 
+        # Save best_probe.json for eval_ood.py
+        best_probe_info = {
+            'best_layer': best_layer['layer'],
+            'best_val_auc': best_layer['val_auc'],
+            'best_val_acc': best_layer['val_acc'],
+            'best_epoch': best_layer['epoch'],
+            'probe_path': os.path.join(output_dir, f"probe_layer_{best_layer['layer']}.pt"),
+            'pooling': args.pooling,
+            'model': args.model,
+            'dataset': args.dataset,
+            'suffix_condition': args.suffix_condition if hasattr(args, 'suffix_condition') else None,
+            'input_dim': D
+        }
+        best_probe_path = os.path.join(output_dir, "best_probe.json")
+        with open(best_probe_path, 'w') as f:
+            json.dump(best_probe_info, f, indent=2)
+        logger.info(f"Saved best probe info to {best_probe_path}")
+
     logger.info(f"\n{'='*70}")
     logger.info(f"✓ Training Complete!")
     logger.info(f"{'='*70}")
