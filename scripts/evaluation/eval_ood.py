@@ -216,8 +216,14 @@ def main():
     parser.add_argument(
         "--best_probe_json",
         type=str,
-        required=True,
-        help="Path to best_probe.json from analyze_probes.py"
+        default=None,
+        help="Path to best_probe.json (used to infer probe directory)"
+    )
+    parser.add_argument(
+        "--probes_dir",
+        type=str,
+        default=None,
+        help="Directory containing probe_layer_*.pt files (alternative to --best_probe_json)"
     )
     parser.add_argument(
         "--model",
@@ -268,16 +274,20 @@ def main():
     logger.info(f"Using device: {device}\n")
 
     # ========================================================================
-    # 1. Load best probe info & Identify all probes
+    # 1. Identify probe directory & all probes
     # ========================================================================
 
-    logger.info(f"Loading best probe info from {args.best_probe_json}...")
-
-    with open(args.best_probe_json, 'r') as f:
-        best_info = json.load(f)
-
-    # Infer probe directory
-    probe_dir = os.path.dirname(args.best_probe_json)
+    # Determine probe directory
+    if args.probes_dir:
+        probe_dir = args.probes_dir
+        logger.info(f"Using provided probe directory: {probe_dir}")
+    elif args.best_probe_json:
+        logger.info(f"Inferring probe dir from {args.best_probe_json}...")
+        probe_dir = os.path.dirname(args.best_probe_json)
+    else:
+        logger.error("Must provide either --probes_dir or --best_probe_json")
+        return 1
+    
     logger.info(f"Probe directory: {probe_dir}")
 
     # Find all probe checkpoints
@@ -299,10 +309,6 @@ def main():
     
     sorted_layers = sorted(probes_by_layer.keys())
     logger.info(f"Found {len(sorted_layers)} trained probes (Layers {min(sorted_layers)} to {max(sorted_layers)})")
-
-    # Handle backward compatibility keys
-    best_layer_key = 'best_layer' if 'best_layer' in best_info else 'layer'
-    best_auc_key = 'best_val_auc' if 'best_val_auc' in best_info else 'val_auc'
     
     # ========================================================================
     # 2. Load evaluation dataset
