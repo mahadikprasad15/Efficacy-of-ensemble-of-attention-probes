@@ -276,7 +276,11 @@ def main():
     with open(args.best_probe_json, 'r') as f:
         best_info = json.load(f)
 
-    logger.info(f"✓ Best probe: Layer {best_info['layer']} (Val AUC: {best_info['val_auc']:.4f})")
+    # Handle both 'layer' and 'best_layer' keys for backward compatibility
+    layer_key = 'best_layer' if 'best_layer' in best_info else 'layer'
+    auc_key = 'best_val_auc' if 'best_val_auc' in best_info else 'val_auc'
+    
+    logger.info(f"✓ Best probe: Layer {best_info[layer_key]} (Val AUC: {best_info[auc_key]:.4f})")
     logger.info(f"  Probe path: {best_info['probe_path']}\n")
 
     # ========================================================================
@@ -328,7 +332,7 @@ def main():
             x, y = self.base[idx]
             return x[self.layer_idx], y
 
-    layer_dataset = LayerDataset(eval_dataset, best_info['layer'])
+    layer_dataset = LayerDataset(eval_dataset, best_info[layer_key])
     eval_loader = DataLoader(
         layer_dataset,
         batch_size=args.batch_size,
@@ -400,7 +404,7 @@ def main():
     )
 
     results = {
-        "probe_layer": best_info['layer'],
+        "probe_layer": best_info[layer_key],
         "eval_dataset": args.eval_dataset,
         "eval_split": args.eval_split,
         "num_examples": len(eval_dataset),
@@ -421,7 +425,7 @@ def main():
     print("✓ EVALUATION COMPLETE")
     print("=" * 70)
     print(f"Dataset: {args.eval_dataset} ({args.eval_split})")
-    print(f"Probe: Layer {best_info['layer']}")
+    print(f"Probe: Layer {best_info[layer_key]}")
     print(f"AUROC: {metrics['auc']:.4f}")
     print(f"Accuracy: {metrics['accuracy']:.4f}")
     print(f"Results saved to: {results_file}")
