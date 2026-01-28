@@ -688,7 +688,7 @@ def main():
     dataset_name = "Deception-Roleplaying" if args.dataset_type == "roleplaying" else "Deception-InsiderTrading"
     output_path = os.path.join(
         args.output_dir,
-        f"suffix_{args.suffix_type}",
+        args.suffix_type,
         dataset_name,
         f"{args.split}.jsonl"
     )
