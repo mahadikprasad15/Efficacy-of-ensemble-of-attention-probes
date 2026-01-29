@@ -63,34 +63,75 @@ class ProbeCategory:
 
 
 # ============================================================================
-# Color Scheme
+# Color Scheme - Soft, professional colors
 # ============================================================================
 
+# Soft, professional color palettes
+PROBE_TYPE_COLORS = {
+    "vanilla": "#4A90D9",        # Soft blue
+    "layer_agnostic": "#E97451", # Soft coral/orange
+    "prompted": "#7CB342",       # Soft green
+    "per_token": "#AB47BC",      # Soft purple
+    "combined": "#26A69A",       # Teal
+    "invariant_core": "#EC407A", # Pink
+}
+
+POOLING_COLORS = {
+    "mean": "#4A90D9",   # Blue
+    "max": "#E97451",    # Coral
+    "last": "#7CB342",   # Green
+    "attn": "#AB47BC",   # Purple
+}
+
 CATEGORY_COLORS = {
-    # Vanilla probes
-    "vanilla_mean": "#2E86AB",
-    "vanilla_max": "#A23B72", 
-    "vanilla_last": "#F18F01",
-    "vanilla_attn": "#06A77D",
+    # Vanilla probes - blue shades
+    "vanilla_mean": "#4A90D9",
+    "vanilla_max": "#7CB3F0", 
+    "vanilla_last": "#2E6DB5",
+    "vanilla_attn": "#1A4D80",
     
-    # Layer-agnostic probes
-    "layer_agnostic_mean": "#5B8C5A",
-    "layer_agnostic_attn": "#3D5A80",
+    # Layer-agnostic probes - coral/orange shades
+    "layer_agnostic_mean": "#E97451",
+    "layer_agnostic_max": "#F5A88D",
+    "layer_agnostic_last": "#D45A38",
+    "layer_agnostic_attn": "#B84425",
     
-    # Prompted probes
-    "prompted_yesno": "#E07A5F",
-    "prompted_fabricated": "#81B29A",
-    "prompted_inconsistency": "#F2CC8F",
-    "prompted_strategic_ab": "#3D405B",
+    # Prompted probes - green shades
+    "prompted_suffix_deception_yesno": "#7CB342",
+    "prompted_suffix_deception_fabricated": "#9CCC65",
+    "prompted_suffix_inconsistency": "#558B2F",
+    "prompted_suffix_strategic_ab": "#33691E",
     
     # Per-token probes
-    "per_token": "#9B5DE5",
+    "per_token_per_token": "#AB47BC",
     
     # Combined probes
-    "combined": "#00BBF9",
+    "combined": "#26A69A",
     
     # Invariant core
-    "invariant_core": "#F15BB5",
+    "invariant_core_residual": "#EC407A",
+}
+
+# Style settings
+STYLE_CONFIG = {
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "axes.edgecolor": "#333333",
+    "axes.labelcolor": "#333333",
+    "axes.grid": True,
+    "grid.color": "#E0E0E0",
+    "grid.linestyle": "-",
+    "grid.alpha": 0.7,
+    "xtick.color": "#333333",
+    "ytick.color": "#333333",
+    "text.color": "#333333",
+    "font.family": "sans-serif",
+    "font.size": 11,
+    "axes.titlesize": 13,
+    "axes.labelsize": 12,
+    "legend.fontsize": 10,
+    "legend.framealpha": 0.95,
+    "legend.edgecolor": "#CCCCCC",
 }
 
 # ============================================================================
@@ -436,15 +477,41 @@ def plot_heatmap(all_results: List[ProbeResult], output_path: str, title: str = 
                            fontsize=6, color=color, fontweight='bold')
     
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"✓ Saved heatmap: {output_path}")
 
 
+def apply_clean_style():
+    """Apply clean, professional matplotlib style."""
+    plt.rcParams.update(STYLE_CONFIG)
+
+
+def get_color_for_probe(probe_type: str, sub_type: str) -> str:
+    """Get a color for a probe type/subtype combination."""
+    # Try exact match first
+    color_key = f"{probe_type}_{sub_type}"
+    if color_key in CATEGORY_COLORS:
+        return CATEGORY_COLORS[color_key]
+    
+    # Try probe type only
+    if probe_type in PROBE_TYPE_COLORS:
+        return PROBE_TYPE_COLORS[probe_type]
+    
+    # Try subtype as pooling
+    if sub_type in POOLING_COLORS:
+        return POOLING_COLORS[sub_type]
+    
+    # Fallback
+    return "#666666"
+
+
 def plot_summary_bars(all_results: List[ProbeResult], output_path: str, title: str = ""):
     """
-    Bar chart showing best OOD AUC per probe type/sub_type.
+    Beautiful bar chart showing best OOD AUC per probe type/sub_type.
     """
+    apply_clean_style()
+    
     # Find best layer for each probe type
     best_by_probe = {}
     for r in all_results:
@@ -468,44 +535,61 @@ def plot_summary_bars(all_results: List[ProbeResult], output_path: str, title: s
     for label in labels:
         probe_type = label.split("/")[0]
         sub_type = label.split("/")[1]
-        color_key = f"{probe_type}_{sub_type}"
-        colors.append(CATEGORY_COLORS.get(color_key, "#666666"))
+        colors.append(get_color_for_probe(probe_type, sub_type))
     
     # Create plot
-    fig, ax = plt.subplots(figsize=(14, max(6, len(labels) * 0.4)))
+    fig, ax = plt.subplots(figsize=(12, max(5, len(labels) * 0.45)))
     
     y_pos = range(len(labels))
-    bars = ax.barh(y_pos, aucs, color=colors, edgecolor='black', linewidth=0.5)
+    bars = ax.barh(y_pos, aucs, color=colors, edgecolor='white', linewidth=1.5, height=0.7)
     
-    # Add layer annotations
+    # Add layer annotations with nice styling
     for i, (bar, layer, auc) in enumerate(zip(bars, layers, aucs)):
-        ax.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height()/2,
-               f'L{layer} ({auc:.3f})', va='center', fontsize=9)
+        # Annotation box
+        ax.annotate(
+            f'L{layer}: {auc:.3f}',
+            xy=(bar.get_width(), bar.get_y() + bar.get_height()/2),
+            xytext=(5, 0),
+            textcoords='offset points',
+            va='center', ha='left',
+            fontsize=9,
+            fontweight='bold',
+            color='#333333',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='#F5F5F5', 
+                     edgecolor='#CCCCCC', alpha=0.9)
+        )
     
+    # Clean axis styling
     ax.set_yticks(y_pos)
-    ax.set_yticklabels(labels, fontsize=10)
+    ax.set_yticklabels([l.replace("_", " ").replace("/", " / ") for l in labels], fontsize=10)
     ax.set_xlabel("Best OOD AUC", fontsize=12, fontweight='bold')
-    ax.set_title(title or "Best OOD Performance per Probe Type", fontsize=14, fontweight='bold')
+    ax.set_title(title or "Best OOD Performance per Probe Type", fontsize=14, fontweight='bold', pad=15)
     
-    # Reference lines
-    ax.axvline(x=0.5, color='red', linestyle='--', alpha=0.5, label='Random')
-    ax.axvline(x=0.7, color='green', linestyle=':', alpha=0.5, label='Good (0.7)')
-    ax.axvline(x=0.8, color='blue', linestyle=':', alpha=0.5, label='Strong (0.8)')
+    # Reference lines with softer colors
+    ax.axvline(x=0.5, color='#E57373', linestyle='--', alpha=0.7, linewidth=1.5, label='Random (0.5)')
+    ax.axvline(x=0.7, color='#81C784', linestyle='--', alpha=0.7, linewidth=1.5, label='Good (0.7)')
+    ax.axvline(x=0.8, color='#64B5F6', linestyle='--', alpha=0.7, linewidth=1.5, label='Strong (0.8)')
     
-    ax.set_xlim(0.4, 1.0)
-    ax.legend(loc='lower right')
+    ax.set_xlim(0.4, 1.05)
+    ax.legend(loc='lower right', framealpha=0.95)
     ax.invert_yaxis()  # Top is best
     
+    # Remove spines for cleaner look
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"✓ Saved summary bars: {output_path}")
 
 
 def plot_layerwise_by_category(all_results: List[ProbeResult], output_path: str, title: str = ""):
     """
-    Line plots grouped by probe category, showing layer profiles.
+    Beautiful line plots grouped by probe category, showing layer profiles.
     """
+    apply_clean_style()
+    
     # Group by probe_type
     by_type = defaultdict(list)
     for r in all_results:
@@ -517,7 +601,7 @@ def plot_layerwise_by_category(all_results: List[ProbeResult], output_path: str,
         return
     
     # Create subplots
-    fig, axes = plt.subplots(1, n_types, figsize=(6 * n_types, 5), sharey=True)
+    fig, axes = plt.subplots(1, n_types, figsize=(5.5 * n_types, 5), sharey=True)
     if n_types == 1:
         axes = [axes]
     
@@ -533,29 +617,52 @@ def plot_layerwise_by_category(all_results: List[ProbeResult], output_path: str,
             layers = [r.layer for r in sub_results]
             aucs = [r.ood_auc for r in sub_results]
             
-            color_key = f"{probe_type}_{sub_type}"
-            color = CATEGORY_COLORS.get(color_key, None)
+            color = get_color_for_probe(probe_type, sub_type)
             
-            ax.plot(layers, aucs, marker='o', linewidth=2, markersize=4,
-                   label=sub_type, color=color, alpha=0.8)
+            # Plot line with markers
+            ax.plot(layers, aucs, marker='o', linewidth=2.5, markersize=5,
+                   label=sub_type.replace("_", " "), color=color, alpha=0.85)
             
-            # Mark best
+            # Mark best with annotation box
             best_idx = np.argmax(aucs)
-            ax.scatter([layers[best_idx]], [aucs[best_idx]], s=100, zorder=5,
-                      edgecolors='black', linewidths=2, marker='*', color=color)
+            best_layer = layers[best_idx]
+            best_auc = aucs[best_idx]
+            
+            ax.scatter([best_layer], [best_auc], s=120, zorder=5,
+                      edgecolors='white', linewidths=2, marker='o', color=color)
+            
+            # Annotation box for best point
+            ax.annotate(
+                f'Best: L{best_layer}\nAUC = {best_auc:.3f}',
+                xy=(best_layer, best_auc),
+                xytext=(10, 10),
+                textcoords='offset points',
+                fontsize=8,
+                bbox=dict(boxstyle='round,pad=0.4', facecolor=color, 
+                         edgecolor='white', alpha=0.9),
+                color='white',
+                fontweight='bold'
+            )
         
-        ax.axhline(y=0.5, color='red', linestyle='--', alpha=0.4)
-        ax.axhline(y=0.7, color='green', linestyle=':', alpha=0.4)
-        ax.set_xlabel("Layer", fontsize=11)
-        ax.set_ylabel("OOD AUC" if ax == axes[0] else "", fontsize=11)
-        ax.set_title(probe_type.replace("_", " ").title(), fontsize=12, fontweight='bold')
-        ax.legend(fontsize=8, loc='best')
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(0.45, 1.0)
+        # Reference lines
+        ax.axhline(y=0.5, color='#E57373', linestyle='--', alpha=0.6, linewidth=1.2, label='Random')
+        
+        # Styling
+        ax.set_xlabel("Layer", fontsize=11, fontweight='bold')
+        ax.set_ylabel("OOD AUC" if ax == axes[0] else "", fontsize=11, fontweight='bold')
+        ax.set_title(probe_type.replace("_", " ").title(), fontsize=13, fontweight='bold', pad=10)
+        ax.legend(fontsize=8, loc='lower right', framealpha=0.95)
+        ax.set_ylim(0.4, 1.05)
+        ax.set_xlim(-0.5, max(layers) + 0.5 if layers else 27.5)
+        
+        # Clean spines
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
     
-    fig.suptitle(title or "OOD AUC by Layer - Grouped by Probe Category", fontsize=14, fontweight='bold')
+    fig.suptitle(title or "OOD AUC by Layer - Grouped by Probe Category", 
+                fontsize=14, fontweight='bold', y=1.02)
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"✓ Saved layerwise by category: {output_path}")
 
@@ -563,8 +670,10 @@ def plot_layerwise_by_category(all_results: List[ProbeResult], output_path: str,
 def plot_overlay_comparison(all_results: List[ProbeResult], output_path: str, 
                            probe_types: List[str] = None, title: str = ""):
     """
-    Single plot overlaying selected probe types for direct comparison.
+    Beautiful single plot overlaying selected probe types for direct comparison.
     """
+    apply_clean_style()
+    
     # Filter to selected types
     if probe_types:
         results = [r for r in all_results if r.probe_type in probe_types]
@@ -583,6 +692,10 @@ def plot_overlay_comparison(all_results: List[ProbeResult], output_path: str,
     
     fig, ax = plt.subplots(figsize=(14, 7))
     
+    # Track best for global annotation
+    global_best = None
+    global_best_label = None
+    
     for label, group_results in grouped.items():
         group_results.sort(key=lambda x: x.layer)
         layers = [r.layer for r in group_results]
@@ -590,29 +703,55 @@ def plot_overlay_comparison(all_results: List[ProbeResult], output_path: str,
         
         probe_type = label.split("/")[0]
         sub_type = label.split("/")[1]
-        color_key = f"{probe_type}_{sub_type}"
-        color = CATEGORY_COLORS.get(color_key, None)
+        color = get_color_for_probe(probe_type, sub_type)
         
-        ax.plot(layers, aucs, marker='o', linewidth=2, markersize=5,
-               label=label, color=color, alpha=0.8)
+        display_label = label.replace("_", " ").replace("/", " / ")
+        ax.plot(layers, aucs, marker='o', linewidth=2.5, markersize=5,
+               label=display_label, color=color, alpha=0.85)
         
-        # Mark best
+        # Mark best for this line
         best_idx = np.argmax(aucs)
-        ax.scatter([layers[best_idx]], [aucs[best_idx]], s=150, zorder=5,
-                  edgecolors='black', linewidths=2, marker='*', color=color)
+        best_layer = layers[best_idx]
+        best_auc = aucs[best_idx]
+        
+        ax.scatter([best_layer], [best_auc], s=100, zorder=5,
+                  edgecolors='white', linewidths=2, marker='o', color=color)
+        
+        # Track global best
+        if global_best is None or best_auc > global_best[1]:
+            global_best = (best_layer, best_auc)
+            global_best_label = label
     
-    ax.axhline(y=0.5, color='red', linestyle='--', alpha=0.5, linewidth=1.5, label='Random')
-    ax.axhline(y=0.7, color='green', linestyle=':', alpha=0.5, linewidth=1.5)
+    # Annotate global best
+    if global_best:
+        ax.annotate(
+            f'Best OOD: {global_best_label.replace("_", " ")}\nLayer {global_best[0]}, AUC = {global_best[1]:.3f}',
+            xy=(global_best[0], global_best[1]),
+            xytext=(15, 15),
+            textcoords='offset points',
+            fontsize=10,
+            fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='#FFF9C4', 
+                     edgecolor='#FBC02D', alpha=0.95),
+            arrowprops=dict(arrowstyle='->', color='#FBC02D', lw=2)
+        )
     
+    # Reference lines
+    ax.axhline(y=0.5, color='#E57373', linestyle='--', alpha=0.6, linewidth=1.5, label='Random (0.5)')
+    
+    # Styling
     ax.set_xlabel("Layer", fontsize=12, fontweight='bold')
     ax.set_ylabel("OOD AUC", fontsize=12, fontweight='bold')
-    ax.set_title(title or "OOD AUC Comparison - All Probe Types", fontsize=14, fontweight='bold')
-    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim(0.45, 1.0)
+    ax.set_title(title or "OOD AUC Comparison - All Probe Types", fontsize=14, fontweight='bold', pad=15)
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=9, framealpha=0.95)
+    ax.set_ylim(0.4, 1.05)
+    
+    # Clean spines
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
     
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"✓ Saved overlay comparison: {output_path}")
 
