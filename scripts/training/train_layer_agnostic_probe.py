@@ -35,6 +35,7 @@ import json
 import glob
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import logging
@@ -162,6 +163,132 @@ class LayerAgnosticDataset(Dataset):
         return item['vector'].float(), torch.tensor(item['label'], dtype=torch.float32), item['layer']
 
 
+class LayerAgnosticAttnDataset(Dataset):
+    """
+    Dataset for ATTENTION pooling - returns raw (T, D) tensors.
+    Pooling is done by the model (learned).
+    """
+    
+    def __init__(self, activations_dir: str):
+        self.items = []  # List of (tensor: (T, D), label: int, layer: int)
+        
+        shard_pattern = os.path.join(activations_dir, "shard_*.safetensors")
+        shards = sorted(glob.glob(shard_pattern))
+        
+        if not shards:
+            raise FileNotFoundError(f"No shard files found: {shard_pattern}")
+        
+        logger.info(f"Loading {len(shards)} shard(s) for attention pooling...")
+        
+        manifest_path = os.path.join(activations_dir, "manifest.jsonl")
+        manifest = {}
+        with open(manifest_path) as f:
+            for line in f:
+                meta = json.loads(line)
+                manifest[meta['id']] = meta
+        
+        n_samples = 0
+        n_layers = None
+        
+        for shard_path in tqdm(shards, desc="Loading shards"):
+            try:
+                tensors = load_file(shard_path)
+                
+                for eid, tensor in tensors.items():
+                    if eid not in manifest:
+                        continue
+                    
+                    meta = manifest[eid]
+                    label = meta.get('label', -1)
+                    
+                    if label == -1:
+                        continue
+                    
+                    L, T, D = tensor.shape
+                    if n_layers is None:
+                        n_layers = L
+                        self.hidden_dim = D
+                        self.seq_len = T
+                        logger.info(f"Detected shape: L={L}, T={T}, D={D}")
+                    
+                    # Store raw tensors for each layer (no pre-pooling)
+                    for layer_idx in range(L):
+                        self.items.append({
+                            "tensor": tensor[layer_idx],  # (T, D)
+                            "label": label,
+                            "layer": layer_idx,
+                            "sample_id": eid
+                        })
+                    
+                    n_samples += 1
+                    
+            except Exception as e:
+                logger.error(f"Error loading shard {shard_path}: {e}")
+        
+        self.n_layers = n_layers
+        logger.info(f"✓ Loaded {n_samples} samples → {len(self.items)} training pairs")
+    
+    def __len__(self):
+        return len(self.items)
+    
+    def __getitem__(self, idx):
+        item = self.items[idx]
+        return item['tensor'].float(), torch.tensor(item['label'], dtype=torch.float32), item['layer']
+
+
+class PerLayerEvalAttnDataset(Dataset):
+    """
+    Per-layer eval dataset for attention - returns raw (T, D) tensors.
+    """
+    
+    def __init__(self, activations_dir: str, layer_idx: int):
+        self.layer_idx = layer_idx
+        self.items = []
+        
+        shard_pattern = os.path.join(activations_dir, "shard_*.safetensors")
+        shards = sorted(glob.glob(shard_pattern))
+        
+        if not shards:
+            raise FileNotFoundError(f"No shard files found: {shard_pattern}")
+        
+        manifest_path = os.path.join(activations_dir, "manifest.jsonl")
+        manifest = {}
+        with open(manifest_path) as f:
+            for line in f:
+                meta = json.loads(line)
+                manifest[meta['id']] = meta
+        
+        for shard_path in shards:
+            try:
+                tensors = load_file(shard_path)
+                
+                for eid, tensor in tensors.items():
+                    if eid not in manifest:
+                        continue
+                    
+                    meta = manifest[eid]
+                    label = meta.get('label', -1)
+                    
+                    if label == -1:
+                        continue
+                    
+                    self.items.append({
+                        "tensor": tensor[layer_idx],  # (T, D)
+                        "label": label,
+                        "id": eid
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Error loading shard {shard_path}: {e}")
+    
+    def __len__(self):
+        return len(self.items)
+    
+    def __getitem__(self, idx):
+        item = self.items[idx]
+        return item['tensor'].float(), torch.tensor(item['label'], dtype=torch.float32)
+
+
 class PerLayerEvalDataset(Dataset):
     """
     Dataset that returns activations for a SPECIFIC layer only.
@@ -247,6 +374,40 @@ class LinearProbe(nn.Module):
         return self.classifier(x)
 
 
+class LearnedAttentionPooling(nn.Module):
+    """
+    Learns a query vector q to compute attention over tokens.
+    Shared across all layers in layer-agnostic training.
+    """
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(input_dim, 1))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, D)
+        scores = torch.matmul(x, self.query)  # (B, T, 1)
+        weights = F.softmax(scores, dim=1)  # (B, T, 1)
+        pooled = (x * weights).sum(dim=1)  # (B, D)
+        return pooled
+
+
+class AttentionProbe(nn.Module):
+    """
+    Attention pooling + linear probe.
+    Shared attention learns which tokens are important across ALL layers.
+    """
+    
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.attention = LearnedAttentionPooling(input_dim)
+        self.classifier = nn.Linear(input_dim, 1)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, D)
+        pooled = self.attention(x)  # (B, D)
+        return self.classifier(pooled)  # (B, 1)
+
+
 # ============================================================================
 # Training & Evaluation
 # ============================================================================
@@ -322,7 +483,11 @@ def evaluate_per_layer(model, activations_dir: str, pooling: str, device: str, n
     logger.info(f"\nEvaluating per-layer performance on {activations_dir}...")
     
     for layer_idx in tqdm(range(n_layers), desc="Evaluating layers"):
-        ds = PerLayerEvalDataset(activations_dir, layer_idx, pooling=pooling)
+        # Use different dataset class for attention pooling
+        if pooling == "attn":
+            ds = PerLayerEvalAttnDataset(activations_dir, layer_idx)
+        else:
+            ds = PerLayerEvalDataset(activations_dir, layer_idx, pooling=pooling)
         loader = DataLoader(ds, batch_size=64, shuffle=False)
         
         preds, targets = [], []
@@ -387,7 +552,7 @@ def main():
     parser.add_argument("--dataset", type=str, default="Deception-Roleplaying", help="Training dataset")
     parser.add_argument("--ood_dataset", type=str, default="Deception-InsiderTrading", help="OOD evaluation dataset")
     parser.add_argument("--activations_dir", type=str, default="data/activations", help="Base activations directory")
-    parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "max", "last"], help="Token pooling method")
+    parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "max", "last", "attn"], help="Token pooling method")
     parser.add_argument("--output_dir", type=str, default="data/probes_layer_agnostic", help="Output directory")
     parser.add_argument("--train_split", type=str, default="train", help="Training split")
     parser.add_argument("--val_split", type=str, default="validation", help="Validation split")
@@ -413,7 +578,11 @@ def main():
     logger.info(f"Loading training data from: {train_path}")
     logger.info(f"{'='*70}")
     
-    train_ds = LayerAgnosticDataset(train_path, pooling=args.pooling)
+    # Use different dataset class for attention pooling
+    if args.pooling == "attn":
+        train_ds = LayerAgnosticAttnDataset(train_path)
+    else:
+        train_ds = LayerAgnosticDataset(train_path, pooling=args.pooling)
     
     # ========================================================================
     # 2. Create Train/Val Split or Load Validation
@@ -428,7 +597,10 @@ def main():
     else:
         val_path = os.path.join(args.activations_dir, model_dir, args.dataset, args.val_split)
         if os.path.exists(val_path):
-            val_ds = LayerAgnosticDataset(val_path, pooling=args.pooling)
+            if args.pooling == "attn":
+                val_ds = LayerAgnosticAttnDataset(val_path)
+            else:
+                val_ds = LayerAgnosticDataset(val_path, pooling=args.pooling)
         else:
             logger.warning(f"Validation path not found: {val_path}, using 80/20 split")
             n_train = int(0.8 * len(train_ds))
@@ -452,7 +624,13 @@ def main():
     logger.info(f"Hidden dim: {hidden_dim}")
     logger.info(f"Pooling: {args.pooling}")
     
-    probe = LinearProbe(hidden_dim)
+    # Create appropriate probe based on pooling type
+    if args.pooling == "attn":
+        probe = AttentionProbe(hidden_dim)
+        logger.info(f"Using AttentionProbe (shared attention across all layers)")
+    else:
+        probe = LinearProbe(hidden_dim)
+    
     probe, best_val_auc = train_probe(probe, train_loader, val_loader, device, epochs=args.epochs, lr=args.lr)
     
     logger.info(f"\n✓ Training complete! Best Val AUC: {best_val_auc:.4f}")
