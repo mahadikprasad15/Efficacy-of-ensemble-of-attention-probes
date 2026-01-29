@@ -68,7 +68,8 @@ POOLING_COLORS = {
 # Discovery Functions - Find OOD Results
 # ============================================================================
 
-def discover_ood_results(results_base: str, dataset: str = "Deception-Roleplaying") -> Dict[str, List[str]]:
+def discover_ood_results(results_base: str, dataset: str = "Deception-Roleplaying",
+                         layer_agnostic_base: str = None) -> Dict[str, List[str]]:
     """Discover all OOD result files in the results directory."""
     discovered = defaultdict(list)
     
@@ -101,11 +102,22 @@ def discover_ood_results(results_base: str, dataset: str = "Deception-Roleplayin
         discovered["invariant_core"].append(pattern4)
         print(f"  ✓ Found invariant core: invariant_core_summary.json")
     
-    # Pattern 5: probes_layer_agnostic/**/results.json or layer_results.json
-    for f in glob.glob(os.path.join(results_base, "probes_layer_agnostic", "**", "results.json"), recursive=True):
-        discovered["layer_agnostic"].append(f)
-    for f in glob.glob(os.path.join(results_base, "probes_layer_agnostic", "**", "layer_results.json"), recursive=True):
-        discovered["layer_agnostic"].append(f)
+    # Pattern 5: Layer-agnostic probes - check both results_base and dedicated path
+    la_search_paths = []
+    if layer_agnostic_base and os.path.exists(layer_agnostic_base):
+        la_search_paths.append(layer_agnostic_base)
+    la_search_paths.append(os.path.join(results_base, "probes_layer_agnostic"))
+    
+    for la_base in la_search_paths:
+        if not os.path.exists(la_base):
+            continue
+        for f in glob.glob(os.path.join(la_base, "**", "layer_results.json"), recursive=True):
+            if f not in discovered["layer_agnostic"]:
+                discovered["layer_agnostic"].append(f)
+        for f in glob.glob(os.path.join(la_base, "**", "results.json"), recursive=True):
+            if f not in discovered["layer_agnostic"]:
+                discovered["layer_agnostic"].append(f)
+    
     if discovered["layer_agnostic"]:
         print(f"  ✓ Found layer-agnostic: {len(discovered['layer_agnostic'])} files")
     
@@ -623,6 +635,8 @@ def main():
     
     parser.add_argument("--results_base", type=str, required=True,
                        help="Base directory containing all results")
+    parser.add_argument("--layer_agnostic_base", type=str, default=None,
+                       help="Base directory for layer-agnostic probes (if different from results_base)")
     parser.add_argument("--dataset", type=str, default="Deception-Roleplaying",
                        help="Dataset name for per-token results")
     parser.add_argument("--output_dir", type=str, default="results/all_probes_comparison",
@@ -638,7 +652,7 @@ def main():
     print()
     
     # Step 1: Discover all OOD result files
-    discovered = discover_ood_results(args.results_base, args.dataset)
+    discovered = discover_ood_results(args.results_base, args.dataset, args.layer_agnostic_base)
     
     total_files = sum(len(v) for v in discovered.values())
     if total_files == 0:
