@@ -97,31 +97,42 @@ CATEGORY_COLORS = {
 # Result Loaders
 # ============================================================================
 
-def load_vanilla_probes(probes_dir: str, model: str, dataset: str) -> List[ProbeResult]:
+def load_vanilla_probes(probes_dir: str, model: str, dataset: str, results_base: str = None) -> List[ProbeResult]:
     """
     Load vanilla probe results (layer_results.json format).
     
-    Expected structure:
-        {probes_dir}/{model}/{dataset}/{pooling}/layer_results.json
+    Expected structures:
+        OLD: {probes_dir}/{model}/{dataset}/{pooling}/layer_results.json
+        NEW: {results_base}/probes/{model}/{dataset}/{pooling}/layer_results.json
     """
     results = []
     model_dir = model.replace("/", "_")
     
     for pooling in ["mean", "max", "last", "attn"]:
-        results_path = os.path.join(probes_dir, model_dir, dataset, pooling, "layer_results.json")
+        results_path = None
         
-        if not os.path.exists(results_path):
-            # Try alternate path patterns
-            alt_paths = [
-                os.path.join(probes_dir, dataset, pooling, "layer_results.json"),
-                os.path.join(probes_dir, pooling, "layer_results.json"),
-            ]
-            for alt in alt_paths:
-                if os.path.exists(alt):
-                    results_path = alt
-                    break
-            else:
-                continue
+        # Try multiple path patterns (new structure first)
+        search_paths = []
+        
+        # New structure: results in separate results/ directory
+        if results_base:
+            search_paths.append(os.path.join(results_base, "probes", model_dir, dataset, pooling, "layer_results.json"))
+            search_paths.append(os.path.join(results_base, model_dir, dataset, pooling, "layer_results.json"))
+        
+        # Old structure: results alongside probes
+        search_paths.extend([
+            os.path.join(probes_dir, model_dir, dataset, pooling, "layer_results.json"),
+            os.path.join(probes_dir, dataset, pooling, "layer_results.json"),
+            os.path.join(probes_dir, pooling, "layer_results.json"),
+        ])
+        
+        for path in search_paths:
+            if os.path.exists(path):
+                results_path = path
+                break
+        
+        if not results_path:
+            continue
         
         try:
             with open(results_path) as f:
@@ -135,27 +146,49 @@ def load_vanilla_probes(probes_dir: str, model: str, dataset: str) -> List[Probe
                     ood_auc=layer_result.get("test_auc", layer_result.get("val_auc", 0.5)),
                     id_auc=layer_result.get("val_auc", 0.5)
                 ))
-            print(f"  ✓ Loaded vanilla/{pooling}: {len(layer_data)} layers")
+            print(f"  ✓ Loaded vanilla/{pooling}: {len(layer_data)} layers from {results_path}")
         except Exception as e:
             print(f"  ✗ Failed to load vanilla/{pooling}: {e}")
     
     return results
 
 
-def load_layer_agnostic_probes(probes_dir: str, model: str, dataset: str) -> List[ProbeResult]:
+
+def load_layer_agnostic_probes(probes_dir: str, model: str, dataset: str, results_base: str = None) -> List[ProbeResult]:
     """
     Load layer-agnostic probe results (results.json format).
     
-    Expected structure:
-        {probes_dir}/{model}/{dataset}/{pooling}/results.json
+    Expected structures:
+        OLD: {probes_dir}/{model}/{dataset}/{pooling}/results.json
+        NEW: {results_base}/probes_layer_agnostic/{model}/{dataset}/{pooling}/results.json
     """
     results = []
     model_dir = model.replace("/", "_")
     
     for pooling in ["mean", "max", "last", "attn"]:
-        results_path = os.path.join(probes_dir, model_dir, dataset, pooling, "results.json")
+        results_path = None
         
-        if not os.path.exists(results_path):
+        # Try multiple path patterns
+        search_paths = []
+        
+        # New structure
+        if results_base:
+            search_paths.append(os.path.join(results_base, "probes_layer_agnostic", model_dir, dataset, pooling, "results.json"))
+            search_paths.append(os.path.join(results_base, model_dir, dataset, pooling, "results.json"))
+        
+        # Old/direct structure
+        search_paths.extend([
+            os.path.join(probes_dir, model_dir, dataset, pooling, "results.json"),
+            os.path.join(probes_dir, dataset, pooling, "results.json"),
+            os.path.join(probes_dir, pooling, "results.json"),
+        ])
+        
+        for path in search_paths:
+            if os.path.exists(path):
+                results_path = path
+                break
+        
+        if not results_path:
             continue
         
         try:
@@ -175,7 +208,7 @@ def load_layer_agnostic_probes(probes_dir: str, model: str, dataset: str) -> Lis
                     id_auc=id_per_layer.get(layer_str, {}).get("auc", 0.5)
                 ))
             
-            print(f"  ✓ Loaded layer_agnostic/{pooling}: {len(ood_per_layer)} layers")
+            print(f"  ✓ Loaded layer_agnostic/{pooling}: {len(ood_per_layer)} layers from {results_path}")
         except Exception as e:
             print(f"  ✗ Failed to load layer_agnostic/{pooling}: {e}")
     
@@ -646,6 +679,7 @@ def main():
     parser.add_argument("--combined_base", type=str, help="Base directory for combined probes")
     parser.add_argument("--invariant_core_results", type=str, help="Path to invariant core results")
     
+    parser.add_argument("--results_base", type=str, help="Base directory for results (new structure: results/probes_*/...)")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-3B-Instruct")
     parser.add_argument("--dataset", type=str, default="Deception-Roleplaying")
     parser.add_argument("--output_dir", type=str, default="results/all_probes_comparison")
@@ -684,13 +718,15 @@ def main():
     
     else:
         # Load from individual base directories
+        results_base = args.results_base
+        
         if args.probes_base:
             print("Loading vanilla probes...")
-            all_results.extend(load_vanilla_probes(args.probes_base, args.model, args.dataset))
+            all_results.extend(load_vanilla_probes(args.probes_base, args.model, args.dataset, results_base))
         
         if args.layer_agnostic_base:
             print("Loading layer-agnostic probes...")
-            all_results.extend(load_layer_agnostic_probes(args.layer_agnostic_base, args.model, args.dataset))
+            all_results.extend(load_layer_agnostic_probes(args.layer_agnostic_base, args.model, args.dataset, results_base))
         
         if args.prompted_base:
             print("Loading prompted probes...")
@@ -710,10 +746,15 @@ def main():
     
     if not all_results:
         print("\n❌ No results loaded! Check paths and try again.")
-        print("\nExample usage:")
+        print("\nExample usage (new structure with separate results dir):")
+        print("  python scripts/comparison/compare_all_probes.py \\")
+        print("      --probes_base /content/drive/MyDrive/data/probes \\")
+        print("      --layer_agnostic_base /content/drive/MyDrive/data/probes_layer_agnostic \\")
+        print("      --results_base /content/drive/MyDrive/results \\")
+        print("      --model meta-llama/Llama-3.2-3B-Instruct")
+        print("\nExample usage (old structure with results in probe dirs):")
         print("  python scripts/comparison/compare_all_probes.py \\")
         print("      --probes_base /content/drive/MyDrive/probes \\")
-        print("      --layer_agnostic_base /content/drive/MyDrive/probes_layer_agnostic \\")
         print("      --model meta-llama/Llama-3.2-3B-Instruct")
         return 1
     
