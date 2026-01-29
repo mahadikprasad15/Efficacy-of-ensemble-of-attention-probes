@@ -553,7 +553,8 @@ def main():
     parser.add_argument("--ood_dataset", type=str, default="Deception-InsiderTrading", help="OOD evaluation dataset")
     parser.add_argument("--activations_dir", type=str, default="data/activations", help="Base activations directory")
     parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "max", "last", "attn"], help="Token pooling method")
-    parser.add_argument("--output_dir", type=str, default="data/probes_layer_agnostic", help="Output directory")
+    parser.add_argument("--output_dir", type=str, default="data/probes_layer_agnostic", help="Output directory for probes")
+    parser.add_argument("--results_dir", type=str, default=None, help="Output directory for results/plots (default: results/probes_layer_agnostic)")
     parser.add_argument("--train_split", type=str, default="train", help="Training split")
     parser.add_argument("--val_split", type=str, default="validation", help="Validation split")
     parser.add_argument("--ood_split", type=str, default="test", help="OOD evaluation split")
@@ -685,12 +686,38 @@ def main():
     
     save_dir = os.path.join(args.output_dir, model_dir, args.dataset, args.pooling)
     os.makedirs(save_dir, exist_ok=True)
-    
+
+    # Results directory (separate from probes)
+    if args.results_dir:
+        results_dir = os.path.join(args.results_dir, model_dir, args.dataset, args.pooling)
+    else:
+        results_dir = os.path.join("results/probes_layer_agnostic", model_dir, args.dataset, args.pooling)
+    os.makedirs(results_dir, exist_ok=True)
+
     # Save probe
     probe_path = os.path.join(save_dir, "probe.pt")
     torch.save(probe.state_dict(), probe_path)
     logger.info(f"\n✓ Saved probe: {probe_path}")
-    
+
+    # Save best_probe.json for eval_ood.py compatibility
+    best_probe_info = {
+        'probe_type': 'layer_agnostic',
+        'probe_path': probe_path,
+        'best_id_layer': best_id_layer,
+        'best_id_auc': id_results[best_id_layer]['auc'],
+        'best_ood_layer': best_ood_layer if ood_results else None,
+        'best_ood_auc': ood_results[best_ood_layer]['auc'] if ood_results else None,
+        'pooling': args.pooling,
+        'model': args.model,
+        'dataset': args.dataset,
+        'hidden_dim': hidden_dim,
+        'note': 'Layer-agnostic probe - single probe.pt applied to any layer'
+    }
+    best_probe_path = os.path.join(save_dir, "best_probe.json")
+    with open(best_probe_path, 'w') as f:
+        json.dump(best_probe_info, f, indent=2)
+    logger.info(f"✓ Saved best probe info: {best_probe_path}")
+
     # Save results
     results = {
         "model": args.model,
@@ -704,14 +731,14 @@ def main():
         "best_ood_layer": best_ood_layer if ood_results else None
     }
     
-    results_path = os.path.join(save_dir, "results.json")
+    results_path = os.path.join(results_dir, "layer_results.json")
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     logger.info(f"✓ Saved results: {results_path}")
-    
+
     # Plot if OOD available
     if ood_results:
-        plot_path = os.path.join(save_dir, "per_layer_auc.png")
+        plot_path = os.path.join(results_dir, "per_layer_auc.png")
         plot_results(
             id_results, ood_results, plot_path,
             f"Layer-Agnostic Probe ({args.pooling} pooling) - Per-Layer AUC"

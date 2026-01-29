@@ -266,7 +266,8 @@ def main():
     parser.add_argument('--val_b', type=str, required=True)
     parser.add_argument('--label_a', type=str, default='Roleplaying')
     parser.add_argument('--label_b', type=str, default='InsiderTrading')
-    parser.add_argument('--output_dir', type=str, default='data/probes_combined_per_token')
+    parser.add_argument('--output_dir', type=str, default='data/probes_combined_per_token', help='Output directory for probes')
+    parser.add_argument('--results_dir', type=str, default=None, help='Output directory for results/plots (default: results/probes_combined_per_token)')
     parser.add_argument('--model', type=str, default='meta-llama_Llama-3.2-3B-Instruct')
     parser.add_argument('--layers', type=str, default='0-27')
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -284,10 +285,17 @@ def main():
     else:
         layers = list(map(int, args.layers.split(',')))
     
-    # Output directory
+    # Output directory for probes
     probe_dir = os.path.join(args.output_dir, args.model, 'Deception-Combined')
     os.makedirs(probe_dir, exist_ok=True)
-    
+
+    # Results directory (separate from probes)
+    if args.results_dir:
+        results_dir = os.path.join(args.results_dir, args.model, 'Deception-Combined')
+    else:
+        results_dir = os.path.join("results/probes_combined_per_token", args.model, 'Deception-Combined')
+    os.makedirs(results_dir, exist_ok=True)
+
     logger.info("=" * 70)
     logger.info("COMBINED PER-TOKEN PROBE TRAINING")
     logger.info("=" * 70)
@@ -345,15 +353,15 @@ def main():
         
         logger.info(f"  MEAN: {args.label_a}={all_results['mean'][-1]['auc_a']:.4f}, {args.label_b}={all_results['mean'][-1]['auc_b']:.4f}")
     
-    # Save results
-    results_path = os.path.join(probe_dir, 'layer_results.json')
+    # Save results to results_dir
+    results_path = os.path.join(results_dir, 'layer_results.json')
     with open(results_path, 'w') as f:
         json.dump(all_results, f, indent=2)
-    
-    # Generate plots
+
+    # Generate plots in results_dir
     logger.info("\nGenerating visualizations...")
-    plot_layerwise_results(all_results, probe_dir, args.label_a, args.label_b)
-    plot_aggregation_comparison(all_results, probe_dir, args.label_a, args.label_b)
+    plot_layerwise_results(all_results, results_dir, args.label_a, args.label_b)
+    plot_aggregation_comparison(all_results, results_dir, args.label_a, args.label_b)
     
     # Summary
     logger.info("\n" + "=" * 70)
@@ -404,12 +412,32 @@ def main():
             'auc_b': best['auc_b']
         }
     
-    summary_path = os.path.join(probe_dir, 'combined_summary.json')
+    summary_path = os.path.join(results_dir, 'combined_summary.json')
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
     logger.info(f"Saved summary: {summary_path}")
-    
-    logger.info(f"\nSaved to: {probe_dir}")
+
+    # Save best_probe.json for eval_ood.py compatibility
+    best_probe_info = {
+        'probe_type': 'combined_per_token',
+        'best_layer': best_combined['layer'],
+        'best_aggregation': best_combined['aggregation'],
+        'best_auc_avg': best_combined['auc_avg'],
+        'best_auc_a': best_combined['auc_a'],
+        'best_auc_b': best_combined['auc_b'],
+        'probe_path': os.path.join(probe_dir, f"probe_layer_{best_combined['layer']}.pt"),
+        'norm_path': os.path.join(probe_dir, f"norm_layer_{best_combined['layer']}.npz"),
+        'label_a': args.label_a,
+        'label_b': args.label_b,
+        'model': args.model
+    }
+    best_probe_path = os.path.join(probe_dir, "best_probe.json")
+    with open(best_probe_path, 'w') as f:
+        json.dump(best_probe_info, f, indent=2)
+    logger.info(f"Saved best probe info: {best_probe_path}")
+
+    logger.info(f"\nProbes saved to: {probe_dir}")
+    logger.info(f"Results saved to: {results_dir}")
     logger.info("=" * 70)
 
 

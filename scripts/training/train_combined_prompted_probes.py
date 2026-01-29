@@ -424,7 +424,38 @@ def main():
     results_path = os.path.join(results_output_dir, "combined_results.json")
     with open(results_path, 'w') as f:
         json.dump(summary, f, indent=2)
-    
+
+    # Save best_probe.json for eval_ood.py compatibility
+    # Use best average of both domains
+    avg_auc_per_layer = [
+        (results_a[i]['layer'], (results_a[i]['auc'] + results_b[i]['auc']) / 2)
+        for i in range(len(results_a))
+    ]
+    best_avg = max(avg_auc_per_layer, key=lambda x: x[1])
+    best_layer = best_avg[0]
+
+    best_probe_info = {
+        'probe_type': 'combined_prompted',
+        'best_layer': best_layer,
+        'best_auc_avg': best_avg[1],
+        'best_layer_a': best_a['layer'],
+        'best_auc_a': best_a['auc'],
+        'best_layer_b': best_b['layer'],
+        'best_auc_b': best_b['auc'],
+        'probe_path': os.path.join(probes_dir, f"probe_layer_{best_layer}.pt"),
+        'pooling': 'none',
+        'input_format': 'final_token',
+        'model': args.model,
+        'suffix_condition': args.suffix_condition,
+        'dataset_a': args.dataset_a,
+        'dataset_b': args.dataset_b,
+        'input_dim': hidden_dim
+    }
+    best_probe_path = os.path.join(probes_dir, "best_probe.json")
+    with open(best_probe_path, 'w') as f:
+        json.dump(best_probe_info, f, indent=2)
+    logger.info(f"Saved best probe info: {best_probe_path}")
+
     # Plot
     plot_path = os.path.join(results_output_dir, "combined_layerwise_auc.png")
     plot_results(results_a, results_b, args.dataset_a, args.dataset_b, plot_path)
