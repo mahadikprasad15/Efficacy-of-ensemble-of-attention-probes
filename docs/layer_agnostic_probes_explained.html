@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Layer-Agnostic Probes Explained</title>
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --text-primary: #c9d1d9;
+            --text-secondary: #8b949e;
+            --accent-blue: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-purple: #a371f7;
+            --accent-orange: #d29922;
+            --accent-red: #f85149;
+            --border-color: #30363d;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        /* Hero Section */
+        .hero {
+            text-align: center;
+            padding: 4rem 2rem;
+            background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-primary) 100%);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .hero h1 {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            background: linear-gradient(90deg, var(--accent-blue), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero p {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 700px;
+            margin: 0 auto;
+        }
+
+        /* Section Styles */
+        section {
+            padding: 4rem 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        h2 {
+            font-size: 2rem;
+            margin-bottom: 2rem;
+            color: var(--accent-blue);
+        }
+
+        h3 {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+            color: var(--text-primary);
+        }
+
+        /* Timeline */
+        .timeline {
+            position: relative;
+            padding-left: 2rem;
+        }
+
+        .timeline::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 3px;
+            background: linear-gradient(180deg, var(--accent-green), var(--accent-blue), var(--accent-purple));
+            border-radius: 3px;
+        }
+
+        .commit-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            position: relative;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .commit-card:hover {
+            border-color: var(--accent-blue);
+            transform: translateX(5px);
+        }
+
+        .commit-card::before {
+            content: '';
+            position: absolute;
+            left: -2.35rem;
+            top: 1.5rem;
+            width: 14px;
+            height: 14px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            border: 3px solid var(--bg-primary);
+        }
+
+        .commit-card:nth-child(2)::before { background: var(--accent-blue); }
+        .commit-card:nth-child(3)::before { background: var(--accent-purple); }
+
+        .commit-hash {
+            font-family: 'Courier New', monospace;
+            background: var(--bg-tertiary);
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.875rem;
+            color: var(--accent-orange);
+            margin-right: 0.5rem;
+        }
+
+        .commit-date {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+        }
+
+        .commit-title {
+            font-size: 1.25rem;
+            margin: 0.75rem 0;
+            color: var(--text-primary);
+        }
+
+        .commit-details {
+            display: none;
+            margin-top: 1rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--border-color);
+        }
+
+        .commit-card.expanded .commit-details {
+            display: block;
+        }
+
+        .file-list {
+            list-style: none;
+            margin-top: 0.5rem;
+        }
+
+        .file-list li {
+            padding: 0.25rem 0;
+            font-family: 'Courier New', monospace;
+            font-size: 0.875rem;
+            color: var(--accent-green);
+        }
+
+        .file-list li::before {
+            content: '+ ';
+        }
+
+        /* Comparison Diagram */
+        .comparison {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            margin-top: 2rem;
+        }
+
+        @media (max-width: 768px) {
+            .comparison {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .approach-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 2rem;
+        }
+
+        .approach-card.traditional {
+            border-color: var(--accent-red);
+        }
+
+        .approach-card.agnostic {
+            border-color: var(--accent-green);
+        }
+
+        .approach-card h3 {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .badge {
+            font-size: 0.75rem;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            text-transform: uppercase;
+        }
+
+        .badge.old { background: var(--accent-red); color: white; }
+        .badge.new { background: var(--accent-green); color: white; }
+
+        /* Probe Visualization */
+        .probe-grid {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 0.5rem;
+            margin: 1.5rem 0;
+        }
+
+        .probe-box {
+            aspect-ratio: 1;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            border: 2px solid var(--border-color);
+            transition: all 0.3s ease;
+        }
+
+        .probe-box.active {
+            background: var(--accent-blue);
+            color: white;
+            border-color: var(--accent-blue);
+        }
+
+        .single-probe {
+            background: var(--accent-green);
+            color: white;
+            border-color: var(--accent-green);
+            padding: 2rem;
+            border-radius: 8px;
+            text-align: center;
+            font-size: 1.25rem;
+            margin: 1.5rem 0;
+        }
+
+        /* Data Flow Animation */
+        .data-flow {
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            padding: 2rem;
+            margin: 2rem 0;
+        }
+
+        .flow-diagram {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+
+        .flow-box {
+            background: var(--bg-tertiary);
+            border: 2px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1.5rem;
+            text-align: center;
+            min-width: 150px;
+            flex: 1;
+        }
+
+        .flow-box.highlight {
+            border-color: var(--accent-purple);
+            background: rgba(163, 113, 247, 0.1);
+        }
+
+        .flow-arrow {
+            font-size: 2rem;
+            color: var(--accent-blue);
+        }
+
+        .flow-box h4 {
+            color: var(--accent-blue);
+            margin-bottom: 0.5rem;
+        }
+
+        .flow-box .formula {
+            font-family: 'Courier New', monospace;
+            background: var(--bg-primary);
+            padding: 0.5rem;
+            border-radius: 4px;
+            margin-top: 0.5rem;
+            font-size: 0.875rem;
+        }
+
+        /* Pooling Selector */
+        .pooling-demo {
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            padding: 2rem;
+            margin: 2rem 0;
+        }
+
+        .pooling-buttons {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
+        }
+
+        .pooling-btn {
+            background: var(--bg-tertiary);
+            border: 2px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 1rem;
+        }
+
+        .pooling-btn:hover {
+            border-color: var(--accent-blue);
+        }
+
+        .pooling-btn.active {
+            background: var(--accent-blue);
+            border-color: var(--accent-blue);
+            color: white;
+        }
+
+        .token-visualization {
+            display: flex;
+            gap: 0.5rem;
+            align-items: flex-end;
+            height: 150px;
+            padding: 1rem;
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+
+        .token {
+            flex: 1;
+            background: var(--accent-blue);
+            border-radius: 4px 4px 0 0;
+            transition: all 0.5s ease;
+            display: flex;
+            align-items: flex-end;
+            justify-content: center;
+            padding-bottom: 0.5rem;
+            color: white;
+            font-size: 0.75rem;
+        }
+
+        .token.highlight {
+            background: var(--accent-green);
+        }
+
+        .pooling-result {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+        }
+
+        .result-bar {
+            height: 40px;
+            background: var(--accent-purple);
+            border-radius: 4px;
+            margin-top: 0.5rem;
+            transition: all 0.5s ease;
+        }
+
+        /* Code Block */
+        .code-block {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 1.5rem;
+            overflow-x: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.875rem;
+            line-height: 1.8;
+            margin: 1rem 0;
+        }
+
+        .code-block .keyword { color: var(--accent-purple); }
+        .code-block .function { color: var(--accent-blue); }
+        .code-block .string { color: var(--accent-green); }
+        .code-block .comment { color: var(--text-secondary); }
+        .code-block .number { color: var(--accent-orange); }
+
+        /* Directory Structure */
+        .directory-comparison {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            margin-top: 2rem;
+        }
+
+        @media (max-width: 768px) {
+            .directory-comparison {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .directory-tree {
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            padding: 1.5rem;
+            font-family: 'Courier New', monospace;
+            font-size: 0.875rem;
+        }
+
+        .directory-tree h4 {
+            margin-bottom: 1rem;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        .tree-item {
+            padding: 0.25rem 0;
+            color: var(--text-secondary);
+        }
+
+        .tree-item.folder { color: var(--accent-blue); }
+        .tree-item.file { color: var(--text-primary); }
+        .tree-item.new { color: var(--accent-green); }
+        .tree-item.moved { color: var(--accent-orange); }
+
+        /* Stats Cards */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+
+        .stat-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.5rem;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: bold;
+            background: linear-gradient(90deg, var(--accent-blue), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .stat-label {
+            color: var(--text-secondary);
+            margin-top: 0.5rem;
+        }
+
+        /* Footer */
+        footer {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-secondary);
+        }
+
+        /* Animations */
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+
+        .animate-pulse {
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .fade-in {
+            animation: fadeIn 0.5s ease forwards;
+        }
+    </style>
+</head>
+<body>
+    <!-- Hero Section -->
+    <header class="hero">
+        <h1>Layer-Agnostic Probes</h1>
+        <p>A visual explanation of how we unified 28 separate deception detection probes into a single universal detector that works across all transformer layers.</p>
+    </header>
+
+    <div class="container">
+        <!-- Stats Overview -->
+        <section>
+            <h2>Key Innovation at a Glance</h2>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-value">28 → 1</div>
+                    <div class="stat-label">Probes Reduced</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">28×</div>
+                    <div class="stat-label">Data Expansion</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">4</div>
+                    <div class="stat-label">Pooling Strategies</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">3</div>
+                    <div class="stat-label">Key Commits</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Commit Timeline -->
+        <section>
+            <h2>Development Timeline</h2>
+            <div class="timeline">
+                <div class="commit-card" onclick="toggleCommit(this)">
+                    <span class="commit-hash">d2eeb63</span>
+                    <span class="commit-date">Initial Implementation</span>
+                    <h3 class="commit-title">feat: add layer-agnostic probe training script</h3>
+                    <p>Introduced the core layer-agnostic architecture with mean, max, and last pooling support.</p>
+                    <div class="commit-details">
+                        <strong>Key Changes:</strong>
+                        <ul class="file-list">
+                            <li>scripts/training/train_layer_agnostic_probe.py (548 lines)</li>
+                            <li>LayerAgnosticDataset - expands samples across layers</li>
+                            <li>LinearProbe - simple D → 1 classifier</li>
+                            <li>Per-layer evaluation infrastructure</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="commit-card" onclick="toggleCommit(this)">
+                    <span class="commit-hash">1446bdc</span>
+                    <span class="commit-date">Enhancement</span>
+                    <h3 class="commit-title">feat: add attention pooling support to layer-agnostic probe</h3>
+                    <p>Added learned attention pooling - a query vector that learns which tokens matter for deception detection.</p>
+                    <div class="commit-details">
+                        <strong>Key Changes:</strong>
+                        <ul class="file-list">
+                            <li>LearnedAttentionPooling - shared query vector across layers</li>
+                            <li>AttentionProbe - attention + classification combined</li>
+                            <li>LayerAgnosticAttnDataset - handles raw tensors</li>
+                            <li>PerLayerEvalAttnDataset - attention-specific evaluation</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="commit-card" onclick="toggleCommit(this)">
+                    <span class="commit-hash">f3500df</span>
+                    <span class="commit-date">Standardization</span>
+                    <h3 class="commit-title">refactor: standardize probe/results storage structure</h3>
+                    <p>Separated probes from results, added best_probe.json metadata for cross-tool compatibility.</p>
+                    <div class="commit-details">
+                        <strong>Key Changes:</strong>
+                        <ul class="file-list">
+                            <li>Added --results_dir argument</li>
+                            <li>Plots moved to results/ directory</li>
+                            <li>best_probe.json generation for eval compatibility</li>
+                            <li>Migration script for existing artifacts</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Architecture Comparison -->
+        <section>
+            <h2>Architecture Comparison</h2>
+            <div class="comparison">
+                <div class="approach-card traditional">
+                    <h3><span class="badge old">Old</span> Traditional Per-Layer Probes</h3>
+                    <p>Train 28 separate probes, one for each layer. Each learns layer-specific patterns independently.</p>
+                    <div class="probe-grid" id="traditional-grid">
+                        <!-- Generated by JS -->
+                    </div>
+                    <p style="color: var(--accent-red);">❌ 28 independent models to maintain</p>
+                    <p style="color: var(--accent-red);">❌ No cross-layer knowledge sharing</p>
+                    <p style="color: var(--accent-red);">❌ Layer-specific overfitting risk</p>
+                </div>
+
+                <div class="approach-card agnostic">
+                    <h3><span class="badge new">New</span> Layer-Agnostic Probe</h3>
+                    <p>Train ONE probe on data from ALL layers. The same weights work universally.</p>
+                    <div class="single-probe animate-pulse">
+                        🧠 Single Universal Probe
+                    </div>
+                    <p style="color: var(--accent-green);">✓ One model for all 28 layers</p>
+                    <p style="color: var(--accent-green);">✓ 28× more training data</p>
+                    <p style="color: var(--accent-green);">✓ Learns universal deception patterns</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Data Flow -->
+        <section>
+            <h2>Data Expansion Magic</h2>
+            <p>The key insight: treat each (sample, layer) pair as a separate training example.</p>
+
+            <div class="data-flow">
+                <div class="flow-diagram">
+                    <div class="flow-box">
+                        <h4>Input Sample</h4>
+                        <p>Tensor shape</p>
+                        <div class="formula">(28, 64, 3072)</div>
+                        <p style="font-size: 0.75rem; color: var(--text-secondary);">layers × tokens × hidden</p>
+                    </div>
+                    <div class="flow-arrow">→</div>
+                    <div class="flow-box highlight">
+                        <h4>Expand</h4>
+                        <p>For each layer L:</p>
+                        <div class="formula">pool(L) → (3072,)</div>
+                        <p style="font-size: 0.75rem; color: var(--text-secondary);">28 training pairs</p>
+                    </div>
+                    <div class="flow-arrow">→</div>
+                    <div class="flow-box">
+                        <h4>Training Set</h4>
+                        <p>N samples become</p>
+                        <div class="formula">28 × N pairs</div>
+                        <p style="font-size: 0.75rem; color: var(--text-secondary);">massive data boost!</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="code-block">
+<span class="comment"># The expansion algorithm</span>
+<span class="keyword">for</span> sample_i, label_i <span class="keyword">in</span> dataset:
+    tensor = load(sample_i)  <span class="comment"># (28, 64, 3072)</span>
+    <span class="keyword">for</span> layer <span class="keyword">in</span> <span class="function">range</span>(<span class="number">28</span>):
+        pooled = <span class="function">pool</span>(tensor[layer])  <span class="comment"># (3072,)</span>
+        training_pairs.<span class="function">append</span>((pooled, label_i))
+            </div>
+        </section>
+
+        <!-- Pooling Strategies -->
+        <section>
+            <h2>Interactive Pooling Strategies</h2>
+            <p>Choose how to combine token activations into a single vector.</p>
+
+            <div class="pooling-demo">
+                <div class="pooling-buttons">
+                    <button class="pooling-btn active" onclick="setPooling('mean')">Mean Pooling</button>
+                    <button class="pooling-btn" onclick="setPooling('max')">Max Pooling</button>
+                    <button class="pooling-btn" onclick="setPooling('last')">Last Token</button>
+                    <button class="pooling-btn" onclick="setPooling('attn')">Attention</button>
+                </div>
+
+                <h4 style="margin-bottom: 0.5rem;">Token Activations (64 tokens)</h4>
+                <div class="token-visualization" id="token-viz">
+                    <!-- Generated by JS -->
+                </div>
+
+                <div class="pooling-result">
+                    <span id="pooling-description">Average all token values</span>
+                    <div class="result-bar" id="result-bar"></div>
+                </div>
+            </div>
+
+            <div class="code-block" id="pooling-code">
+<span class="comment"># Mean Pooling (default)</span>
+pooled = layer_activations.<span class="function">mean</span>(dim=<span class="number">0</span>)  <span class="comment"># Average across tokens</span>
+            </div>
+        </section>
+
+        <!-- Directory Structure -->
+        <section>
+            <h2>Storage Structure Evolution</h2>
+            <div class="directory-comparison">
+                <div class="directory-tree">
+                    <h4 style="color: var(--accent-red);">Before (Mixed)</h4>
+                    <div class="tree-item folder">data/probes_layer_agnostic/</div>
+                    <div class="tree-item folder" style="padding-left: 1rem;">└── model/dataset/pooling/</div>
+                    <div class="tree-item file" style="padding-left: 2rem;">├── probe.pt</div>
+                    <div class="tree-item file" style="padding-left: 2rem; color: var(--accent-red);">├── results.json ❌</div>
+                    <div class="tree-item file" style="padding-left: 2rem; color: var(--accent-red);">└── per_layer_auc.png ❌</div>
+                </div>
+
+                <div class="directory-tree">
+                    <h4 style="color: var(--accent-green);">After (Separated)</h4>
+                    <div class="tree-item folder">data/probes_layer_agnostic/</div>
+                    <div class="tree-item folder" style="padding-left: 1rem;">└── model/dataset/pooling/</div>
+                    <div class="tree-item file" style="padding-left: 2rem;">├── probe.pt</div>
+                    <div class="tree-item new" style="padding-left: 2rem;">└── best_probe.json ✨</div>
+                    <div class="tree-item folder" style="margin-top: 1rem;">results/probes_layer_agnostic/</div>
+                    <div class="tree-item folder" style="padding-left: 1rem;">└── model/dataset/pooling/</div>
+                    <div class="tree-item moved" style="padding-left: 2rem;">├── layer_results.json →</div>
+                    <div class="tree-item moved" style="padding-left: 2rem;">└── per_layer_auc.png →</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Usage Examples -->
+        <section>
+            <h2>Quick Start</h2>
+            <h3>Training a Layer-Agnostic Probe</h3>
+            <div class="code-block">
+python scripts/training/train_layer_agnostic_probe.py \
+    --model meta-llama/Llama-3.2-3B-Instruct \
+    --dataset Deception-Roleplaying \
+    --pooling mean \
+    --output_dir data/probes_layer_agnostic \
+    --results_dir results/probes_layer_agnostic
+            </div>
+
+            <h3 style="margin-top: 2rem;">With Attention Pooling</h3>
+            <div class="code-block">
+python scripts/training/train_layer_agnostic_probe.py \
+    --model meta-llama/Llama-3.2-3B-Instruct \
+    --dataset Deception-Roleplaying \
+    --pooling attn \  <span class="comment"># Learns which tokens matter!</span>
+    --epochs 30
+            </div>
+        </section>
+    </div>
+
+    <footer>
+        <p>Layer-Agnostic Probes for Deception Detection | Built with ❤️</p>
+    </footer>
+
+    <script>
+        // Initialize traditional probe grid
+        function initTraditionalGrid() {
+            const grid = document.getElementById('traditional-grid');
+            for (let i = 0; i < 28; i++) {
+                const box = document.createElement('div');
+                box.className = 'probe-box';
+                box.textContent = `L${i}`;
+                grid.appendChild(box);
+            }
+            // Animate boxes sequentially
+            const boxes = grid.querySelectorAll('.probe-box');
+            boxes.forEach((box, i) => {
+                setTimeout(() => box.classList.add('active'), i * 100);
+            });
+        }
+
+        // Token visualization
+        const tokenHeights = [60, 80, 45, 90, 55, 70, 85, 40, 95, 50, 65, 75, 88, 42, 78, 62];
+        const attentionWeights = [0.02, 0.05, 0.03, 0.08, 0.04, 0.06, 0.15, 0.02, 0.25, 0.04, 0.06, 0.08, 0.05, 0.03, 0.02, 0.02];
+
+        function initTokenViz() {
+            const viz = document.getElementById('token-viz');
+            viz.innerHTML = '';
+            for (let i = 0; i < 16; i++) {
+                const token = document.createElement('div');
+                token.className = 'token';
+                token.style.height = tokenHeights[i] + '%';
+                token.textContent = `T${i}`;
+                viz.appendChild(token);
+            }
+        }
+
+        function setPooling(type) {
+            // Update buttons
+            document.querySelectorAll('.pooling-btn').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+
+            const tokens = document.querySelectorAll('.token');
+            const resultBar = document.getElementById('result-bar');
+            const description = document.getElementById('pooling-description');
+            const codeBlock = document.getElementById('pooling-code');
+
+            // Reset highlights
+            tokens.forEach(t => t.classList.remove('highlight'));
+
+            switch(type) {
+                case 'mean':
+                    description.textContent = 'Average all token values → single vector';
+                    resultBar.style.width = '60%';
+                    resultBar.style.background = 'var(--accent-blue)';
+                    codeBlock.innerHTML = `<span class="comment"># Mean Pooling (default)</span>
+pooled = layer_activations.<span class="function">mean</span>(dim=<span class="number">0</span>)  <span class="comment"># (D,)</span>`;
+                    break;
+                case 'max':
+                    const maxIdx = tokenHeights.indexOf(Math.max(...tokenHeights));
+                    tokens[maxIdx].classList.add('highlight');
+                    description.textContent = 'Take maximum activation per dimension';
+                    resultBar.style.width = '95%';
+                    resultBar.style.background = 'var(--accent-orange)';
+                    codeBlock.innerHTML = `<span class="comment"># Max Pooling</span>
+pooled = layer_activations.<span class="function">max</span>(dim=<span class="number">0</span>).values  <span class="comment"># (D,)</span>`;
+                    break;
+                case 'last':
+                    tokens[tokens.length - 1].classList.add('highlight');
+                    description.textContent = 'Use only the final token (often EOS)';
+                    resultBar.style.width = '2%';
+                    resultBar.style.background = 'var(--accent-purple)';
+                    codeBlock.innerHTML = `<span class="comment"># Last Token Pooling</span>
+pooled = layer_activations[<span class="number">-1</span>]  <span class="comment"># (D,)</span>`;
+                    break;
+                case 'attn':
+                    // Highlight tokens based on attention weights
+                    tokens.forEach((t, i) => {
+                        const weight = attentionWeights[i];
+                        t.style.opacity = 0.3 + weight * 3;
+                        if (weight > 0.1) t.classList.add('highlight');
+                    });
+                    description.textContent = 'Learned query weights tokens by importance';
+                    resultBar.style.width = '75%';
+                    resultBar.style.background = 'linear-gradient(90deg, var(--accent-green), var(--accent-blue))';
+                    codeBlock.innerHTML = `<span class="comment"># Learned Attention Pooling</span>
+scores = torch.<span class="function">matmul</span>(x, self.query)  <span class="comment"># (B, T, 1)</span>
+weights = F.<span class="function">softmax</span>(scores, dim=<span class="number">1</span>)  <span class="comment"># Learned!</span>
+pooled = (x * weights).<span class="function">sum</span>(dim=<span class="number">1</span>)  <span class="comment"># (B, D)</span>`;
+                    break;
+            }
+        }
+
+        function toggleCommit(card) {
+            card.classList.toggle('expanded');
+        }
+
+        // Initialize on load
+        document.addEventListener('DOMContentLoaded', () => {
+            initTraditionalGrid();
+            initTokenViz();
+        });
+    </script>
+</body>
+</html>
