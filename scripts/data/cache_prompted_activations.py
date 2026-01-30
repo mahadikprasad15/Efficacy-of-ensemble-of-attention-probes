@@ -104,6 +104,12 @@ def main():
         default=None,
         help="Limit number of examples (for testing)"
     )
+    parser.add_argument(
+        "--soft_prefix_ckpt",
+        type=str,
+        default=None,
+        help="Path to soft prefix checkpoint dir (optional, for prefix-conditioned activations)"
+    )
     
     args = parser.parse_args()
     
@@ -113,6 +119,8 @@ def main():
     logger.info(f"Model: {args.model}")
     logger.info(f"Prepared dataset: {args.prepared_dataset}")
     logger.info(f"Batch size: {args.batch_size}")
+    if args.soft_prefix_ckpt:
+        logger.info(f"Soft prefix: {args.soft_prefix_ckpt}")
     logger.info("=" * 70)
     
     # ========================================================================
@@ -147,9 +155,18 @@ def main():
     # 2. Setup output directory
     # ========================================================================
     
+    # Determine output directory based on whether using soft prefix
     model_name_safe = args.model.replace("/", "_")
+    if args.soft_prefix_ckpt:
+        # Use separate directory for prefixed activations
+        base_output_dir = args.output_dir.replace("prompted_activations", "soft_prefix_activations")
+        if base_output_dir == args.output_dir:
+            base_output_dir = "data/soft_prefix_activations"
+    else:
+        base_output_dir = args.output_dir
+    
     save_dir = os.path.join(
-        args.output_dir,
+        base_output_dir,
         model_name_safe,
         suffix_type,
         dataset_name,
@@ -179,6 +196,19 @@ def main():
     runner = ActivationRunner(args.model, dtype=torch.float16, hf_token=args.hf_token)
     logger.info("  ✓ Model loaded")
     
+    # Load soft prefix if provided
+    soft_prefix = None
+    if args.soft_prefix_ckpt:
+        from safetensors.torch import load_file
+        prefix_path = os.path.join(args.soft_prefix_ckpt, 'prefix.safetensors')
+        if os.path.exists(prefix_path):
+            tensors = load_file(prefix_path)
+            soft_prefix = tensors['soft_prefix']  # [P, D]
+            logger.info(f"  ✓ Loaded soft prefix with shape {soft_prefix.shape}")
+        else:
+            logger.error(f"Soft prefix not found at {prefix_path}")
+            return 1
+    
     # Process in batches
     logger.info(f"\n[4/4] Extracting final-token activations...")
     
@@ -197,8 +227,11 @@ def main():
         model_inputs = [item['model_input'] for item in batch_items]
         
         try:
-            # Extract final-token activations
-            activations = runner.get_final_token_activations(model_inputs)
+            # Extract final-token activations (with or without prefix)
+            if soft_prefix is not None:
+                activations = runner.get_final_token_activations_with_prefix(model_inputs, soft_prefix)
+            else:
+                activations = runner.get_final_token_activations(model_inputs)
             
             for i, (item, tensor) in enumerate(zip(batch_items, activations)):
                 item_id = item['id']

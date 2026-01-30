@@ -206,3 +206,71 @@ class ActivationRunner:
             results.append(tensor.cpu())
         
         return results
+
+    @torch.no_grad()
+    def get_final_token_activations_with_prefix(
+        self, 
+        texts: List[str], 
+        soft_prefix: torch.Tensor
+    ) -> List[torch.Tensor]:
+        """
+        Run forward pass WITH soft prefix prepended and return final token activations.
+        
+        This enables caching activations for evaluation after soft prefix training.
+        The output format matches get_final_token_activations exactly.
+        
+        Args:
+            texts: List of full model inputs (PASSAGE + DELIM + SUFFIX)
+            soft_prefix: Tensor of shape [P, D] (prefix embeddings)
+        
+        Returns:
+            List of tensors shape (L, D) for each input text
+        """
+        # CRITICAL: Left-truncate to preserve Answer: at tail
+        self.tokenizer.truncation_side = "left"
+        inputs = self.tokenizer(
+            texts, return_tensors="pt", padding=True,
+            truncation=True, max_length=2048
+        ).to(self.device)
+        
+        # Runtime assert: verify Answer: not truncated
+        for i, ids in enumerate(inputs.input_ids):
+            decoded = self.tokenizer.decode(ids[-30:])
+            assert "Answer" in decoded or ":" in decoded, \
+                f"Truncation removed Answer: from sample {i}. Decoded tail: {decoded}"
+        
+        input_ids = inputs.input_ids  # [B, T]
+        attention_mask = inputs.attention_mask  # [B, T]
+        B, T = input_ids.shape
+        P = soft_prefix.shape[0]
+        
+        # Embed tokens
+        token_embeds = self.model.model.embed_tokens(input_ids)  # [B, T, D]
+        
+        # Expand prefix: [P, D] -> [B, P, D], align dtype
+        prefix_embeds = soft_prefix.unsqueeze(0).expand(B, -1, -1).to(self.device)
+        prefix_embeds = prefix_embeds.to(dtype=token_embeds.dtype)
+        
+        # Concat embeddings and masks
+        combined_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)  # [B, P+T, D]
+        prefix_mask = torch.ones(B, P, device=attention_mask.device, dtype=attention_mask.dtype)
+        combined_mask = torch.cat([prefix_mask, attention_mask], dim=1)  # [B, P+T]
+        
+        # Forward with inputs_embeds
+        outputs = self.model(
+            inputs_embeds=combined_embeds,
+            attention_mask=combined_mask,
+            output_hidden_states=True
+        )
+        
+        # Extract final token activations
+        hs_tuple = outputs.hidden_states[1:]  # Exclude embeddings
+        stacked = torch.stack(hs_tuple, dim=1)  # [B, L, P+T, D]
+        
+        results = []
+        for i in range(B):
+            real_len = combined_mask[i].sum().item()
+            final_idx = int(real_len) - 1
+            results.append(stacked[i, :, final_idx, :].cpu())  # [L, D]
+        
+        return results
