@@ -432,7 +432,8 @@ def train_soft_prefix(
         Best prefix tensor [1, P, D]
     """
     device = next(wrapper.model.parameters()).device
-    probe = probe.to(device)
+    dtype = next(wrapper.model.parameters()).dtype
+    probe = probe.to(device=device, dtype=dtype)
     
     # Only optimize soft_prefix
     optimizer = torch.optim.AdamW([wrapper.soft_prefix], lr=args.lr)
