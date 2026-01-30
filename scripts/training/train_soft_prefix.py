@@ -241,9 +241,9 @@ class SoftPrefixWrapper(nn.Module):
         # Token embeddings
         token_embeds = self.model.model.embed_tokens(input_ids)  # [B, T, D]
         
-        # Expand prefix: [1, P, D] -> [B, P, D], align dtype
-        prefix_embeds = self.soft_prefix.expand(B, -1, -1)
-        prefix_embeds = prefix_embeds.to(dtype=token_embeds.dtype)
+        # Expand prefix: [1, P, D] -> [B, P, D], align dtype AND device
+        prefix_embeds = self.soft_prefix.to(device=token_embeds.device, dtype=token_embeds.dtype)
+        prefix_embeds = prefix_embeds.expand(B, -1, -1)
         
         # Concat embeddings: [B, P+T, D]
         combined_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)
