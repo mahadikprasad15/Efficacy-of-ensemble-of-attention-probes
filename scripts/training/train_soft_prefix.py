@@ -456,9 +456,11 @@ def train_soft_prefix(
             # Forward: wrapper -> features -> probe
             features = wrapper.get_final_token_features(texts, layer_idx)
             
-            # Prompted probes expect [B, D] features (final token vector). No unsqueeze.
-            assert features.ndim == 2 and features.shape[1] == probe.classifier.in_features, \
-                f"Feature shape mismatch: got {features.shape}, expected [B, {probe.classifier.in_features}]"
+            # Layer-agnostic probes with pooling (last/mean/max) expect [B, T, D]
+            # We have [B, D], so unsqueeze to [B, 1, D] for pooling to work
+            # Probes with pooling="none" expect [B, D] directly
+            if hasattr(probe, 'pooling') and probe.pooling is not None:
+                features = features.unsqueeze(1)  # [B, 1, D]
             
             logits = probe(features).squeeze(-1)  # [B]
             
