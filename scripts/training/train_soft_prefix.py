@@ -47,6 +47,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Global flag for raw mode (no suffix/Answer: check)
+RAW_MODE = False
+
+
 # ============================================================================
 # Dataset + Collate
 # ============================================================================
@@ -77,6 +81,63 @@ def collate_fn(batch):
     texts = [t for t, l in batch]
     labels = torch.tensor([l for t, l in batch], dtype=torch.long)
     return texts, labels
+
+
+class RawDataset(Dataset):
+    """
+    Load raw YAML data (without suffix) for soft prefix training.
+    
+    Expected format (like roleplaying/dataset.yaml):
+    - scenario: "..."
+      question: "..."
+      answer_prefix: "..."
+      honest_completion: "..."
+      deceptive_completion: "..."
+    
+    Produces TEXT = scenario + question + answer_prefix + completion
+    """
+    
+    def __init__(self, yaml_path: str):
+        import yaml
+        self.items = []
+        
+        with open(yaml_path, 'r') as f:
+            data = yaml.safe_load(f)
+        
+        # Handle both list format and dict with 'data' key
+        if isinstance(data, dict) and 'data' in data:
+            data = data['data']
+        
+        for i, item in enumerate(data):
+            scenario = item.get('scenario', '')
+            question = item.get('question', '')
+            answer_prefix = item.get('answer_prefix', '')
+            
+            # Combine scenario + question + answer_prefix as the base
+            base_text = f"{scenario}\n{question}\n{answer_prefix}"
+            
+            # Honest sample
+            honest = item.get('honest_completion', '')
+            if honest:
+                text = f"{base_text}{honest}"
+                self.items.append((text.strip(), 0))  # label=0 for honest
+            
+            # Deceptive sample
+            deceptive = item.get('deceptive_completion', '')
+            if deceptive:
+                text = f"{base_text}{deceptive}"
+                self.items.append((text.strip(), 1))  # label=1 for deceptive
+        
+        logger.info(f"Loaded {len(self.items)} examples from {yaml_path}")
+    
+    def __len__(self):
+        return len(self.items)
+    
+    def __getitem__(self, idx):
+        return self.items[idx]
+    
+    def get_labels(self) -> List[int]:
+        return [label for _, label in self.items]
 
 
 # ============================================================================
@@ -165,11 +226,13 @@ class SoftPrefixWrapper(nn.Module):
             truncation=True, max_length=2048
         ).to(self.model.device)
         
-        # Runtime assert: verify Answer: not truncated
-        for i, ids in enumerate(inputs.input_ids):
-            decoded = self.tokenizer.decode(ids[-30:])
-            assert "Answer" in decoded or ":" in decoded, \
-                f"Truncation removed Answer: from sample {i}. Decoded tail: {decoded}"
+        # Runtime check: skip for raw mode, required for prompted mode
+        global RAW_MODE
+        if not RAW_MODE:
+            for i, ids in enumerate(inputs.input_ids):
+                decoded = self.tokenizer.decode(ids[-30:])
+                assert "Answer" in decoded or ":" in decoded, \
+                    f"Truncation removed Answer: from sample {i}. Decoded tail: {decoded}"
         
         input_ids = inputs.input_ids  # [B, T]
         attention_mask = inputs.attention_mask  # [B, T]
@@ -453,8 +516,10 @@ def main():
     # Model & data
     parser.add_argument("--model", type=str, required=True,
                         help="HuggingFace model name")
-    parser.add_argument("--train_jsonl", type=str, required=True,
-                        help="Path to prepared train JSONL")
+    parser.add_argument("--train_jsonl", type=str, default=None,
+                        help="Path to prepared train JSONL (with suffix)")
+    parser.add_argument("--raw_yaml", type=str, default=None,
+                        help="Path to raw YAML data (without suffix, e.g., roleplaying/dataset.yaml)")
     parser.add_argument("--val_jsonl", type=str, default=None,
                         help="Path to prepared val JSONL (optional)")
     parser.add_argument("--hf_token", type=str, default=None,
@@ -551,8 +616,21 @@ def main():
     # Load Datasets
     # ========================================================================
     
-    train_dataset = PreparedDataset(args.train_jsonl)
-    val_dataset = PreparedDataset(args.val_jsonl) if args.val_jsonl else train_dataset
+    global RAW_MODE
+    
+    if args.raw_yaml:
+        # Raw mode: no suffix, just scenario + completion
+        RAW_MODE = True
+        logger.info(f"Using RAW mode with YAML data (no suffix)")
+        train_dataset = RawDataset(args.raw_yaml)
+        val_dataset = train_dataset  # Use same for validation in raw mode
+    elif args.train_jsonl:
+        # Prompted mode: with suffix format
+        RAW_MODE = False
+        train_dataset = PreparedDataset(args.train_jsonl)
+        val_dataset = PreparedDataset(args.val_jsonl) if args.val_jsonl else train_dataset
+    else:
+        raise ValueError("Must provide either --train_jsonl or --raw_yaml")
     
     # Get labels for balanced sampler
     train_labels = train_dataset.get_labels()
