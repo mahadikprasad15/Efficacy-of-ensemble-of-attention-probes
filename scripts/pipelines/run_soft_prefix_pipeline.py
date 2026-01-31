@@ -742,6 +742,19 @@ def train_soft_prefix(
                     lambda_anchor=args.lambda_anchor, safe_threshold=args.safe_threshold
                 )
             
+            labels = labels.to(device)
+            
+            # Forward with prefix
+            features = wrapper.get_final_token_features(texts, layer_idx)
+            logits = probe(features.unsqueeze(1)).squeeze() * logit_sign
+            
+            # Hinge loss: only penalize if honest drifts UP toward ambiguity
+            loss, metrics = contrastive_hinge_loss(
+                logits, labels, wrapper.soft_prefix,
+                margin=args.margin, lambda_norm=args.lambda_norm,
+                lambda_anchor=args.lambda_anchor, safe_threshold=args.safe_threshold
+            )
+            
             # Backward
             optimizer.zero_grad()
             loss.backward()
@@ -1156,6 +1169,7 @@ def main():
                 'best_val_auroc': training_log['best_auroc'],
                 'logit_sign': logit_sign,
                 'loss_type': args.loss_type
+                'logit_sign': logit_sign
             }, f, indent=2)
         
         with open(os.path.join(prefix_dir, 'training_log.json'), 'w') as f:
