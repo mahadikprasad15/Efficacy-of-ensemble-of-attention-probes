@@ -299,6 +299,37 @@ class SimpleDataset(Dataset):
         return [s.label for s in self.samples]
 
 
+class PairDataset(Dataset):
+    """Dataset of (honest, deceptive) pairs grouped by scenario_idx."""
+
+    def __init__(self, samples: List[DataSample]):
+        pairs = {}
+        for sample in samples:
+            scenario_idx = sample.metadata.get('scenario_idx')
+            if scenario_idx is None:
+                continue
+            if scenario_idx not in pairs:
+                pairs[scenario_idx] = {}
+            pairs[scenario_idx][sample.metadata.get('type')] = sample
+
+        self.pairs = []
+        for scenario_idx, items in pairs.items():
+            honest = items.get('honest')
+            deceptive = items.get('deceptive')
+            if honest is None or deceptive is None:
+                continue
+            self.pairs.append((honest, deceptive))
+
+        logger.info(f"Constructed {len(self.pairs)} paired samples from {len(samples)} inputs")
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        honest, deceptive = self.pairs[idx]
+        return honest.text, deceptive.text
+
+
 class BalancedBatchSampler(Sampler):
     """Yields batches with B/2 honest, B/2 deceptive."""
     
@@ -462,6 +493,32 @@ def contrastive_hinge_loss(
     }
 
 
+def pairwise_margin_loss(
+    honest_logits: torch.Tensor,
+    deceptive_logits: torch.Tensor,
+    soft_prefix: nn.Parameter,
+    margin: float = 1.0,
+    lambda_norm: float = 1e-3
+) -> Tuple[torch.Tensor, dict]:
+    """
+    Pairwise margin loss on paired honest/deceptive completions.
+
+    Loss = mean(max(0, margin - (z_dec - z_hon))) + λ_norm * ||prefix||
+    """
+    deltas = deceptive_logits - honest_logits
+    pair_loss = F.relu(margin - deltas)
+    L_norm = soft_prefix.norm()
+    loss = pair_loss.mean() + lambda_norm * L_norm
+    pair_acc = (deltas > 0).float().mean()
+
+    return loss, {
+        'pair_margin': deltas.mean().item(),
+        'pair_acc': pair_acc.item(),
+        'L_pair': pair_loss.mean().item(),
+        'loss': loss.item()
+    }
+
+
 def compute_baseline_logits(
     model,
     tokenizer,
@@ -614,27 +671,76 @@ def train_soft_prefix(
     probe = probe.to(device=device, dtype=dtype)
     
     # Setup data
-    train_dataset = SimpleDataset(train_samples)
-    sampler = BalancedBatchSampler(train_dataset.get_labels(), args.batch_size)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_sampler=sampler,
-        collate_fn=lambda b: ([t for t, l in b], torch.tensor([l for t, l in b]))
-    )
+    if args.loss_type == "pairwise":
+        train_dataset = PairDataset(train_samples)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=lambda b: ([h for h, _ in b], [d for _, d in b])
+        )
+    else:
+        train_dataset = SimpleDataset(train_samples)
+        sampler = BalancedBatchSampler(train_dataset.get_labels(), args.batch_size)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=sampler,
+            collate_fn=lambda b: ([t for t, l in b], torch.tensor([l for t, l in b]))
+        )
     
     optimizer = torch.optim.AdamW([wrapper.soft_prefix], lr=args.lr)
     
     best_auroc = 0.0
     best_prefix = None
-    training_log = {'steps': [], 'train_loss': [], 'val_auroc': [], 'separation': [], 'L_hinge': [], 'mu_hon': [], 'mu_dec': []}
+    training_log = {
+        'steps': [],
+        'train_loss': [],
+        'val_auroc': [],
+        'separation': [],
+        'L_hinge': [],
+        'mu_hon': [],
+        'mu_dec': [],
+        'pair_margin': [],
+        'pair_acc': []
+    }
     
     step = 0
     pbar = tqdm(total=args.steps, desc="Training")
     
     while step < args.steps:
-        for texts, labels in train_loader:
+        for batch in train_loader:
             if step >= args.steps:
                 break
+
+            if args.loss_type == "pairwise":
+                honest_texts, deceptive_texts = batch
+                texts = honest_texts + deceptive_texts
+                features = wrapper.get_final_token_features(texts, layer_idx)
+                split = len(honest_texts)
+                honest_features = features[:split]
+                deceptive_features = features[split:]
+
+                honest_logits = probe(honest_features.unsqueeze(1)).squeeze() * logit_sign
+                deceptive_logits = probe(deceptive_features.unsqueeze(1)).squeeze() * logit_sign
+
+                loss, metrics = pairwise_margin_loss(
+                    honest_logits, deceptive_logits, wrapper.soft_prefix,
+                    margin=args.margin, lambda_norm=args.lambda_norm
+                )
+            else:
+                texts, labels = batch
+                labels = labels.to(device)
+
+                # Forward with prefix
+                features = wrapper.get_final_token_features(texts, layer_idx)
+                logits = probe(features.unsqueeze(1)).squeeze() * logit_sign
+
+                # Hinge loss: only penalize if honest drifts UP toward ambiguity
+                loss, metrics = contrastive_hinge_loss(
+                    logits, labels, wrapper.soft_prefix,
+                    margin=args.margin, lambda_norm=args.lambda_norm,
+                    lambda_anchor=args.lambda_anchor, safe_threshold=args.safe_threshold
+                )
             
             labels = labels.to(device)
             
@@ -656,12 +762,19 @@ def train_soft_prefix(
             
             step += 1
             pbar.update(1)
-            pbar.set_postfix(
-                loss=f"{metrics['loss']:.3f}", 
-                sep=f"{metrics['separation']:.2f}",
-                mu_h=f"{metrics['mu_hon']:.2f}",
-                hinge=f"{metrics['L_hinge']:.3f}"
-            )
+            if args.loss_type == "pairwise":
+                pbar.set_postfix(
+                    loss=f"{metrics['loss']:.3f}",
+                    pair_margin=f"{metrics['pair_margin']:.2f}",
+                    pair_acc=f"{metrics['pair_acc']:.2f}"
+                )
+            else:
+                pbar.set_postfix(
+                    loss=f"{metrics['loss']:.3f}",
+                    sep=f"{metrics['separation']:.2f}",
+                    mu_h=f"{metrics['mu_hon']:.2f}",
+                    hinge=f"{metrics['L_hinge']:.3f}"
+                )
             
             # Validation every N steps
             if step % args.val_every == 0:
@@ -672,12 +785,26 @@ def train_soft_prefix(
                 training_log['steps'].append(step)
                 training_log['train_loss'].append(metrics['loss'])
                 training_log['val_auroc'].append(val_auroc)
-                training_log['separation'].append(metrics['separation'])
-                training_log['L_hinge'].append(metrics['L_hinge'])
-                training_log['mu_hon'].append(metrics['mu_hon'])
-                training_log['mu_dec'].append(metrics['mu_dec'])
-                
-                logger.info(f"Step {step}: val_auroc={val_auroc:.4f}, sep={metrics['separation']:.2f}, μ_hon={metrics['mu_hon']:.2f}, L_hinge={metrics['L_hinge']:.3f}")
+
+                if args.loss_type == "pairwise":
+                    training_log['pair_margin'].append(metrics['pair_margin'])
+                    training_log['pair_acc'].append(metrics['pair_acc'])
+                    logger.info(
+                        f"Step {step}: val_auroc={val_auroc:.4f}, "
+                        f"pair_margin={metrics['pair_margin']:.2f}, "
+                        f"pair_acc={metrics['pair_acc']:.2f}"
+                    )
+                else:
+                    training_log['separation'].append(metrics['separation'])
+                    training_log['L_hinge'].append(metrics['L_hinge'])
+                    training_log['mu_hon'].append(metrics['mu_hon'])
+                    training_log['mu_dec'].append(metrics['mu_dec'])
+                    logger.info(
+                        f"Step {step}: val_auroc={val_auroc:.4f}, "
+                        f"sep={metrics['separation']:.2f}, "
+                        f"μ_hon={metrics['mu_hon']:.2f}, "
+                        f"L_hinge={metrics['L_hinge']:.3f}"
+                    )
                 
                 if val_auroc > best_auroc:
                     best_auroc = val_auroc
@@ -889,8 +1016,11 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4,
                        help="Training batch size (reduce if OOM)")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--loss_type", type=str, default="mean",
+                       choices=["mean", "pairwise"],
+                       help="Loss type: mean (batch mean separation) or pairwise (paired ranking)")
     parser.add_argument("--margin", type=float, default=1.0,
-                       help="Margin for contrastive loss (mu_dec - mu_hon > margin)")
+                       help="Margin for loss (mean separation or pairwise ranking)")
     parser.add_argument("--lambda_norm", type=float, default=1e-3,
                        help="L2 regularization on prefix norm")
     parser.add_argument("--lambda_anchor", type=float, default=1.0,
@@ -1037,6 +1167,8 @@ def main():
                 'prompt_len': args.prompt_len,
                 'steps': args.steps,
                 'best_val_auroc': training_log['best_auroc'],
+                'logit_sign': logit_sign,
+                'loss_type': args.loss_type
                 'logit_sign': logit_sign
             }, f, indent=2)
         
@@ -1160,7 +1292,8 @@ def main():
         'config': {
             'model': args.model,
             'layer_idx': args.layer_idx,
-            'prompt_len': args.prompt_len
+            'prompt_len': args.prompt_len,
+            'loss_type': args.loss_type
         }
     }
     
