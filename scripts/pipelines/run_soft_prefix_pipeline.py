@@ -857,7 +857,8 @@ def main():
     # Training
     parser.add_argument("--prompt_len", type=int, default=16)
     parser.add_argument("--steps", type=int, default=500)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=4,
+                       help="Training batch size (reduce if OOM)")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--margin", type=float, default=0.5)
     parser.add_argument("--lambda_norm", type=float, default=1e-3,
@@ -957,6 +958,10 @@ def main():
             torch_dtype=torch.float16, device_map="auto"
         )
         model.eval()
+        
+        # Enable gradient checkpointing to reduce memory usage
+        model.gradient_checkpointing_enable()
+        logger.info("Enabled gradient checkpointing for memory efficiency")
         
         # Load probe
         from actprobe.probes.models import LayerProbe
