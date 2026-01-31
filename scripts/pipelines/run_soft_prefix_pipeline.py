@@ -1169,7 +1169,6 @@ def main():
                 'best_val_auroc': training_log['best_auroc'],
                 'logit_sign': logit_sign,
                 'loss_type': args.loss_type
-                'logit_sign': logit_sign
             }, f, indent=2)
         
         with open(os.path.join(prefix_dir, 'training_log.json'), 'w') as f:
