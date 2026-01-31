@@ -90,9 +90,17 @@ class ActivationData:
         return self.labels == 1
 
 
-def load_activations_from_dir(activations_dir: str) -> ActivationData:
+def load_activations_from_dir(activations_dir: str, pool_to_last: bool = True) -> ActivationData:
     """
     Load activations from safetensors shards and manifest.
+    
+    Handles both formats:
+        - Per-token: (L, T, D) -> pools to (L, D) using last token
+        - Already pooled: (L, D) -> uses as-is
+    
+    Args:
+        activations_dir: Directory with shard_*.safetensors and manifest.jsonl
+        pool_to_last: If True, pool per-token activations to last token
     
     Returns:
         ActivationData with shape (N, L, D)
@@ -121,6 +129,7 @@ def load_activations_from_dir(activations_dir: str) -> ActivationData:
     all_labels = []
     all_ids = []
     skipped = 0
+    detected_format = None
     
     for shard_path in shards:
         shard_data = load_file(shard_path)
@@ -135,8 +144,25 @@ def load_activations_from_dir(activations_dir: str) -> ActivationData:
                 skipped += 1
                 continue
             
-            # tensor is (L, D) for final-token activations
-            all_acts.append(tensor.numpy())
+            arr = tensor.numpy()
+            
+            # Detect format from first sample
+            if detected_format is None:
+                if arr.ndim == 2:
+                    detected_format = "pooled"
+                    print(f"  Format: Already pooled (L, D) = {arr.shape}")
+                elif arr.ndim == 3:
+                    detected_format = "per_token"
+                    print(f"  Format: Per-token (L, T, D) = {arr.shape}")
+                else:
+                    raise ValueError(f"Unexpected tensor shape: {arr.shape}")
+            
+            # Handle per-token format: (L, T, D) -> (L, D) via last token
+            if detected_format == "per_token" and pool_to_last:
+                # arr shape is (L, T, D), take last token: arr[:, -1, :]
+                arr = arr[:, -1, :]  # (L, D)
+            
+            all_acts.append(arr)
             all_labels.append(label)
             all_ids.append(sample_id)
     
@@ -146,7 +172,7 @@ def load_activations_from_dir(activations_dir: str) -> ActivationData:
     activations = np.stack(all_acts, axis=0)  # (N, L, D)
     labels = np.array(all_labels)
     
-    print(f"  Loaded: {len(all_ids)} samples, shape {activations.shape}")
+    print(f"  Final shape: {activations.shape} (N, L, D)")
     print(f"  Labels: {np.sum(labels == 0)} honest, {np.sum(labels == 1)} deceptive")
     
     return ActivationData(activations=activations, labels=labels, ids=all_ids)
