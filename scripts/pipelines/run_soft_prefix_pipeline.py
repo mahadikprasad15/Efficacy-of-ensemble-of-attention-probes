@@ -26,6 +26,7 @@ Key fixes over previous implementation:
 """
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -57,6 +58,14 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Phase 1: Data Preparation
 # ============================================================================
+
+def _last_nonzero_index(mask_row: torch.Tensor) -> int:
+    """Return the last index where mask_row is non-zero."""
+    nonzero = torch.nonzero(mask_row, as_tuple=False)
+    if nonzero.numel() == 0:
+        raise ValueError("Mask row has no non-zero entries")
+    return int(nonzero[-1].item())
+
 
 @dataclass
 class DataSample:
@@ -420,8 +429,7 @@ class SoftPrefixWrapper(nn.Module):
         
         features = []
         for i in range(len(texts)):
-            real_len = combined_mask[i].sum().item()
-            final_idx = int(real_len) - 1
+            final_idx = _last_nonzero_index(combined_mask[i])
             features.append(layer_hidden[i, final_idx, :])
         
         return torch.stack(features)
@@ -565,8 +573,7 @@ def compute_baseline_logits(
             layer_hidden = outputs.hidden_states[layer_idx + 1]
             
             for j, sample in enumerate(batch):
-                real_len = inputs.attention_mask[j].sum().item()
-                final_idx = int(real_len) - 1
+                final_idx = _last_nonzero_index(inputs.attention_mask[j])
                 features = layer_hidden[j, final_idx, :].unsqueeze(0).unsqueeze(1)
                 logit = probe(features).squeeze().item()
                 baseline[sample.id] = logit
@@ -742,19 +749,6 @@ def train_soft_prefix(
                     lambda_anchor=args.lambda_anchor, safe_threshold=args.safe_threshold
                 )
             
-            labels = labels.to(device)
-            
-            # Forward with prefix
-            features = wrapper.get_final_token_features(texts, layer_idx)
-            logits = probe(features.unsqueeze(1)).squeeze() * logit_sign
-            
-            # Hinge loss: only penalize if honest drifts UP toward ambiguity
-            loss, metrics = contrastive_hinge_loss(
-                logits, labels, wrapper.soft_prefix,
-                margin=args.margin, lambda_norm=args.lambda_norm,
-                lambda_anchor=args.lambda_anchor, safe_threshold=args.safe_threshold
-            )
-            
             # Backward
             optimizer.zero_grad()
             loss.backward()
@@ -886,8 +880,7 @@ def cache_activations_with_prefix(
             stacked = torch.stack(hs_tuple, dim=1)  # [B, L, P+T, D]
             
             for i, sample in enumerate(batch):
-                real_len = combined_mask[i].sum().item()
-                final_idx = int(real_len) - 1
+                final_idx = _last_nonzero_index(combined_mask[i])
                 acts = stacked[i, :, final_idx, :].cpu()  # [L, D]
                 
                 buffer[sample.id] = acts
@@ -972,17 +965,27 @@ def evaluate_probe_on_activations(
             
             all_logits.append(torch.sigmoid(torch.tensor(logit)).item())
             all_labels.append(sample['label'])
-    
+
     auroc = roc_auc_score(all_labels, all_logits)
-    
+    auroc_flipped = roc_auc_score(all_labels, [1.0 - p for p in all_logits])
+
     n_honest = sum(1 for l in all_labels if l == 0)
     n_deceptive = sum(1 for l in all_labels if l == 1)
+
+    logits = np.array(all_logits)
+    labels = np.array(all_labels)
+    mean_honest = float(np.mean(logits[labels == 0])) if n_honest else float("nan")
+    mean_deceptive = float(np.mean(logits[labels == 1])) if n_deceptive else float("nan")
     
     return {
         'auroc': auroc,
+        'auroc_flipped': auroc_flipped,
         'n_samples': len(samples),
         'n_honest': n_honest,
         'n_deceptive': n_deceptive,
+        'mean_prob_honest': mean_honest,
+        'mean_prob_deceptive': mean_deceptive,
+        'prob_separation': mean_deceptive - mean_honest,
         'layer': layer_idx
     }
 
@@ -1034,6 +1037,8 @@ def main():
                        help="Max OOD samples to use (default 300)")
     parser.add_argument("--cache_batch_size", type=int, default=2,
                        help="Batch size for caching (smaller to avoid OOM)")
+    parser.add_argument("--dump_diagnostics", action="store_true",
+                       help="Write diagnostics summary CSV/JSON in results dir")
     
     # Output
     parser.add_argument("--output_base", type=str, required=True,
@@ -1268,6 +1273,12 @@ def main():
         id_val_acts_dir, args.probe_path, args.layer_idx, args.pooling, logit_sign
     )
     logger.info(f"  ID Val AUROC: {id_val_results['auroc']:.4f}")
+    logger.info(
+        f"  ID Val diag: mean_prob_hon={id_val_results['mean_prob_honest']:.4f}, "
+        f"mean_prob_dec={id_val_results['mean_prob_deceptive']:.4f}, "
+        f"sep={id_val_results['prob_separation']:.4f}, "
+        f"auroc_flipped={id_val_results['auroc_flipped']:.4f}"
+    )
     
     # ID Test
     logger.info("\nEvaluating on ID Test...")
@@ -1275,6 +1286,12 @@ def main():
         id_test_acts_dir, args.probe_path, args.layer_idx, args.pooling, logit_sign
     )
     logger.info(f"  ID Test AUROC: {id_test_results['auroc']:.4f}")
+    logger.info(
+        f"  ID Test diag: mean_prob_hon={id_test_results['mean_prob_honest']:.4f}, "
+        f"mean_prob_dec={id_test_results['mean_prob_deceptive']:.4f}, "
+        f"sep={id_test_results['prob_separation']:.4f}, "
+        f"auroc_flipped={id_test_results['auroc_flipped']:.4f}"
+    )
     
     # OOD Test
     logger.info("\nEvaluating on OOD Test...")
@@ -1282,6 +1299,12 @@ def main():
         ood_test_acts_dir, args.probe_path, args.layer_idx, args.pooling, logit_sign
     )
     logger.info(f"  OOD Test AUROC: {ood_test_results['auroc']:.4f}")
+    logger.info(
+        f"  OOD Test diag: mean_prob_hon={ood_test_results['mean_prob_honest']:.4f}, "
+        f"mean_prob_dec={ood_test_results['mean_prob_deceptive']:.4f}, "
+        f"sep={ood_test_results['prob_separation']:.4f}, "
+        f"auroc_flipped={ood_test_results['auroc_flipped']:.4f}"
+    )
     
     # Save results
     all_results = {
@@ -1298,6 +1321,42 @@ def main():
     
     with open(os.path.join(results_dir, 'evaluation_results.json'), 'w') as f:
         json.dump(all_results, f, indent=2)
+
+    if args.dump_diagnostics:
+        diag_config = {
+            'model': args.model,
+            'layer_idx': args.layer_idx,
+            'prompt_len': args.prompt_len,
+            'loss_type': args.loss_type,
+        }
+        diag_rows = [
+            {
+                'split': 'id_val',
+                **diag_config,
+                **id_val_results
+            },
+            {
+                'split': 'id_test',
+                **diag_config,
+                **id_test_results
+            },
+            {
+                'split': 'ood_test',
+                **diag_config,
+                **ood_test_results
+            },
+        ]
+
+        diag_json_path = os.path.join(results_dir, 'diagnostics.json')
+        with open(diag_json_path, 'w') as f:
+            json.dump({'diagnostics': diag_rows}, f, indent=2)
+
+        diag_csv_path = os.path.join(results_dir, 'diagnostics.csv')
+        fieldnames = sorted({k for row in diag_rows for k in row.keys()})
+        with open(diag_csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(diag_rows)
     
     # =========================================================================
     # Summary
