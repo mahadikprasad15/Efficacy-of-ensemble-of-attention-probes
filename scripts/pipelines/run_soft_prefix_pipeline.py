@@ -396,30 +396,32 @@ class SoftPrefixWrapper(nn.Module):
         return torch.stack(features)
 
 
-def contrastive_separation_loss_v2(
+def contrastive_separation_loss_v3(
     logits: torch.Tensor,
     labels: torch.Tensor,
-    baseline_logits: torch.Tensor,
     soft_prefix: nn.Parameter,
-    margin: float = 0.5,
+    margin: float = 1.0,
     lambda_norm: float = 1e-3,
-    lambda_stability: float = 1.0,
+    lambda_anchor: float = 1.0,
+    target_honest: float = 0.0,  # Anchor honest logits to this
 ) -> Tuple[torch.Tensor, dict]:
     """
-    Improved contrastive separation loss with STABILITY anchoring.
+    Contrastive loss with honest anchoring to target value.
     
-    L = L_contrast + λ_norm * ||prefix|| + λ_stability * L_stability
+    Loss = L_contrast + λ_norm * ||prefix|| + λ_anchor * (μ_hon - target)²
     
     Where:
-    - L_contrast = max(0, margin - (μ_dec - μ_hon))
-    - L_stability = MSE(honest_logits, baseline_honest_logits)
+    - L_contrast = max(0, margin - (μ_dec - μ_hon)) - push deceptive high
+    - L_anchor = (μ_hon - target)² - keep honest near decision boundary
     
-    The stability term ANCHORS honest samples to their original positions,
-    preventing the prefix from destroying the probe's learned behavior.
+    Key insight: We anchor honest to TARGET=0 (not to baseline logits from 
+    different activation patterns). This ensures:
+    1. Honest samples stay near decision boundary
+    2. Only deceptive samples get pushed high
+    3. The prefix adds signal, doesn't destroy it
     """
     z_dec = logits[labels == 1]
     z_hon = logits[labels == 0]
-    baseline_hon = baseline_logits[labels == 0]
     
     if len(z_dec) == 0 or len(z_hon) == 0:
         raise ValueError("Batch must contain both classes")
@@ -428,23 +430,23 @@ def contrastive_separation_loss_v2(
     mu_hon = z_hon.mean()
     separation = mu_dec - mu_hon
     
-    # Main contrastive loss
+    # Main contrastive loss - push deceptive above honest by margin
     L_contrast = F.relu(margin - separation)
     
     # Norm regularization on prefix
     L_norm = soft_prefix.norm()
     
-    # STABILITY: Keep honest logits close to baseline (original behavior)
-    L_stability = F.mse_loss(z_hon, baseline_hon)
+    # ANCHOR: Keep mean honest logit near target (typically 0)
+    L_anchor = (mu_hon - target_honest) ** 2
     
-    loss = L_contrast + lambda_norm * L_norm + lambda_stability * L_stability
+    loss = L_contrast + lambda_norm * L_norm + lambda_anchor * L_anchor
     
     return loss, {
         'mu_dec': mu_dec.item(),
         'mu_hon': mu_hon.item(),
         'separation': separation.item(),
         'L_contrast': L_contrast.item(),
-        'L_stability': L_stability.item(),
+        'L_anchor': L_anchor.item(),
         'loss': loss.item()
     }
 
@@ -555,15 +557,14 @@ def train_soft_prefix(
     probe: nn.Module,
     train_samples: List[DataSample],
     val_samples: List[DataSample],
-    baseline_logits: Dict[str, float],
     layer_idx: int,
     args
 ) -> Tuple[torch.Tensor, dict]:
     """
-    Train soft prefix with validation monitoring and STABILITY anchoring.
+    Train soft prefix with validation monitoring.
     
-    Key improvement: Uses baseline_logits to anchor honest samples to their
-    original positions, preventing the prefix from destroying probe behavior.
+    Uses contrastive loss with honest anchoring to TARGET=0.
+    This ensures the prefix improves separation WITHOUT destroying the probe.
     
     Returns:
         best_prefix: Best prefix tensor
@@ -573,55 +574,40 @@ def train_soft_prefix(
     dtype = next(wrapper.model.parameters()).dtype
     probe = probe.to(device=device, dtype=dtype)
     
-    # Setup data - we need sample IDs for baseline lookup
-    # Modify dataset to return IDs
-    class DatasetWithIDs(Dataset):
-        def __init__(self, samples):
-            self.samples = samples
-        def __len__(self):
-            return len(self.samples)
-        def __getitem__(self, idx):
-            s = self.samples[idx]
-            return s.id, s.text, s.label
-        def get_labels(self):
-            return [s.label for s in self.samples]
-    
-    train_dataset = DatasetWithIDs(train_samples)
+    # Setup data
+    train_dataset = SimpleDataset(train_samples)
     sampler = BalancedBatchSampler(train_dataset.get_labels(), args.batch_size)
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=sampler,
-        collate_fn=lambda b: ([i for i, t, l in b], [t for i, t, l in b], torch.tensor([l for i, t, l in b]))
+        collate_fn=lambda b: ([t for t, l in b], torch.tensor([l for t, l in b]))
     )
     
     optimizer = torch.optim.AdamW([wrapper.soft_prefix], lr=args.lr)
     
     best_auroc = 0.0
     best_prefix = None
-    training_log = {'steps': [], 'train_loss': [], 'val_auroc': [], 'separation': [], 'L_stability': []}
+    training_log = {'steps': [], 'train_loss': [], 'val_auroc': [], 'separation': [], 'L_anchor': [], 'mu_hon': [], 'mu_dec': []}
     
     step = 0
     pbar = tqdm(total=args.steps, desc="Training")
     
     while step < args.steps:
-        for ids, texts, labels in train_loader:
+        for texts, labels in train_loader:
             if step >= args.steps:
                 break
             
             labels = labels.to(device)
             
-            # Get baseline logits for this batch
-            batch_baseline = torch.tensor([baseline_logits[id] for id in ids], device=device, dtype=dtype)
-            
             # Forward with prefix
             features = wrapper.get_final_token_features(texts, layer_idx)
             logits = probe(features.unsqueeze(1)).squeeze()
             
-            # Loss with stability anchoring
-            loss, metrics = contrastive_separation_loss_v2(
-                logits, labels, batch_baseline, wrapper.soft_prefix,
+            # Loss with honest anchoring to 0
+            loss, metrics = contrastive_separation_loss_v3(
+                logits, labels, wrapper.soft_prefix,
                 margin=args.margin, lambda_norm=args.lambda_norm,
-                lambda_stability=args.lambda_stability
+                lambda_anchor=args.lambda_anchor, target_honest=0.0
             )
             
             # Backward
@@ -632,9 +618,10 @@ def train_soft_prefix(
             step += 1
             pbar.update(1)
             pbar.set_postfix(
-                loss=f"{metrics['loss']:.4f}", 
-                sep=f"{metrics['separation']:.3f}",
-                stab=f"{metrics['L_stability']:.4f}"
+                loss=f"{metrics['loss']:.3f}", 
+                sep=f"{metrics['separation']:.2f}",
+                mu_h=f"{metrics['mu_hon']:.2f}",
+                mu_d=f"{metrics['mu_dec']:.2f}"
             )
             
             # Validation every N steps
@@ -647,9 +634,11 @@ def train_soft_prefix(
                 training_log['train_loss'].append(metrics['loss'])
                 training_log['val_auroc'].append(val_auroc)
                 training_log['separation'].append(metrics['separation'])
-                training_log['L_stability'].append(metrics['L_stability'])
+                training_log['L_anchor'].append(metrics['L_anchor'])
+                training_log['mu_hon'].append(metrics['mu_hon'])
+                training_log['mu_dec'].append(metrics['mu_dec'])
                 
-                logger.info(f"Step {step}: val_auroc={val_auroc:.4f}, sep={metrics['separation']:.3f}, L_stab={metrics['L_stability']:.4f}")
+                logger.info(f"Step {step}: val_auroc={val_auroc:.4f}, sep={metrics['separation']:.2f}, μ_hon={metrics['mu_hon']:.2f}, μ_dec={metrics['mu_dec']:.2f}")
                 
                 if val_auroc > best_auroc:
                     best_auroc = val_auroc
@@ -860,11 +849,12 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4,
                        help="Training batch size (reduce if OOM)")
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--margin", type=float, default=0.5)
+    parser.add_argument("--margin", type=float, default=1.0,
+                       help="Margin for contrastive loss (mu_dec - mu_hon > margin)")
     parser.add_argument("--lambda_norm", type=float, default=1e-3,
                        help="L2 regularization on prefix norm")
-    parser.add_argument("--lambda_stability", type=float, default=1.0,
-                       help="Weight for stability loss (anchor honest to baseline)")
+    parser.add_argument("--lambda_anchor", type=float, default=1.0,
+                       help="Weight for anchoring honest logits to 0")
     parser.add_argument("--val_every", type=int, default=50)
     
     # OOD
@@ -974,22 +964,13 @@ def main():
         
         logger.info(f"Loaded probe from {args.probe_path}")
         
-        # CRITICAL: Compute baseline logits BEFORE training
-        # This is what we anchor honest samples to
-        all_train_samples = id_splits['train'] + id_splits['val']
-        baseline_logits = compute_baseline_logits(
-            model, tokenizer, probe, all_train_samples,
-            args.layer_idx, batch_size=4
-        )
-        
         # Create wrapper
         wrapper = SoftPrefixWrapper(model, tokenizer, args.prompt_len)
         
-        # Train with stability anchoring
+        # Train with honest anchoring to 0
         best_prefix, training_log = train_soft_prefix(
             wrapper, probe,
             id_splits['train'], id_splits['val'],
-            baseline_logits,  # NEW: pass baseline for stability loss
             args.layer_idx, args
         )
         
