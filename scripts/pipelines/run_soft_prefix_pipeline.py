@@ -526,12 +526,39 @@ def compute_baseline_logits(
     return baseline
 
 
+def determine_probe_sign(
+    model,
+    tokenizer,
+    probe: nn.Module,
+    samples: List[DataSample],
+    layer_idx: int,
+    batch_size: int = 4
+) -> float:
+    """
+    Determine whether probe logits are oriented correctly.
+
+    Returns +1.0 if deceptive mean > honest mean, else -1.0 to flip logits.
+    """
+    baseline = compute_baseline_logits(
+        model, tokenizer, probe, samples, layer_idx, batch_size=batch_size
+    )
+    honest_baselines = [baseline[s.id] for s in samples if s.label == 0]
+    deceptive_baselines = [baseline[s.id] for s in samples if s.label == 1]
+    separation = np.mean(deceptive_baselines) - np.mean(honest_baselines)
+    logit_sign = 1.0 if separation >= 0 else -1.0
+    logger.info(
+        f"Probe orientation: separation={separation:.3f} -> logit_sign={logit_sign:+.0f}"
+    )
+    return logit_sign
+
+
 def compute_validation_auroc(
     wrapper: SoftPrefixWrapper,
     probe: nn.Module,
     val_samples: List[DataSample],
     layer_idx: int,
-    batch_size: int = 8
+    batch_size: int = 8,
+    logit_sign: float = 1.0
 ) -> float:
     """Compute AUROC on validation set."""
     wrapper.eval()
@@ -550,7 +577,7 @@ def compute_validation_auroc(
             
             # For layer-agnostic probes, features are already (B, D)
             # No token dimension needed
-            logits = probe(features.unsqueeze(1))  # Add token dim for probe
+            logits = probe(features.unsqueeze(1)) * logit_sign  # Add token dim for probe
             
             all_logits.extend(torch.sigmoid(logits).cpu().numpy().flatten())
             all_labels.extend(labels)
@@ -569,7 +596,8 @@ def train_soft_prefix(
     train_samples: List[DataSample],
     val_samples: List[DataSample],
     layer_idx: int,
-    args
+    args,
+    logit_sign: float = 1.0
 ) -> Tuple[torch.Tensor, dict]:
     """
     Train soft prefix with validation monitoring.
@@ -612,7 +640,7 @@ def train_soft_prefix(
             
             # Forward with prefix
             features = wrapper.get_final_token_features(texts, layer_idx)
-            logits = probe(features.unsqueeze(1)).squeeze()
+            logits = probe(features.unsqueeze(1)).squeeze() * logit_sign
             
             # Hinge loss: only penalize if honest drifts UP toward ambiguity
             loss, metrics = contrastive_hinge_loss(
@@ -638,7 +666,7 @@ def train_soft_prefix(
             # Validation every N steps
             if step % args.val_every == 0:
                 val_auroc = compute_validation_auroc(
-                    wrapper, probe, val_samples, layer_idx, args.batch_size
+                    wrapper, probe, val_samples, layer_idx, args.batch_size, logit_sign
                 )
                 
                 training_log['steps'].append(step)
@@ -775,7 +803,8 @@ def evaluate_probe_on_activations(
     activations_dir: str,
     probe_path: str,
     layer_idx: int,
-    pooling: str = "last"
+    pooling: str = "last",
+    logit_sign: float = 1.0
 ) -> dict:
     """Evaluate probe on cached activations."""
     from actprobe.probes.models import LayerProbe
@@ -812,7 +841,7 @@ def evaluate_probe_on_activations(
             layer_acts = acts[layer_idx]  # [D]
             
             x = torch.tensor(layer_acts).unsqueeze(0).unsqueeze(1).float()  # [1, 1, D]
-            logit = probe(x).item()
+            logit = probe(x).item() * logit_sign
             
             all_logits.append(torch.sigmoid(torch.tensor(logit)).item())
             all_labels.append(sample['label'])
@@ -977,6 +1006,15 @@ def main():
         
         logger.info(f"Loaded probe from {args.probe_path}")
         
+        logit_sign = determine_probe_sign(
+            model,
+            tokenizer,
+            probe,
+            id_splits['train'],
+            args.layer_idx,
+            batch_size=args.batch_size
+        )
+
         # Create wrapper
         wrapper = SoftPrefixWrapper(model, tokenizer, args.prompt_len)
         
@@ -984,7 +1022,7 @@ def main():
         best_prefix, training_log = train_soft_prefix(
             wrapper, probe,
             id_splits['train'], id_splits['val'],
-            args.layer_idx, args
+            args.layer_idx, args, logit_sign
         )
         
         # Save
@@ -998,7 +1036,8 @@ def main():
                 'layer_idx': args.layer_idx,
                 'prompt_len': args.prompt_len,
                 'steps': args.steps,
-                'best_val_auroc': training_log['best_auroc']
+                'best_val_auroc': training_log['best_auroc'],
+                'logit_sign': logit_sign
             }, f, indent=2)
         
         with open(os.path.join(prefix_dir, 'training_log.json'), 'w') as f:
@@ -1024,6 +1063,30 @@ def main():
             torch_dtype=torch.float16, device_map="auto"
         )
         model.eval()
+
+        from actprobe.probes.models import LayerProbe
+        hidden_dim = model.config.hidden_size
+        probe = LayerProbe(input_dim=hidden_dim, pooling_type=args.pooling)
+        probe.load_state_dict(torch.load(args.probe_path, map_location='cpu'))
+        probe.eval()
+        for p in probe.parameters():
+            p.requires_grad = False
+
+        config_path = os.path.join(args.prefix_ckpt, 'config.json')
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            logit_sign = config.get('logit_sign', 1.0)
+            logger.info(f"Loaded logit_sign from config: {logit_sign:+.0f}")
+        else:
+            logit_sign = determine_probe_sign(
+                model,
+                tokenizer,
+                probe,
+                id_splits['train'],
+                args.layer_idx,
+                batch_size=args.batch_size
+            )
     
     # =========================================================================
     # Phase 3: Cache Activations
@@ -1071,21 +1134,21 @@ def main():
     # ID Val
     logger.info("\nEvaluating on ID Validation...")
     id_val_results = evaluate_probe_on_activations(
-        id_val_acts_dir, args.probe_path, args.layer_idx, args.pooling
+        id_val_acts_dir, args.probe_path, args.layer_idx, args.pooling, logit_sign
     )
     logger.info(f"  ID Val AUROC: {id_val_results['auroc']:.4f}")
     
     # ID Test
     logger.info("\nEvaluating on ID Test...")
     id_test_results = evaluate_probe_on_activations(
-        id_test_acts_dir, args.probe_path, args.layer_idx, args.pooling
+        id_test_acts_dir, args.probe_path, args.layer_idx, args.pooling, logit_sign
     )
     logger.info(f"  ID Test AUROC: {id_test_results['auroc']:.4f}")
     
     # OOD Test
     logger.info("\nEvaluating on OOD Test...")
     ood_test_results = evaluate_probe_on_activations(
-        ood_test_acts_dir, args.probe_path, args.layer_idx, args.pooling
+        ood_test_acts_dir, args.probe_path, args.layer_idx, args.pooling, logit_sign
     )
     logger.info(f"  OOD Test AUROC: {ood_test_results['auroc']:.4f}")
     
