@@ -119,40 +119,99 @@ def load_roleplaying_raw(yaml_path: str) -> List[DataSample]:
 
 def load_insider_trading_raw(json_path: str) -> List[DataSample]:
     """
-    Load InsiderTrading dataset from raw JSON.
+    Load InsiderTrading dataset from raw JSON (Apollo format).
     
-    Uses 'made_trade' from metadata for labels.
+    JSON format:
+    [
+        {
+            "transcript": [
+                {"role": "system", "content": "..."},
+                {"role": "user", "content": "..."},
+                {"role": "assistant", "content": "..."},
+                ...
+            ],
+            "metadata": {
+                "made_trade": "yes" | "no" | "invalid",
+                "trade_message": "..."
+            }
+        },
+        ...
+    ]
+    
+    Label mapping:
+    - "yes": Made insider trade → DECEPTIVE (label=1)
+    - "no": Refused → HONEST (label=0)
+    - "invalid": Skip
     """
     with open(json_path, 'r') as f:
         data = json.load(f)
     
-    # Handle both list format and dict with 'data' key
-    if isinstance(data, dict):
+    # Apollo data is a list of rollouts
+    if not isinstance(data, list):
         data = data.get('data', data.get('rollouts', []))
     
     samples = []
-    for i, item in enumerate(data):
-        # Get text - could be 'text', 'prompt', 'rollout', etc.
-        text = item.get('text', item.get('prompt', item.get('rollout', '')))
+    skipped = {'no_label': 0, 'invalid': 0}
+    
+    LABEL_MAP = {
+        "yes": 1,       # Made insider trade - DECEPTIVE
+        "no": 0,        # Refused to trade - HONEST
+        "invalid": -1   # SKIP
+    }
+    
+    for i, rollout in enumerate(data):
+        # Get metadata
+        metadata = rollout.get("metadata", {})
+        made_trade = metadata.get("made_trade")
         
-        # Get label from metadata
-        metadata = item.get('metadata', {})
-        made_trade = metadata.get('made_trade')
-        
+        # Skip if no trade decision
         if made_trade is None:
+            skipped['no_label'] += 1
             continue
         
-        label = 1 if made_trade else 0
+        # Map label
+        label = LABEL_MAP.get(str(made_trade).lower().strip(), -1)
+        
+        # Skip invalid
+        if label == -1:
+            skipped['invalid'] += 1
+            continue
+        
+        # Extract transcript and build full text
+        transcript = rollout.get("transcript", [])
+        
+        # Build full context from transcript
+        full_context = ""
+        for msg in transcript:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "system":
+                full_context += f"System: {content}\n\n"
+            elif role == "user":
+                full_context += f"User: {content}\n\n"
+            elif role == "assistant":
+                full_context += f"Assistant: {content}\n\n"
+        
+        # If we have the trade_message in metadata, use that as summary
+        trade_message = metadata.get("trade_message", "")
+        
+        # Use full context as text (or fall back to trade_message)
+        text = full_context.strip() if full_context else trade_message
         
         if text:
             samples.append(DataSample(
                 id=f"insider_{i}",
-                text=text.strip(),
+                text=text,
                 label=label,
                 metadata={'idx': i, 'made_trade': made_trade}
             ))
     
     logger.info(f"Loaded {len(samples)} samples from {json_path}")
+    logger.info(f"  Skipped: {skipped['no_label']} no label, {skipped['invalid']} invalid")
+    n_honest = sum(1 for s in samples if s.label == 0)
+    n_deceptive = sum(1 for s in samples if s.label == 1)
+    logger.info(f"  Labels: {n_honest} honest, {n_deceptive} deceptive")
+    
     return samples
 
 
