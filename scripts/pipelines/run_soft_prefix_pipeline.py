@@ -299,6 +299,37 @@ class SimpleDataset(Dataset):
         return [s.label for s in self.samples]
 
 
+class PairDataset(Dataset):
+    """Dataset of (honest, deceptive) pairs grouped by scenario_idx."""
+
+    def __init__(self, samples: List[DataSample]):
+        pairs = {}
+        for sample in samples:
+            scenario_idx = sample.metadata.get('scenario_idx')
+            if scenario_idx is None:
+                continue
+            if scenario_idx not in pairs:
+                pairs[scenario_idx] = {}
+            pairs[scenario_idx][sample.metadata.get('type')] = sample
+
+        self.pairs = []
+        for scenario_idx, items in pairs.items():
+            honest = items.get('honest')
+            deceptive = items.get('deceptive')
+            if honest is None or deceptive is None:
+                continue
+            self.pairs.append((honest, deceptive))
+
+        logger.info(f"Constructed {len(self.pairs)} paired samples from {len(samples)} inputs")
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        honest, deceptive = self.pairs[idx]
+        return honest.text, deceptive.text
+
+
 class BalancedBatchSampler(Sampler):
     """Yields batches with B/2 honest, B/2 deceptive."""
     
@@ -462,6 +493,32 @@ def contrastive_hinge_loss(
     }
 
 
+def pairwise_margin_loss(
+    honest_logits: torch.Tensor,
+    deceptive_logits: torch.Tensor,
+    soft_prefix: nn.Parameter,
+    margin: float = 1.0,
+    lambda_norm: float = 1e-3
+) -> Tuple[torch.Tensor, dict]:
+    """
+    Pairwise margin loss on paired honest/deceptive completions.
+
+    Loss = mean(max(0, margin - (z_dec - z_hon))) + λ_norm * ||prefix||
+    """
+    deltas = deceptive_logits - honest_logits
+    pair_loss = F.relu(margin - deltas)
+    L_norm = soft_prefix.norm()
+    loss = pair_loss.mean() + lambda_norm * L_norm
+    pair_acc = (deltas > 0).float().mean()
+
+    return loss, {
+        'pair_margin': deltas.mean().item(),
+        'pair_acc': pair_acc.item(),
+        'L_pair': pair_loss.mean().item(),
+        'loss': loss.item()
+    }
+
+
 def compute_baseline_logits(
     model,
     tokenizer,
@@ -526,12 +583,39 @@ def compute_baseline_logits(
     return baseline
 
 
+def determine_probe_sign(
+    model,
+    tokenizer,
+    probe: nn.Module,
+    samples: List[DataSample],
+    layer_idx: int,
+    batch_size: int = 4
+) -> float:
+    """
+    Determine whether probe logits are oriented correctly.
+
+    Returns +1.0 if deceptive mean > honest mean, else -1.0 to flip logits.
+    """
+    baseline = compute_baseline_logits(
+        model, tokenizer, probe, samples, layer_idx, batch_size=batch_size
+    )
+    honest_baselines = [baseline[s.id] for s in samples if s.label == 0]
+    deceptive_baselines = [baseline[s.id] for s in samples if s.label == 1]
+    separation = np.mean(deceptive_baselines) - np.mean(honest_baselines)
+    logit_sign = 1.0 if separation >= 0 else -1.0
+    logger.info(
+        f"Probe orientation: separation={separation:.3f} -> logit_sign={logit_sign:+.0f}"
+    )
+    return logit_sign
+
+
 def compute_validation_auroc(
     wrapper: SoftPrefixWrapper,
     probe: nn.Module,
     val_samples: List[DataSample],
     layer_idx: int,
-    batch_size: int = 8
+    batch_size: int = 8,
+    logit_sign: float = 1.0
 ) -> float:
     """Compute AUROC on validation set."""
     wrapper.eval()
@@ -550,7 +634,7 @@ def compute_validation_auroc(
             
             # For layer-agnostic probes, features are already (B, D)
             # No token dimension needed
-            logits = probe(features.unsqueeze(1))  # Add token dim for probe
+            logits = probe(features.unsqueeze(1)) * logit_sign  # Add token dim for probe
             
             all_logits.extend(torch.sigmoid(logits).cpu().numpy().flatten())
             all_labels.extend(labels)
@@ -569,7 +653,8 @@ def train_soft_prefix(
     train_samples: List[DataSample],
     val_samples: List[DataSample],
     layer_idx: int,
-    args
+    args,
+    logit_sign: float = 1.0
 ) -> Tuple[torch.Tensor, dict]:
     """
     Train soft prefix with validation monitoring.
@@ -586,40 +671,76 @@ def train_soft_prefix(
     probe = probe.to(device=device, dtype=dtype)
     
     # Setup data
-    train_dataset = SimpleDataset(train_samples)
-    sampler = BalancedBatchSampler(train_dataset.get_labels(), args.batch_size)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_sampler=sampler,
-        collate_fn=lambda b: ([t for t, l in b], torch.tensor([l for t, l in b]))
-    )
+    if args.loss_type == "pairwise":
+        train_dataset = PairDataset(train_samples)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=lambda b: ([h for h, _ in b], [d for _, d in b])
+        )
+    else:
+        train_dataset = SimpleDataset(train_samples)
+        sampler = BalancedBatchSampler(train_dataset.get_labels(), args.batch_size)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=sampler,
+            collate_fn=lambda b: ([t for t, l in b], torch.tensor([l for t, l in b]))
+        )
     
     optimizer = torch.optim.AdamW([wrapper.soft_prefix], lr=args.lr)
     
     best_auroc = 0.0
     best_prefix = None
-    training_log = {'steps': [], 'train_loss': [], 'val_auroc': [], 'separation': [], 'L_hinge': [], 'mu_hon': [], 'mu_dec': []}
+    training_log = {
+        'steps': [],
+        'train_loss': [],
+        'val_auroc': [],
+        'separation': [],
+        'L_hinge': [],
+        'mu_hon': [],
+        'mu_dec': [],
+        'pair_margin': [],
+        'pair_acc': []
+    }
     
     step = 0
     pbar = tqdm(total=args.steps, desc="Training")
     
     while step < args.steps:
-        for texts, labels in train_loader:
+        for batch in train_loader:
             if step >= args.steps:
                 break
-            
-            labels = labels.to(device)
-            
-            # Forward with prefix
-            features = wrapper.get_final_token_features(texts, layer_idx)
-            logits = probe(features.unsqueeze(1)).squeeze()
-            
-            # Hinge loss: only penalize if honest drifts UP toward ambiguity
-            loss, metrics = contrastive_hinge_loss(
-                logits, labels, wrapper.soft_prefix,
-                margin=args.margin, lambda_norm=args.lambda_norm,
-                lambda_anchor=args.lambda_anchor, safe_threshold=args.safe_threshold
-            )
+
+            if args.loss_type == "pairwise":
+                honest_texts, deceptive_texts = batch
+                texts = honest_texts + deceptive_texts
+                features = wrapper.get_final_token_features(texts, layer_idx)
+                split = len(honest_texts)
+                honest_features = features[:split]
+                deceptive_features = features[split:]
+
+                honest_logits = probe(honest_features.unsqueeze(1)).squeeze() * logit_sign
+                deceptive_logits = probe(deceptive_features.unsqueeze(1)).squeeze() * logit_sign
+
+                loss, metrics = pairwise_margin_loss(
+                    honest_logits, deceptive_logits, wrapper.soft_prefix,
+                    margin=args.margin, lambda_norm=args.lambda_norm
+                )
+            else:
+                texts, labels = batch
+                labels = labels.to(device)
+
+                # Forward with prefix
+                features = wrapper.get_final_token_features(texts, layer_idx)
+                logits = probe(features.unsqueeze(1)).squeeze() * logit_sign
+
+                # Hinge loss: only penalize if honest drifts UP toward ambiguity
+                loss, metrics = contrastive_hinge_loss(
+                    logits, labels, wrapper.soft_prefix,
+                    margin=args.margin, lambda_norm=args.lambda_norm,
+                    lambda_anchor=args.lambda_anchor, safe_threshold=args.safe_threshold
+                )
             
             # Backward
             optimizer.zero_grad()
@@ -628,28 +749,49 @@ def train_soft_prefix(
             
             step += 1
             pbar.update(1)
-            pbar.set_postfix(
-                loss=f"{metrics['loss']:.3f}", 
-                sep=f"{metrics['separation']:.2f}",
-                mu_h=f"{metrics['mu_hon']:.2f}",
-                hinge=f"{metrics['L_hinge']:.3f}"
-            )
+            if args.loss_type == "pairwise":
+                pbar.set_postfix(
+                    loss=f"{metrics['loss']:.3f}",
+                    pair_margin=f"{metrics['pair_margin']:.2f}",
+                    pair_acc=f"{metrics['pair_acc']:.2f}"
+                )
+            else:
+                pbar.set_postfix(
+                    loss=f"{metrics['loss']:.3f}",
+                    sep=f"{metrics['separation']:.2f}",
+                    mu_h=f"{metrics['mu_hon']:.2f}",
+                    hinge=f"{metrics['L_hinge']:.3f}"
+                )
             
             # Validation every N steps
             if step % args.val_every == 0:
                 val_auroc = compute_validation_auroc(
-                    wrapper, probe, val_samples, layer_idx, args.batch_size
+                    wrapper, probe, val_samples, layer_idx, args.batch_size, logit_sign
                 )
                 
                 training_log['steps'].append(step)
                 training_log['train_loss'].append(metrics['loss'])
                 training_log['val_auroc'].append(val_auroc)
-                training_log['separation'].append(metrics['separation'])
-                training_log['L_hinge'].append(metrics['L_hinge'])
-                training_log['mu_hon'].append(metrics['mu_hon'])
-                training_log['mu_dec'].append(metrics['mu_dec'])
-                
-                logger.info(f"Step {step}: val_auroc={val_auroc:.4f}, sep={metrics['separation']:.2f}, μ_hon={metrics['mu_hon']:.2f}, L_hinge={metrics['L_hinge']:.3f}")
+
+                if args.loss_type == "pairwise":
+                    training_log['pair_margin'].append(metrics['pair_margin'])
+                    training_log['pair_acc'].append(metrics['pair_acc'])
+                    logger.info(
+                        f"Step {step}: val_auroc={val_auroc:.4f}, "
+                        f"pair_margin={metrics['pair_margin']:.2f}, "
+                        f"pair_acc={metrics['pair_acc']:.2f}"
+                    )
+                else:
+                    training_log['separation'].append(metrics['separation'])
+                    training_log['L_hinge'].append(metrics['L_hinge'])
+                    training_log['mu_hon'].append(metrics['mu_hon'])
+                    training_log['mu_dec'].append(metrics['mu_dec'])
+                    logger.info(
+                        f"Step {step}: val_auroc={val_auroc:.4f}, "
+                        f"sep={metrics['separation']:.2f}, "
+                        f"μ_hon={metrics['mu_hon']:.2f}, "
+                        f"L_hinge={metrics['L_hinge']:.3f}"
+                    )
                 
                 if val_auroc > best_auroc:
                     best_auroc = val_auroc
@@ -775,7 +917,8 @@ def evaluate_probe_on_activations(
     activations_dir: str,
     probe_path: str,
     layer_idx: int,
-    pooling: str = "last"
+    pooling: str = "last",
+    logit_sign: float = 1.0
 ) -> dict:
     """Evaluate probe on cached activations."""
     from actprobe.probes.models import LayerProbe
@@ -812,7 +955,7 @@ def evaluate_probe_on_activations(
             layer_acts = acts[layer_idx]  # [D]
             
             x = torch.tensor(layer_acts).unsqueeze(0).unsqueeze(1).float()  # [1, 1, D]
-            logit = probe(x).item()
+            logit = probe(x).item() * logit_sign
             
             all_logits.append(torch.sigmoid(torch.tensor(logit)).item())
             all_labels.append(sample['label'])
@@ -860,8 +1003,11 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4,
                        help="Training batch size (reduce if OOM)")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--loss_type", type=str, default="mean",
+                       choices=["mean", "pairwise"],
+                       help="Loss type: mean (batch mean separation) or pairwise (paired ranking)")
     parser.add_argument("--margin", type=float, default=1.0,
-                       help="Margin for contrastive loss (mu_dec - mu_hon > margin)")
+                       help="Margin for loss (mean separation or pairwise ranking)")
     parser.add_argument("--lambda_norm", type=float, default=1e-3,
                        help="L2 regularization on prefix norm")
     parser.add_argument("--lambda_anchor", type=float, default=1.0,
@@ -977,6 +1123,15 @@ def main():
         
         logger.info(f"Loaded probe from {args.probe_path}")
         
+        logit_sign = determine_probe_sign(
+            model,
+            tokenizer,
+            probe,
+            id_splits['train'],
+            args.layer_idx,
+            batch_size=args.batch_size
+        )
+
         # Create wrapper
         wrapper = SoftPrefixWrapper(model, tokenizer, args.prompt_len)
         
@@ -984,7 +1139,7 @@ def main():
         best_prefix, training_log = train_soft_prefix(
             wrapper, probe,
             id_splits['train'], id_splits['val'],
-            args.layer_idx, args
+            args.layer_idx, args, logit_sign
         )
         
         # Save
@@ -998,7 +1153,9 @@ def main():
                 'layer_idx': args.layer_idx,
                 'prompt_len': args.prompt_len,
                 'steps': args.steps,
-                'best_val_auroc': training_log['best_auroc']
+                'best_val_auroc': training_log['best_auroc'],
+                'logit_sign': logit_sign,
+                'loss_type': args.loss_type
             }, f, indent=2)
         
         with open(os.path.join(prefix_dir, 'training_log.json'), 'w') as f:
@@ -1024,6 +1181,30 @@ def main():
             torch_dtype=torch.float16, device_map="auto"
         )
         model.eval()
+
+        from actprobe.probes.models import LayerProbe
+        hidden_dim = model.config.hidden_size
+        probe = LayerProbe(input_dim=hidden_dim, pooling_type=args.pooling)
+        probe.load_state_dict(torch.load(args.probe_path, map_location='cpu'))
+        probe.eval()
+        for p in probe.parameters():
+            p.requires_grad = False
+
+        config_path = os.path.join(args.prefix_ckpt, 'config.json')
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            logit_sign = config.get('logit_sign', 1.0)
+            logger.info(f"Loaded logit_sign from config: {logit_sign:+.0f}")
+        else:
+            logit_sign = determine_probe_sign(
+                model,
+                tokenizer,
+                probe,
+                id_splits['train'],
+                args.layer_idx,
+                batch_size=args.batch_size
+            )
     
     # =========================================================================
     # Phase 3: Cache Activations
@@ -1071,21 +1252,21 @@ def main():
     # ID Val
     logger.info("\nEvaluating on ID Validation...")
     id_val_results = evaluate_probe_on_activations(
-        id_val_acts_dir, args.probe_path, args.layer_idx, args.pooling
+        id_val_acts_dir, args.probe_path, args.layer_idx, args.pooling, logit_sign
     )
     logger.info(f"  ID Val AUROC: {id_val_results['auroc']:.4f}")
     
     # ID Test
     logger.info("\nEvaluating on ID Test...")
     id_test_results = evaluate_probe_on_activations(
-        id_test_acts_dir, args.probe_path, args.layer_idx, args.pooling
+        id_test_acts_dir, args.probe_path, args.layer_idx, args.pooling, logit_sign
     )
     logger.info(f"  ID Test AUROC: {id_test_results['auroc']:.4f}")
     
     # OOD Test
     logger.info("\nEvaluating on OOD Test...")
     ood_test_results = evaluate_probe_on_activations(
-        ood_test_acts_dir, args.probe_path, args.layer_idx, args.pooling
+        ood_test_acts_dir, args.probe_path, args.layer_idx, args.pooling, logit_sign
     )
     logger.info(f"  OOD Test AUROC: {ood_test_results['auroc']:.4f}")
     
@@ -1097,7 +1278,8 @@ def main():
         'config': {
             'model': args.model,
             'layer_idx': args.layer_idx,
-            'prompt_len': args.prompt_len
+            'prompt_len': args.prompt_len,
+            'loss_type': args.loss_type
         }
     }
     
