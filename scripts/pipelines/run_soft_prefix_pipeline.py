@@ -396,29 +396,38 @@ class SoftPrefixWrapper(nn.Module):
         return torch.stack(features)
 
 
-def contrastive_separation_loss_v3(
+def contrastive_hinge_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     soft_prefix: nn.Parameter,
     margin: float = 1.0,
     lambda_norm: float = 1e-3,
     lambda_anchor: float = 1.0,
-    target_honest: float = 0.0,  # Anchor honest logits to this
+    safe_threshold: float = -1.0,  # Only penalize if honest rises above this
 ) -> Tuple[torch.Tensor, dict]:
     """
-    Contrastive loss with honest anchoring to target value.
+    Contrastive loss with ONE-SIDED HINGE for honest samples.
     
-    Loss = L_contrast + λ_norm * ||prefix|| + λ_anchor * (μ_hon - target)²
+    Loss = L_contrast + λ_norm * ||prefix|| + λ_anchor * L_hinge
     
     Where:
     - L_contrast = max(0, margin - (μ_dec - μ_hon)) - push deceptive high
-    - L_anchor = (μ_hon - target)² - keep honest near decision boundary
+    - L_hinge = max(0, μ_hon - safe_threshold)² - ONLY penalize if honest 
+      drifts UP toward ambiguity/deception zone
     
-    Key insight: We anchor honest to TARGET=0 (not to baseline logits from 
-    different activation patterns). This ensures:
-    1. Honest samples stay near decision boundary
-    2. Only deceptive samples get pushed high
-    3. The prefix adds signal, doesn't destroy it
+    KEY INSIGHT from baseline stats:
+    - Honest baseline = -1.334 (naturally negative)
+    - Sigmoid(0) = 0.5 = AMBIGUOUS (bad!)
+    - Sigmoid(-1) = 0.27 = leaning honest
+    - Sigmoid(-2) = 0.12 = safely honest
+    
+    We want honest samples to stay NEGATIVE (safe). If the prefix makes them
+    even more negative (-5.0), that's GREAT! Don't penalize that.
+    Only penalize if they drift UPWARD toward 0 (ambiguity).
+    
+    This is like saying: "Keep the furniture away from the fire (-1.0)."
+    If it's at -5.0 (very safe), leave it alone. Only pull it back if it
+    approaches the danger zone.
     """
     z_dec = logits[labels == 1]
     z_hon = logits[labels == 0]
@@ -436,17 +445,19 @@ def contrastive_separation_loss_v3(
     # Norm regularization on prefix
     L_norm = soft_prefix.norm()
     
-    # ANCHOR: Keep mean honest logit near target (typically 0)
-    L_anchor = (mu_hon - target_honest) ** 2
+    # HINGE ANCHOR: Only penalize if honest drifts UP toward danger zone
+    # If mu_hon < safe_threshold, loss = 0 (good, it's safely negative)
+    # If mu_hon > safe_threshold, loss = (mu_hon - safe_threshold)²
+    L_hinge = F.relu(mu_hon - safe_threshold) ** 2
     
-    loss = L_contrast + lambda_norm * L_norm + lambda_anchor * L_anchor
+    loss = L_contrast + lambda_norm * L_norm + lambda_anchor * L_hinge
     
     return loss, {
         'mu_dec': mu_dec.item(),
         'mu_hon': mu_hon.item(),
         'separation': separation.item(),
         'L_contrast': L_contrast.item(),
-        'L_anchor': L_anchor.item(),
+        'L_hinge': L_hinge.item(),
         'loss': loss.item()
     }
 
@@ -587,7 +598,7 @@ def train_soft_prefix(
     
     best_auroc = 0.0
     best_prefix = None
-    training_log = {'steps': [], 'train_loss': [], 'val_auroc': [], 'separation': [], 'L_anchor': [], 'mu_hon': [], 'mu_dec': []}
+    training_log = {'steps': [], 'train_loss': [], 'val_auroc': [], 'separation': [], 'L_hinge': [], 'mu_hon': [], 'mu_dec': []}
     
     step = 0
     pbar = tqdm(total=args.steps, desc="Training")
@@ -603,11 +614,11 @@ def train_soft_prefix(
             features = wrapper.get_final_token_features(texts, layer_idx)
             logits = probe(features.unsqueeze(1)).squeeze()
             
-            # Loss with honest anchoring to 0
-            loss, metrics = contrastive_separation_loss_v3(
+            # Hinge loss: only penalize if honest drifts UP toward ambiguity
+            loss, metrics = contrastive_hinge_loss(
                 logits, labels, wrapper.soft_prefix,
                 margin=args.margin, lambda_norm=args.lambda_norm,
-                lambda_anchor=args.lambda_anchor, target_honest=0.0
+                lambda_anchor=args.lambda_anchor, safe_threshold=args.safe_threshold
             )
             
             # Backward
@@ -621,7 +632,7 @@ def train_soft_prefix(
                 loss=f"{metrics['loss']:.3f}", 
                 sep=f"{metrics['separation']:.2f}",
                 mu_h=f"{metrics['mu_hon']:.2f}",
-                mu_d=f"{metrics['mu_dec']:.2f}"
+                hinge=f"{metrics['L_hinge']:.3f}"
             )
             
             # Validation every N steps
@@ -634,11 +645,11 @@ def train_soft_prefix(
                 training_log['train_loss'].append(metrics['loss'])
                 training_log['val_auroc'].append(val_auroc)
                 training_log['separation'].append(metrics['separation'])
-                training_log['L_anchor'].append(metrics['L_anchor'])
+                training_log['L_hinge'].append(metrics['L_hinge'])
                 training_log['mu_hon'].append(metrics['mu_hon'])
                 training_log['mu_dec'].append(metrics['mu_dec'])
                 
-                logger.info(f"Step {step}: val_auroc={val_auroc:.4f}, sep={metrics['separation']:.2f}, μ_hon={metrics['mu_hon']:.2f}, μ_dec={metrics['mu_dec']:.2f}")
+                logger.info(f"Step {step}: val_auroc={val_auroc:.4f}, sep={metrics['separation']:.2f}, μ_hon={metrics['mu_hon']:.2f}, L_hinge={metrics['L_hinge']:.3f}")
                 
                 if val_auroc > best_auroc:
                     best_auroc = val_auroc
@@ -854,7 +865,9 @@ def main():
     parser.add_argument("--lambda_norm", type=float, default=1e-3,
                        help="L2 regularization on prefix norm")
     parser.add_argument("--lambda_anchor", type=float, default=1.0,
-                       help="Weight for anchoring honest logits to 0")
+                       help="Weight for hinge loss on honest logits")
+    parser.add_argument("--safe_threshold", type=float, default=-1.0,
+                       help="Only penalize if honest rises above this (hinge)")
     parser.add_argument("--val_every", type=int, default=50)
     
     # OOD
