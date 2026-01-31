@@ -302,7 +302,7 @@ class SimpleDataset(Dataset):
     
     def __getitem__(self, idx):
         s = self.samples[idx]
-        return s.text, s.label
+        return s.id, s.text, s.label
     
     def get_labels(self):
         return [s.label for s in self.samples]
@@ -336,7 +336,7 @@ class PairDataset(Dataset):
 
     def __getitem__(self, idx):
         honest, deceptive = self.pairs[idx]
-        return honest.text, deceptive.text
+        return honest.id, honest.text, deceptive.id, deceptive.text
 
 
 class BalancedBatchSampler(Sampler):
@@ -501,6 +501,37 @@ def contrastive_hinge_loss(
     }
 
 
+def bce_logits_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    soft_prefix: nn.Parameter,
+    lambda_norm: float = 1e-3
+) -> Tuple[torch.Tensor, dict]:
+    """Binary cross-entropy on logits for per-sample supervision."""
+    labels = labels.float()
+    bce = F.binary_cross_entropy_with_logits(logits, labels)
+    L_norm = soft_prefix.norm()
+    loss = bce + lambda_norm * L_norm
+
+    z_dec = logits[labels == 1]
+    z_hon = logits[labels == 0]
+    metrics = {
+        'bce': bce.item(),
+        'L_norm': L_norm.item(),
+        'loss': loss.item()
+    }
+    if len(z_dec) > 0 and len(z_hon) > 0:
+        mu_dec = z_dec.mean()
+        mu_hon = z_hon.mean()
+        metrics.update({
+            'mu_dec': mu_dec.item(),
+            'mu_hon': mu_hon.item(),
+            'separation': (mu_dec - mu_hon).item()
+        })
+
+    return loss, metrics
+
+
 def pairwise_margin_loss(
     honest_logits: torch.Tensor,
     deceptive_logits: torch.Tensor,
@@ -525,6 +556,25 @@ def pairwise_margin_loss(
         'L_pair': pair_loss.mean().item(),
         'loss': loss.item()
     }
+
+
+def baseline_mse_loss(
+    logits: torch.Tensor,
+    sample_ids: List[str],
+    baseline_logits: Optional[Dict[str, float]]
+) -> Optional[torch.Tensor]:
+    """MSE penalty to keep logits close to baseline (no-prefix) logits."""
+    if baseline_logits is None:
+        return None
+    try:
+        target = torch.tensor(
+            [baseline_logits[sid] for sid in sample_ids],
+            device=logits.device,
+            dtype=logits.dtype
+        )
+    except KeyError:
+        return None
+    return F.mse_loss(logits, target)
 
 
 def compute_baseline_logits(
@@ -596,23 +646,28 @@ def determine_probe_sign(
     probe: nn.Module,
     samples: List[DataSample],
     layer_idx: int,
-    batch_size: int = 4
+    batch_size: int = 4,
+    baseline_logits: Optional[Dict[str, float]] = None,
+    return_baseline: bool = False
 ) -> float:
     """
     Determine whether probe logits are oriented correctly.
 
     Returns +1.0 if deceptive mean > honest mean, else -1.0 to flip logits.
     """
-    baseline = compute_baseline_logits(
-        model, tokenizer, probe, samples, layer_idx, batch_size=batch_size
-    )
-    honest_baselines = [baseline[s.id] for s in samples if s.label == 0]
-    deceptive_baselines = [baseline[s.id] for s in samples if s.label == 1]
+    if baseline_logits is None:
+        baseline_logits = compute_baseline_logits(
+            model, tokenizer, probe, samples, layer_idx, batch_size=batch_size
+        )
+    honest_baselines = [baseline_logits[s.id] for s in samples if s.label == 0]
+    deceptive_baselines = [baseline_logits[s.id] for s in samples if s.label == 1]
     separation = np.mean(deceptive_baselines) - np.mean(honest_baselines)
     logit_sign = 1.0 if separation >= 0 else -1.0
     logger.info(
         f"Probe orientation: separation={separation:.3f} -> logit_sign={logit_sign:+.0f}"
     )
+    if return_baseline:
+        return logit_sign, baseline_logits
     return logit_sign
 
 
@@ -661,6 +716,7 @@ def train_soft_prefix(
     val_samples: List[DataSample],
     layer_idx: int,
     args,
+    baseline_logits: Optional[Dict[str, float]] = None,
     logit_sign: float = 1.0
 ) -> Tuple[torch.Tensor, dict]:
     """
@@ -684,7 +740,12 @@ def train_soft_prefix(
             train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            collate_fn=lambda b: ([h for h, _ in b], [d for _, d in b])
+            collate_fn=lambda b: (
+                [h_id for h_id, _, _, _ in b],
+                [h for _, h, _, _ in b],
+                [d_id for _, _, d_id, _ in b],
+                [d for _, _, _, d in b]
+            )
         )
     else:
         train_dataset = SimpleDataset(train_samples)
@@ -692,7 +753,11 @@ def train_soft_prefix(
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=sampler,
-            collate_fn=lambda b: ([t for t, l in b], torch.tensor([l for t, l in b]))
+            collate_fn=lambda b: (
+                [i for i, _, _ in b],
+                [t for _, t, _ in b],
+                torch.tensor([l for _, _, l in b])
+            )
         )
     
     optimizer = torch.optim.AdamW([wrapper.soft_prefix], lr=args.lr)
@@ -705,8 +770,10 @@ def train_soft_prefix(
         'val_auroc': [],
         'separation': [],
         'L_hinge': [],
+        'L_baseline': [],
         'mu_hon': [],
         'mu_dec': [],
+        'bce': [],
         'pair_margin': [],
         'pair_acc': []
     }
@@ -720,7 +787,7 @@ def train_soft_prefix(
                 break
 
             if args.loss_type == "pairwise":
-                honest_texts, deceptive_texts = batch
+                honest_ids, honest_texts, deceptive_ids, deceptive_texts = batch
                 texts = honest_texts + deceptive_texts
                 features = wrapper.get_final_token_features(texts, layer_idx)
                 split = len(honest_texts)
@@ -734,20 +801,40 @@ def train_soft_prefix(
                     honest_logits, deceptive_logits, wrapper.soft_prefix,
                     margin=args.margin, lambda_norm=args.lambda_norm
                 )
+
+                if args.lambda_baseline > 0:
+                    batch_ids = honest_ids + deceptive_ids
+                    batch_logits = torch.cat([honest_logits, deceptive_logits], dim=0)
+                    L_baseline = baseline_mse_loss(batch_logits, batch_ids, baseline_logits)
+                    if L_baseline is not None:
+                        loss = loss + args.lambda_baseline * L_baseline
+                        metrics['L_baseline'] = L_baseline.item()
             else:
-                texts, labels = batch
+                sample_ids, texts, labels = batch
                 labels = labels.to(device)
 
                 # Forward with prefix
                 features = wrapper.get_final_token_features(texts, layer_idx)
                 logits = probe(features.unsqueeze(1)).squeeze() * logit_sign
 
-                # Hinge loss: only penalize if honest drifts UP toward ambiguity
-                loss, metrics = contrastive_hinge_loss(
-                    logits, labels, wrapper.soft_prefix,
-                    margin=args.margin, lambda_norm=args.lambda_norm,
-                    lambda_anchor=args.lambda_anchor, safe_threshold=args.safe_threshold
-                )
+                if args.loss_type == "bce":
+                    loss, metrics = bce_logits_loss(
+                        logits, labels, wrapper.soft_prefix,
+                        lambda_norm=args.lambda_norm
+                    )
+                else:
+                    # Hinge loss: only penalize if honest drifts UP toward ambiguity
+                    loss, metrics = contrastive_hinge_loss(
+                        logits, labels, wrapper.soft_prefix,
+                        margin=args.margin, lambda_norm=args.lambda_norm,
+                        lambda_anchor=args.lambda_anchor, safe_threshold=args.safe_threshold
+                    )
+
+                if args.lambda_baseline > 0:
+                    L_baseline = baseline_mse_loss(logits, sample_ids, baseline_logits)
+                    if L_baseline is not None:
+                        loss = loss + args.lambda_baseline * L_baseline
+                        metrics['L_baseline'] = L_baseline.item()
             
             # Backward
             optimizer.zero_grad()
@@ -756,19 +843,26 @@ def train_soft_prefix(
             
             step += 1
             pbar.update(1)
+            postfix = {'loss': f"{metrics['loss']:.3f}"}
             if args.loss_type == "pairwise":
-                pbar.set_postfix(
-                    loss=f"{metrics['loss']:.3f}",
-                    pair_margin=f"{metrics['pair_margin']:.2f}",
-                    pair_acc=f"{metrics['pair_acc']:.2f}"
-                )
+                postfix.update({
+                    'pair_margin': f"{metrics['pair_margin']:.2f}",
+                    'pair_acc': f"{metrics['pair_acc']:.2f}"
+                })
+            elif args.loss_type == "bce":
+                postfix.update({
+                    'bce': f"{metrics['bce']:.3f}",
+                    'sep': f"{metrics.get('separation', 0.0):.2f}"
+                })
             else:
-                pbar.set_postfix(
-                    loss=f"{metrics['loss']:.3f}",
-                    sep=f"{metrics['separation']:.2f}",
-                    mu_h=f"{metrics['mu_hon']:.2f}",
-                    hinge=f"{metrics['L_hinge']:.3f}"
-                )
+                postfix.update({
+                    'sep': f"{metrics['separation']:.2f}",
+                    'mu_h': f"{metrics['mu_hon']:.2f}",
+                    'hinge': f"{metrics['L_hinge']:.3f}"
+                })
+            if 'L_baseline' in metrics:
+                postfix['base'] = f"{metrics['L_baseline']:.3f}"
+            pbar.set_postfix(postfix)
             
             # Validation every N steps
             if step % args.val_every == 0:
@@ -779,6 +873,10 @@ def train_soft_prefix(
                 training_log['steps'].append(step)
                 training_log['train_loss'].append(metrics['loss'])
                 training_log['val_auroc'].append(val_auroc)
+                if 'bce' in metrics:
+                    training_log['bce'].append(metrics['bce'])
+                if 'L_baseline' in metrics:
+                    training_log['L_baseline'].append(metrics['L_baseline'])
 
                 if args.loss_type == "pairwise":
                     training_log['pair_margin'].append(metrics['pair_margin'])
@@ -789,15 +887,15 @@ def train_soft_prefix(
                         f"pair_acc={metrics['pair_acc']:.2f}"
                     )
                 else:
-                    training_log['separation'].append(metrics['separation'])
-                    training_log['L_hinge'].append(metrics['L_hinge'])
-                    training_log['mu_hon'].append(metrics['mu_hon'])
-                    training_log['mu_dec'].append(metrics['mu_dec'])
+                    training_log['separation'].append(metrics.get('separation', 0.0))
+                    training_log['L_hinge'].append(metrics.get('L_hinge', 0.0))
+                    training_log['mu_hon'].append(metrics.get('mu_hon', 0.0))
+                    training_log['mu_dec'].append(metrics.get('mu_dec', 0.0))
                     logger.info(
                         f"Step {step}: val_auroc={val_auroc:.4f}, "
-                        f"sep={metrics['separation']:.2f}, "
-                        f"μ_hon={metrics['mu_hon']:.2f}, "
-                        f"L_hinge={metrics['L_hinge']:.3f}"
+                        f"sep={metrics.get('separation', 0.0):.2f}, "
+                        f"μ_hon={metrics.get('mu_hon', 0.0):.2f}, "
+                        f"L_hinge={metrics.get('L_hinge', 0.0):.3f}"
                     )
                 
                 if val_auroc > best_auroc:
@@ -1020,14 +1118,16 @@ def main():
                        help="Training batch size (reduce if OOM)")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--loss_type", type=str, default="mean",
-                       choices=["mean", "pairwise"],
-                       help="Loss type: mean (batch mean separation) or pairwise (paired ranking)")
+                       choices=["mean", "pairwise", "bce"],
+                       help="Loss type: mean (batch mean separation), pairwise (paired ranking), or bce")
     parser.add_argument("--margin", type=float, default=1.0,
                        help="Margin for loss (mean separation or pairwise ranking)")
     parser.add_argument("--lambda_norm", type=float, default=1e-3,
                        help="L2 regularization on prefix norm")
     parser.add_argument("--lambda_anchor", type=float, default=1.0,
                        help="Weight for hinge loss on honest logits")
+    parser.add_argument("--lambda_baseline", type=float, default=0.0,
+                       help="Weight for MSE to baseline (no-prefix) logits")
     parser.add_argument("--safe_threshold", type=float, default=-1.0,
                        help="Only penalize if honest rises above this (hinge)")
     parser.add_argument("--val_every", type=int, default=50)
@@ -1141,14 +1241,16 @@ def main():
         
         logger.info(f"Loaded probe from {args.probe_path}")
         
-        logit_sign = determine_probe_sign(
+        logit_sign, baseline_logits = determine_probe_sign(
             model,
             tokenizer,
             probe,
             id_splits['train'],
             args.layer_idx,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            return_baseline=True
         )
+        baseline_logits = {k: v * logit_sign for k, v in baseline_logits.items()}
 
         # Create wrapper
         wrapper = SoftPrefixWrapper(model, tokenizer, args.prompt_len)
@@ -1157,7 +1259,9 @@ def main():
         best_prefix, training_log = train_soft_prefix(
             wrapper, probe,
             id_splits['train'], id_splits['val'],
-            args.layer_idx, args, logit_sign
+            args.layer_idx, args,
+            baseline_logits=baseline_logits,
+            logit_sign=logit_sign
         )
         
         # Save
@@ -1173,7 +1277,8 @@ def main():
                 'steps': args.steps,
                 'best_val_auroc': training_log['best_auroc'],
                 'logit_sign': logit_sign,
-                'loss_type': args.loss_type
+                'loss_type': args.loss_type,
+                'lambda_baseline': args.lambda_baseline
             }, f, indent=2)
         
         with open(os.path.join(prefix_dir, 'training_log.json'), 'w') as f:
@@ -1315,7 +1420,8 @@ def main():
             'model': args.model,
             'layer_idx': args.layer_idx,
             'prompt_len': args.prompt_len,
-            'loss_type': args.loss_type
+            'loss_type': args.loss_type,
+            'lambda_baseline': args.lambda_baseline
         }
     }
     
@@ -1328,6 +1434,7 @@ def main():
             'layer_idx': args.layer_idx,
             'prompt_len': args.prompt_len,
             'loss_type': args.loss_type,
+            'lambda_baseline': args.lambda_baseline,
         }
         diag_rows = [
             {
