@@ -22,9 +22,13 @@ POOLINGS = ["mean", "max", "last", "attn"]
 def load_residual_id_ood(residual_json: str) -> Tuple[float, float]:
     with open(residual_json, "r") as f:
         data = json.load(f)
-    # Use mean across layers for stability (or you can choose max)
-    id_auc = float(np.mean(data.get("id_auc", [])))
-    ood_auc = float(np.mean(data.get("ood_auc", [])))
+    id_list = data.get("id_auc", [])
+    ood_list = data.get("ood_auc", [])
+    if not id_list or not ood_list:
+        return None, None
+    # Use best layer AUCs
+    id_auc = float(np.max(id_list))
+    ood_auc = float(np.max(ood_list))
     return id_auc, ood_auc
 
 
@@ -44,20 +48,24 @@ def extract_top3_from_ood_json(ood_json: str) -> Dict[str, Dict]:
     for pooling in POOLINGS:
         # Common formats
         if pooling in data and isinstance(data[pooling], dict):
+            # Array format: layers + aucs
+            if "layers" in data[pooling] and "aucs" in data[pooling]:
+                layer_aucs = list(zip(data[pooling]["layers"], data[pooling]["aucs"]))
             # Try per-layer data if present
-            layer_results = data[pooling].get("per_layer_results")
-            if layer_results and isinstance(layer_results, list):
-                layer_aucs = [(r.get("layer"), r.get("ood_auc", r.get("auc", 0.0))) for r in layer_results]
             else:
-                # Some results store per-layer under "results" or "layers"
-                layer_aucs = []
-                for k, v in data[pooling].items():
-                    if isinstance(v, dict) and "ood_auc" in v:
-                        try:
-                            layer = int(str(k).replace("layer_", ""))
-                        except Exception:
-                            continue
-                        layer_aucs.append((layer, v["ood_auc"]))
+                layer_results = data[pooling].get("per_layer_results")
+                if layer_results and isinstance(layer_results, list):
+                    layer_aucs = [(r.get("layer"), r.get("ood_auc", r.get("auc", 0.0))) for r in layer_results]
+                else:
+                    # Some results store per-layer under "results" or "layers"
+                    layer_aucs = []
+                    for k, v in data[pooling].items():
+                        if isinstance(v, dict) and "ood_auc" in v:
+                            try:
+                                layer = int(str(k).replace("layer_", ""))
+                            except Exception:
+                                continue
+                            layer_aucs.append((layer, v["ood_auc"]))
         elif "results" in data and pooling in data["results"]:
             # sweep-like format
             layer_aucs = []
