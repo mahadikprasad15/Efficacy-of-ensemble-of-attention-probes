@@ -5,10 +5,17 @@ Invariant Core Sweep: Run across all layers and pooling types
 
 This script:
 1. Sweeps across all layers and pooling types
-2. Computes invariant core for each (layer, pooling) combination
-3. Evaluates invariant core AND single-domain probes on OOD data
+2. Computes invariant core for each (layer, pooling) combination  
+3. Evaluates on InsiderTrading (target) data:
+   - Invariant Core: domain-invariant residual direction
+   - Roleplaying probe (OOD): trained on Roleplaying, tested on InsiderTrading
+   - InsiderTrading probe (ID): trained on InsiderTrading, tested on InsiderTrading
+   - Combined probe: trained on both domains
 4. Generates comparison line plots
 5. Saves all probes and results
+
+NOTE: The InsiderTrading probe from probes_flipped/ is IN-DOMAIN (ID) for the
+InsiderTrading evaluation set, not OOD! Only the Roleplaying probe is truly OOD.
 
 Usage (Colab):
     python scripts/pipelines/sweep_invariant_core.py \
@@ -268,20 +275,22 @@ def run_sweep(args):
             auc_combined = evaluate_direction(X_ood_norm, y_ood, w_C)
             auc_projection = evaluate_direction(X_ood_norm, y_ood, decomp['projection'])
             
-            # Also evaluate single-domain probes directly (not orthogonalized)
-            auc_roleplaying_raw = evaluate_direction(X_ood_norm, y_ood, w_R)
-            auc_insider_raw = evaluate_direction(X_ood_norm, y_ood, w_I)
+            # Evaluate single-domain probes directly (not orthogonalized)
+            # NOTE: Roleplaying probe on InsiderTrading = OOD
+            #       InsiderTrading probe on InsiderTrading = ID (in-domain!)
+            auc_roleplaying_OOD = evaluate_direction(X_ood_norm, y_ood, w_R)
+            auc_insider_ID = evaluate_direction(X_ood_norm, y_ood, w_I)
             
             layer_result = {
                 'layer': layer,
-                'ood_auc': {
+                'eval_on_insider': {
                     'invariant_core': float(auc_invariant),
                     'roleplaying_e1': float(auc_roleplaying),
                     'insider_orth_e2': float(auc_insider),
                     'combined': float(auc_combined),
                     'projection': float(auc_projection),
-                    'roleplaying_raw': float(auc_roleplaying_raw),
-                    'insider_raw': float(auc_insider_raw)
+                    'roleplaying_OOD': float(auc_roleplaying_OOD),  # Trained on Roleplaying -> OOD
+                    'insider_ID': float(auc_insider_ID)              # Trained on InsiderTrading -> ID
                 },
                 'decomposition': {
                     'a': float(decomp['a']),
@@ -337,10 +346,10 @@ def generate_comparison_plots(all_results, output_dir):
         layers = [r['layer'] for r in valid_results]
         
         # Extract AUCs
-        auc_invariant = [r['ood_auc']['invariant_core'] for r in valid_results]
-        auc_roleplaying = [r['ood_auc']['roleplaying_raw'] for r in valid_results]
-        auc_insider = [r['ood_auc']['insider_raw'] for r in valid_results]
-        auc_combined = [r['ood_auc']['combined'] for r in valid_results]
+        auc_invariant = [r['eval_on_insider']['invariant_core'] for r in valid_results]
+        auc_roleplaying = [r['eval_on_insider']['roleplaying_OOD'] for r in valid_results]
+        auc_insider = [r['eval_on_insider']['insider_ID'] for r in valid_results]
+        auc_combined = [r['eval_on_insider']['combined'] for r in valid_results]
         
         # Plot
         fig, ax = plt.subplots(figsize=(12, 6))
@@ -348,9 +357,9 @@ def generate_comparison_plots(all_results, output_dir):
         ax.plot(layers, auc_invariant, 'o-', linewidth=2.5, markersize=6, 
                 label='Invariant Core', color='#2ecc71')
         ax.plot(layers, auc_roleplaying, 's--', linewidth=1.5, markersize=5, 
-                label='Roleplaying (ID→OOD)', color='#3498db', alpha=0.7)
+                label='Roleplaying Probe (OOD)', color='#3498db', alpha=0.7)
         ax.plot(layers, auc_insider, '^--', linewidth=1.5, markersize=5, 
-                label='InsiderTrading (ID→OOD)', color='#e74c3c', alpha=0.7)
+                label='InsiderTrading Probe (ID)', color='#e74c3c', alpha=0.7)
         ax.plot(layers, auc_combined, 'd-', linewidth=2, markersize=5, 
                 label='Combined Probe', color='#9b59b6', alpha=0.8)
         
@@ -367,8 +376,8 @@ def generate_comparison_plots(all_results, output_dir):
                     bbox=dict(boxstyle='round', facecolor='#2ecc71', alpha=0.3))
         
         ax.set_xlabel('Layer', fontsize=12)
-        ax.set_ylabel('OOD AUC', fontsize=12)
-        ax.set_title(f'OOD Generalization: Invariant Core vs ID Probes ({pooling.upper()} pooling)', 
+        ax.set_ylabel('AUC on InsiderTrading', fontsize=12)
+        ax.set_title(f'InsiderTrading Eval: Invariant Core vs Probes ({pooling.upper()} pooling)', 
                      fontsize=14, fontweight='bold')
         ax.legend(loc='lower right', fontsize=10)
         ax.set_ylim(0.4, 1.0)
@@ -391,7 +400,7 @@ def generate_comparison_plots(all_results, output_dir):
             continue
         
         layers = [r['layer'] for r in valid_results]
-        auc_invariant = [r['ood_auc']['invariant_core'] for r in valid_results]
+        auc_invariant = [r['eval_on_insider']['invariant_core'] for r in valid_results]
         
         ax.plot(layers, auc_invariant, 'o-', linewidth=2, markersize=5, 
                 label=f'{pooling.upper()}', color=colors.get(pooling, 'gray'))
@@ -424,29 +433,30 @@ def save_best_summary(all_results, output_dir):
             continue
         
         # Best invariant core
-        best_invariant = max(valid_results, key=lambda r: r['ood_auc']['invariant_core'])
+        best_invariant = max(valid_results, key=lambda r: r['eval_on_insider']['invariant_core'])
         
-        # Best ID probes on OOD
-        best_roleplaying = max(valid_results, key=lambda r: r['ood_auc']['roleplaying_raw'])
-        best_insider = max(valid_results, key=lambda r: r['ood_auc']['insider_raw'])
-        best_combined = max(valid_results, key=lambda r: r['ood_auc']['combined'])
+        # Roleplaying probe on InsiderTrading = OOD performance
+        # InsiderTrading probe on InsiderTrading = ID performance
+        best_roleplaying = max(valid_results, key=lambda r: r['eval_on_insider']['roleplaying_OOD'])
+        best_insider = max(valid_results, key=lambda r: r['eval_on_insider']['insider_ID'])
+        best_combined = max(valid_results, key=lambda r: r['eval_on_insider']['combined'])
         
         summary[pooling] = {
             'invariant_core': {
                 'best_layer': best_invariant['layer'],
-                'best_auc': best_invariant['ood_auc']['invariant_core']
+                'best_auc': best_invariant['eval_on_insider']['invariant_core']
             },
-            'roleplaying_id_probe': {
+            'roleplaying_probe_OOD': {  # Trained on Roleplaying, tested on InsiderTrading
                 'best_layer': best_roleplaying['layer'],
-                'best_auc': best_roleplaying['ood_auc']['roleplaying_raw']
+                'best_auc': best_roleplaying['eval_on_insider']['roleplaying_OOD']
             },
-            'insider_id_probe': {
+            'insider_probe_ID': {  # Trained on InsiderTrading, tested on InsiderTrading (in-domain!)
                 'best_layer': best_insider['layer'],
-                'best_auc': best_insider['ood_auc']['insider_raw']
+                'best_auc': best_insider['eval_on_insider']['insider_ID']
             },
             'combined_probe': {
                 'best_layer': best_combined['layer'],
-                'best_auc': best_combined['ood_auc']['combined']
+                'best_auc': best_combined['eval_on_insider']['combined']
             }
         }
     
@@ -457,16 +467,16 @@ def save_best_summary(all_results, output_dir):
     
     # Print summary
     print("\n" + "-" * 50)
-    print("BEST CONFIGURATIONS (OOD AUC)")
+    print("BEST CONFIGURATIONS (Evaluated on InsiderTrading)")
     print("-" * 50)
     for pooling, data in summary.items():
         if 'error' in data:
             continue
         print(f"\n{pooling.upper()}:")
-        print(f"  Invariant Core:   Layer {data['invariant_core']['best_layer']:2d} → AUC {data['invariant_core']['best_auc']:.4f}")
-        print(f"  Roleplaying ID:   Layer {data['roleplaying_id_probe']['best_layer']:2d} → AUC {data['roleplaying_id_probe']['best_auc']:.4f}")
-        print(f"  InsiderTrad ID:   Layer {data['insider_id_probe']['best_layer']:2d} → AUC {data['insider_id_probe']['best_auc']:.4f}")
-        print(f"  Combined:         Layer {data['combined_probe']['best_layer']:2d} → AUC {data['combined_probe']['best_auc']:.4f}")
+        print(f"  Invariant Core:      Layer {data['invariant_core']['best_layer']:2d} → AUC {data['invariant_core']['best_auc']:.4f}")
+        print(f"  Roleplaying (OOD):   Layer {data['roleplaying_probe_OOD']['best_layer']:2d} → AUC {data['roleplaying_probe_OOD']['best_auc']:.4f}")
+        print(f"  InsiderTrad (ID):    Layer {data['insider_probe_ID']['best_layer']:2d} → AUC {data['insider_probe_ID']['best_auc']:.4f}")
+        print(f"  Combined:            Layer {data['combined_probe']['best_layer']:2d} → AUC {data['combined_probe']['best_auc']:.4f}")
 
 
 def main():
