@@ -197,6 +197,9 @@ def main() -> int:
     parser.add_argument("--pooling", default="mean")
     parser.add_argument("--splits", default="validation,test")
     parser.add_argument("--top_k", type=int, default=3)
+    parser.add_argument("--filter_mode", default="both_fail",
+                        choices=["both_fail", "either_fail", "residual_only"],
+                        help="Sample filter: residual correct AND (both fail | either fail | no constraint)")
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--output_dir", required=True)
     args = parser.parse_args()
@@ -261,7 +264,15 @@ def main() -> int:
                     pred_a = int(score_a > 0)
                     pred_b = int(score_b > 0)
 
-                    if pred_res == y and pred_a != y and pred_b != y:
+                    keep = False
+                    if pred_res == y:
+                        if args.filter_mode == "both_fail":
+                            keep = (pred_a != y and pred_b != y)
+                        elif args.filter_mode == "either_fail":
+                            keep = (pred_a != y or pred_b != y)
+                        elif args.filter_mode == "residual_only":
+                            keep = True
+                    if keep:
                         selected.append((x, y, eid, toks, res_score, score_a, score_b))
 
                 if not selected:
