@@ -163,6 +163,23 @@ def plot_cosines_per_pooling(
 
 def _extract_eval_dict(r: Dict) -> Tuple[Dict, str]:
     """Find the evaluation dict in a sweep result entry."""
+    # Common legacy formats
+    if "ood_auc" in r:
+        # ood_auc may be a dict of metrics or a single float
+        if isinstance(r["ood_auc"], dict):
+            return r["ood_auc"], "ood_auc"
+        try:
+            return {"invariant_core": float(r["ood_auc"])}, "ood_auc_scalar"
+        except Exception:
+            pass
+    if "id_auc" in r:
+        if isinstance(r["id_auc"], dict):
+            return r["id_auc"], "id_auc"
+        try:
+            return {"invariant_core": float(r["id_auc"])}, "id_auc_scalar"
+        except Exception:
+            pass
+
     for key in ["eval_on_insider", "eval_on_roleplaying", "eval_on_ood", "eval_on_id", "eval"]:
         if key in r and isinstance(r[key], dict):
             return r[key], key
