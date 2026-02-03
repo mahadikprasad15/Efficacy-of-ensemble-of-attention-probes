@@ -209,6 +209,285 @@ def plot_best_layer_summary(results, output_dir):
     print(f"  ✓ Saved: {plot_path}")
 
 
+# ============================================================================
+# NEW DECOMPOSITION ANALYSIS PLOTS
+# ============================================================================
+
+def plot_residual_norm_vs_layer(results, output_dir):
+    """Plot 1: Residual norm across layers for each pooling type."""
+    print("\n📊 Generating residual norm vs layer plot...")
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    colors = {'mean': '#2ecc71', 'max': '#3498db', 'last': '#e74c3c', 'attn': '#9b59b6'}
+    markers = {'mean': 'o', 'max': 's', 'last': '^', 'attn': 'd'}
+    
+    for pooling, layer_results in results['results'].items():
+        valid = [r for r in layer_results if 'error' not in r]
+        if len(valid) == 0:
+            continue
+        
+        layers = [r['layer'] for r in valid]
+        residual_norms = [r['decomposition']['residual_norm'] for r in valid]
+        
+        ax.plot(layers, residual_norms, f'{markers.get(pooling, "o")}-', 
+                linewidth=2, markersize=6, label=f'{pooling.upper()}', 
+                color=colors.get(pooling, 'gray'))
+    
+    ax.set_xlabel('Layer', fontsize=12)
+    ax.set_ylabel('Residual Norm (Invariant Core Magnitude)', fontsize=12)
+    ax.set_title('Invariant Core Magnitude Across Layers', fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, 'residual_norm_vs_layer.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  ✓ Saved: {plot_path}")
+
+
+def plot_residual_norm_vs_auc(results, output_dir):
+    """Plot 2: Scatter of residual norm vs invariant core AUC."""
+    print("\n📊 Generating residual norm vs AUC scatter plot...")
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    colors = {'mean': '#2ecc71', 'max': '#3498db', 'last': '#e74c3c', 'attn': '#9b59b6'}
+    
+    all_norms, all_aucs = [], []
+    
+    for pooling, layer_results in results['results'].items():
+        valid = [r for r in layer_results if 'error' not in r]
+        if len(valid) == 0:
+            continue
+        
+        auc_dict_key = 'eval_on_insider' if 'eval_on_insider' in valid[0] else 'ood_auc'
+        
+        norms = [r['decomposition']['residual_norm'] for r in valid]
+        aucs = [r[auc_dict_key]['invariant_core'] for r in valid]
+        layers = [r['layer'] for r in valid]
+        
+        all_norms.extend(norms)
+        all_aucs.extend(aucs)
+        
+        ax.scatter(norms, aucs, c=colors.get(pooling, 'gray'), label=pooling.upper(), 
+                   s=60, alpha=0.7, edgecolors='white', linewidth=0.5)
+        
+        # Annotate a few points with layer numbers
+        for i in range(0, len(layers), 5):
+            ax.annotate(f'L{layers[i]}', (norms[i], aucs[i]), fontsize=7, alpha=0.6)
+    
+    # Add correlation line
+    if len(all_norms) > 2:
+        z = np.polyfit(all_norms, all_aucs, 1)
+        p = np.poly1d(z)
+        x_line = np.linspace(min(all_norms), max(all_norms), 100)
+        ax.plot(x_line, p(x_line), '--', color='gray', alpha=0.5, linewidth=2)
+        
+        # Calculate correlation
+        corr = np.corrcoef(all_norms, all_aucs)[0, 1]
+        ax.text(0.05, 0.95, f'Correlation: {corr:.3f}', transform=ax.transAxes,
+                fontsize=11, fontweight='bold', verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    ax.set_xlabel('Residual Norm', fontsize=12)
+    ax.set_ylabel('Invariant Core AUC', fontsize=12)
+    ax.set_title('Does Larger Invariant Signal → Better OOD Performance?', 
+                 fontsize=14, fontweight='bold')
+    ax.legend(loc='lower right', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, 'residual_norm_vs_auc.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  ✓ Saved: {plot_path}")
+
+
+def plot_decomposition_coefficients(results, output_dir):
+    """Plot 3: Decomposition coefficients (a, b) vs layer."""
+    print("\n📊 Generating decomposition coefficients plot...")
+    
+    for pooling, layer_results in results['results'].items():
+        valid = [r for r in layer_results if 'error' not in r]
+        if len(valid) == 0:
+            continue
+        
+        layers = [r['layer'] for r in valid]
+        a_vals = [r['decomposition']['a'] for r in valid]
+        b_vals = [r['decomposition']['b'] for r in valid]
+        residual_norms = [r['decomposition']['residual_norm'] for r in valid]
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        ax.plot(layers, a_vals, 'o-', linewidth=2, markersize=6, 
+                label='a (Roleplaying alignment)', color='#3498db')
+        ax.plot(layers, b_vals, 's-', linewidth=2, markersize=6, 
+                label='b (InsiderTrading orth. alignment)', color='#e74c3c')
+        ax.plot(layers, residual_norms, '^--', linewidth=2, markersize=6, 
+                label='Residual Norm', color='#2ecc71', alpha=0.7)
+        
+        ax.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+        ax.set_xlabel('Layer', fontsize=12)
+        ax.set_ylabel('Coefficient Value', fontsize=12)
+        ax.set_title(f'Decomposition: w_C = a·e1 + b·e2 + residual ({pooling.upper()})', 
+                     fontsize=14, fontweight='bold')
+        ax.legend(loc='best', fontsize=10)
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plot_path = os.path.join(output_dir, f'decomposition_coefficients_{pooling}.png')
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  ✓ Saved: {plot_path}")
+
+
+def plot_ternary_composition(results, output_dir):
+    """Plot 4: Stacked area showing relative contributions |a|², |b|², residual²."""
+    print("\n📊 Generating ternary composition plots...")
+    
+    for pooling, layer_results in results['results'].items():
+        valid = [r for r in layer_results if 'error' not in r]
+        if len(valid) == 0:
+            continue
+        
+        layers = [r['layer'] for r in valid]
+        a_sq = [r['decomposition']['a']**2 for r in valid]
+        b_sq = [r['decomposition']['b']**2 for r in valid]
+        r_sq = [r['decomposition']['residual_norm']**2 for r in valid]
+        
+        # Normalize to sum to 1
+        totals = [a + b + r for a, b, r in zip(a_sq, b_sq, r_sq)]
+        a_frac = [a/t for a, t in zip(a_sq, totals)]
+        b_frac = [b/t for b, t in zip(b_sq, totals)]
+        r_frac = [r/t for r, t in zip(r_sq, totals)]
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        ax.stackplot(layers, a_frac, b_frac, r_frac,
+                     labels=['|a|² (Roleplaying)', '|b|² (InsiderTrading orth.)', '|residual|² (Invariant)'],
+                     colors=['#3498db', '#e74c3c', '#2ecc71'], alpha=0.8)
+        
+        ax.set_xlabel('Layer', fontsize=12)
+        ax.set_ylabel('Fraction of Combined Probe', fontsize=12)
+        ax.set_title(f'Combined Probe Composition ({pooling.upper()})', 
+                     fontsize=14, fontweight='bold')
+        ax.legend(loc='upper right', fontsize=10)
+        ax.set_ylim(0, 1)
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        plt.tight_layout()
+        plot_path = os.path.join(output_dir, f'ternary_composition_{pooling}.png')
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  ✓ Saved: {plot_path}")
+
+
+def plot_correlation_heatmap(results, output_dir):
+    """Plot 5: Correlation heatmap between all metrics."""
+    print("\n📊 Generating correlation heatmap...")
+    
+    # Collect all data across all pooling types
+    all_data = []
+    
+    for pooling, layer_results in results['results'].items():
+        valid = [r for r in layer_results if 'error' not in r]
+        for r in valid:
+            auc_dict = r.get('eval_on_insider', r.get('ood_auc', {}))
+            row = {
+                'a': r['decomposition']['a'],
+                'b': r['decomposition']['b'],
+                'residual_norm': r['decomposition']['residual_norm'],
+                'invariant_auc': auc_dict.get('invariant_core', 0),
+                'roleplaying_auc': auc_dict.get('roleplaying_OOD', auc_dict.get('roleplaying_raw', 0)),
+                'insider_auc': auc_dict.get('insider_ID', auc_dict.get('insider_raw', 0)),
+                'combined_auc': auc_dict.get('combined', 0),
+            }
+            all_data.append(row)
+    
+    if len(all_data) < 3:
+        print("  ⚠ Not enough data for correlation heatmap")
+        return
+    
+    # Build correlation matrix
+    keys = ['a', 'b', 'residual_norm', 'invariant_auc', 'roleplaying_auc', 'insider_auc', 'combined_auc']
+    labels = ['a', 'b', 'Residual\nNorm', 'Invariant\nAUC', 'Roleplaying\nAUC', 'Insider\nAUC', 'Combined\nAUC']
+    
+    data_matrix = np.array([[d[k] for k in keys] for d in all_data])
+    corr_matrix = np.corrcoef(data_matrix.T)
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
+    
+    ax.set_xticks(range(len(labels)))
+    ax.set_yticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=10)
+    ax.set_yticklabels(labels, fontsize=10)
+    
+    # Add correlation values
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            val = corr_matrix[i, j]
+            color = 'white' if abs(val) > 0.5 else 'black'
+            ax.text(j, i, f'{val:.2f}', ha='center', va='center', color=color, fontsize=9)
+    
+    plt.colorbar(im, ax=ax, label='Correlation')
+    ax.set_title('Correlation Between Decomposition & AUC Metrics', fontsize=14, fontweight='bold')
+    
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, 'correlation_heatmap.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  ✓ Saved: {plot_path}")
+
+
+def plot_residual_norm_by_pooling(results, output_dir):
+    """Plot 6: Compare residual norms across pooling types at each layer."""
+    print("\n📊 Generating residual norm by pooling comparison...")
+    
+    fig, ax = plt.subplots(figsize=(14, 6))
+    
+    poolings = list(results['results'].keys())
+    colors = {'mean': '#2ecc71', 'max': '#3498db', 'last': '#e74c3c', 'attn': '#9b59b6'}
+    
+    # Get common layers
+    all_layers = set()
+    for pooling, layer_results in results['results'].items():
+        valid = [r for r in layer_results if 'error' not in r]
+        all_layers.update([r['layer'] for r in valid])
+    layers = sorted(all_layers)
+    
+    x = np.arange(len(layers))
+    width = 0.2
+    
+    for i, pooling in enumerate(poolings):
+        layer_results = results['results'][pooling]
+        valid = [r for r in layer_results if 'error' not in r]
+        layer_to_norm = {r['layer']: r['decomposition']['residual_norm'] for r in valid}
+        
+        norms = [layer_to_norm.get(l, 0) for l in layers]
+        offset = (i - len(poolings)/2 + 0.5) * width
+        ax.bar(x + offset, norms, width, label=pooling.upper(), 
+               color=colors.get(pooling, 'gray'), alpha=0.8)
+    
+    ax.set_xlabel('Layer', fontsize=12)
+    ax.set_ylabel('Residual Norm', fontsize=12)
+    ax.set_title('Invariant Core Magnitude by Pooling Type', fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(layers)
+    ax.legend(loc='upper right', fontsize=10)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, 'residual_norm_by_pooling.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  ✓ Saved: {plot_path}")
+
+
+# ============================================================================
+# SUMMARY AND MAIN
+# ============================================================================
+
 def print_summary_table(results):
     """Print a text summary table."""
     print("\n" + "=" * 70)
@@ -251,10 +530,18 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     print(f"Output directory: {output_dir}")
     
-    # Generate plots
+    # Generate original plots
     plot_comparison_per_pooling(results, output_dir)
     plot_invariant_all_pooling(results, output_dir)
     plot_best_layer_summary(results, output_dir)
+    
+    # Generate new decomposition analysis plots
+    plot_residual_norm_vs_layer(results, output_dir)
+    plot_residual_norm_vs_auc(results, output_dir)
+    plot_decomposition_coefficients(results, output_dir)
+    plot_ternary_composition(results, output_dir)
+    plot_correlation_heatmap(results, output_dir)
+    plot_residual_norm_by_pooling(results, output_dir)
     
     # Print summary
     print_summary_table(results)
