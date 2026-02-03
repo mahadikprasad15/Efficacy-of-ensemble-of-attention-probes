@@ -187,6 +187,7 @@ def main() -> int:
     os.makedirs(args.output_dir, exist_ok=True)
 
     summary_rows = []
+    ks_rows = []
 
     for layer in layers:
         w_res = load_invariant_direction(args.invariant_probes_dir, layer)
@@ -226,6 +227,12 @@ def main() -> int:
                 ks_stat, ks_p = ks_2samp(a_pos, b_pos)
             else:
                 ks_stat, ks_p = float("nan"), float("nan")
+            ks_rows.append({
+                "layer": layer,
+                "split": split,
+                "ks_deceptive": ks_stat,
+                "ks_pvalue": ks_p,
+            })
 
             # Plot
             fig, axes = plt.subplots(1, 3, figsize=(18, 5))
@@ -304,6 +311,41 @@ def main() -> int:
         for row in summary_rows:
             f.write(f"{row['layer']},{row['split']},{row['domain']},{row['auc']}\n")
     print(f"✓ Saved: {summary_csv}")
+
+    # Invariance vs Performance scatter
+    for split in splits:
+        # Collect per-layer avg AUC and KS
+        layers_in_split = sorted({r["layer"] for r in summary_rows if r["split"] == split})
+        if not layers_in_split:
+            continue
+
+        xs = []
+        ys = []
+        labels = []
+        for layer in layers_in_split:
+            a_auc = next((r["auc"] for r in summary_rows if r["layer"] == layer and r["split"] == split and r["domain"] == args.domain_a), None)
+            b_auc = next((r["auc"] for r in summary_rows if r["layer"] == layer and r["split"] == split and r["domain"] == args.domain_b), None)
+            ks = next((k["ks_deceptive"] for k in ks_rows if k["layer"] == layer and k["split"] == split), None)
+            if a_auc is None or b_auc is None or ks is None or not (ks == ks):
+                continue
+            xs.append(ks)
+            ys.append((a_auc + b_auc) / 2.0)
+            labels.append(layer)
+
+        if xs:
+            plt.figure(figsize=(8, 6))
+            plt.scatter(xs, ys, c="#4c78a8")
+            for x, y, layer in zip(xs, ys, labels):
+                plt.text(x, y, str(layer), fontsize=8, ha="right", va="bottom")
+            plt.xlabel("KS (Deceptive: Roleplaying vs InsiderTrading)")
+            plt.ylabel("Avg AUC (Roleplaying + InsiderTrading)")
+            plt.title(f"Invariance vs Performance ({split})")
+            plt.grid(True, alpha=0.3)
+            out_path = os.path.join(args.output_dir, f"invariance_vs_performance_{split}.png")
+            plt.tight_layout()
+            plt.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close()
+            print(f"✓ Saved: {out_path}")
 
     return 0
 
