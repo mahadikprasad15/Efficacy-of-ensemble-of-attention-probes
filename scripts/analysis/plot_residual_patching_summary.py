@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Plot Residual Patching Summaries
-================================
+Plot Residual Patching Results
+==============================
 
-Aggregates layer_*_summary.json files produced by patch_residual_tokens.py
-and visualizes:
-  - Top tokens by frequency
-  - Top positions by frequency
-  - Distribution of absolute delta scores
+Aggregates layer_*.jsonl files produced by patch_residual_tokens.py and visualizes:
+  - Top tokens by count and by sum(|delta|)
+  - Top positions by count and by sum(|delta|)
+  - Distribution of |delta_score|
+  - Relative position histogram (pos / length)
 
 Usage:
   python scripts/analysis/plot_residual_patching_summary.py \
@@ -19,22 +19,39 @@ import os
 import json
 import glob
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 
 import numpy as np
 import matplotlib.pyplot as plt
 
 
-def load_summaries(input_dir: str):
-    pattern = os.path.join(input_dir, "**", "layer_*_summary.json")
+def load_jsonl(input_dir: str):
+    pattern = os.path.join(input_dir, "**", "layer_*.jsonl")
     paths = glob.glob(pattern, recursive=True)
-    summaries = []
+    records = []
     for p in paths:
         with open(p, "r") as f:
-            s = json.load(f)
-        s["_path"] = p
-        summaries.append(s)
-    return summaries
+            for line in f:
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                rec["_path"] = p
+                records.append(rec)
+    return records
+
+
+def parse_group(path: str):
+    # Expect .../<split>/<domain>/layer_X.jsonl
+    parts = path.split(os.sep)
+    split = "unknown"
+    domain = "unknown"
+    for i, part in enumerate(parts):
+        if part in ["validation", "test"]:
+            split = part
+            if i + 1 < len(parts):
+                domain = parts[i + 1]
+            break
+    return split, domain
 
 
 def plot_bar(data, title, xlabel, output_path, top_k=20):
@@ -72,87 +89,159 @@ def main() -> int:
     parser.add_argument("--top_k", type=int, default=20)
     args = parser.parse_args()
 
-    summaries = load_summaries(args.input_dir)
-    if not summaries:
-        print("No summary files found.")
+    records = load_jsonl(args.input_dir)
+    if not records:
+        print("No JSONL files found.")
         return 1
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Global aggregation
-    token_counter = Counter()
-    pos_counter = Counter()
+    token_count = Counter()
+    token_weight = Counter()
+    pos_count = Counter()
+    pos_weight = Counter()
     delta_vals = []
+    rel_pos_vals = []
+    missing_token = 0
+    total_token = 0
 
-    for s in summaries:
-        for tok, cnt in s.get("top_tokens", []):
-            token_counter[tok] += cnt
-        for pos, cnt in s.get("top_positions", []):
-            pos_counter[str(pos)] += cnt
-        # delta_stats are summary, not per-sample; use mean_abs_delta as proxy
-        if "delta_stats" in s and "mean_abs_delta" in s["delta_stats"]:
-            delta_vals.append(s["delta_stats"]["mean_abs_delta"])
+    grouped = defaultdict(list)
+    for r in records:
+        split, domain = parse_group(r["_path"])
+        grouped[f"{split}/{domain}"].append(r)
+
+        length = r.get("length", None)
+        for t in r.get("top_tokens", []):
+            token = t.get("token")
+            idx = t.get("index")
+            delta = abs(t.get("delta_score", 0.0))
+            if token is not None:
+                token_count[token] += 1
+                token_weight[token] += delta
+                total_token += 1
+            else:
+                missing_token += 1
+            pos_count[str(idx)] += 1
+            pos_weight[str(idx)] += delta
+            delta_vals.append(delta)
+            if length and length > 0:
+                rel_pos_vals.append(float(idx) / float(length))
+
+    if missing_token > 0:
+        print(f"Warning: {missing_token} token entries missing token text.")
 
     plot_bar(
-        token_counter,
-        "Top Tokens (All Layers/Splits/Domains)",
-        "Frequency",
-        os.path.join(args.output_dir, "top_tokens_all.png"),
+        token_count,
+        "Top Tokens by Count (All Layers/Splits/Domains)",
+        "Count",
+        os.path.join(args.output_dir, "top_tokens_count_all.png"),
         top_k=args.top_k,
     )
     plot_bar(
-        pos_counter,
-        "Top Positions (All Layers/Splits/Domains)",
-        "Frequency",
-        os.path.join(args.output_dir, "top_positions_all.png"),
+        token_weight,
+        "Top Tokens by |Delta| (All Layers/Splits/Domains)",
+        "Sum |Delta|",
+        os.path.join(args.output_dir, "top_tokens_weight_all.png"),
+        top_k=args.top_k,
+    )
+    plot_bar(
+        pos_count,
+        "Top Positions by Count (All Layers/Splits/Domains)",
+        "Count",
+        os.path.join(args.output_dir, "top_positions_count_all.png"),
+        top_k=args.top_k,
+    )
+    plot_bar(
+        pos_weight,
+        "Top Positions by |Delta| (All Layers/Splits/Domains)",
+        "Sum |Delta|",
+        os.path.join(args.output_dir, "top_positions_weight_all.png"),
         top_k=args.top_k,
     )
     plot_delta_hist(
         np.array(delta_vals),
-        "Mean |Delta Score| Across Summaries",
+        "|Delta Score| Distribution (All Layers/Splits/Domains)",
         os.path.join(args.output_dir, "delta_hist_all.png"),
     )
 
-    # Split/domain specific plots
-    by_group = {}
-    for s in summaries:
-        split = s.get("split", "unknown")
-        domain = s.get("domain", "unknown")
-        key = f"{split}/{domain}"
-        by_group.setdefault(key, []).append(s)
+    if rel_pos_vals:
+        plt.figure(figsize=(8, 5))
+        plt.hist(rel_pos_vals, bins=20, color="#54a24b", alpha=0.8)
+        plt.title("Relative Position Distribution (All)")
+        plt.xlabel("Position / Length")
+        plt.ylabel("Count")
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.output_dir, "relative_position_all.png"), dpi=150, bbox_inches="tight")
+        plt.close()
 
-    for key, group in by_group.items():
-        token_counter = Counter()
-        pos_counter = Counter()
+    # Split/domain specific plots
+    for key, group in grouped.items():
+        token_count = Counter()
+        token_weight = Counter()
+        pos_count = Counter()
+        pos_weight = Counter()
         delta_vals = []
-        for s in group:
-            for tok, cnt in s.get("top_tokens", []):
-                token_counter[tok] += cnt
-            for pos, cnt in s.get("top_positions", []):
-                pos_counter[str(pos)] += cnt
-            if "delta_stats" in s and "mean_abs_delta" in s["delta_stats"]:
-                delta_vals.append(s["delta_stats"]["mean_abs_delta"])
+        rel_pos_vals = []
+
+        for r in group:
+            length = r.get("length", None)
+            for t in r.get("top_tokens", []):
+                token = t.get("token")
+                idx = t.get("index")
+                delta = abs(t.get("delta_score", 0.0))
+                if token is not None:
+                    token_count[token] += 1
+                    token_weight[token] += delta
+                pos_count[str(idx)] += 1
+                pos_weight[str(idx)] += delta
+                delta_vals.append(delta)
+                if length and length > 0:
+                    rel_pos_vals.append(float(idx) / float(length))
 
         safe_key = key.replace("/", "_")
         plot_bar(
-            token_counter,
-            f"Top Tokens ({key})",
-            "Frequency",
-            os.path.join(args.output_dir, f"top_tokens_{safe_key}.png"),
+            token_count,
+            f"Top Tokens by Count ({key})",
+            "Count",
+            os.path.join(args.output_dir, f"top_tokens_count_{safe_key}.png"),
             top_k=args.top_k,
         )
         plot_bar(
-            pos_counter,
-            f"Top Positions ({key})",
-            "Frequency",
-            os.path.join(args.output_dir, f"top_positions_{safe_key}.png"),
+            token_weight,
+            f"Top Tokens by |Delta| ({key})",
+            "Sum |Delta|",
+            os.path.join(args.output_dir, f"top_tokens_weight_{safe_key}.png"),
+            top_k=args.top_k,
+        )
+        plot_bar(
+            pos_count,
+            f"Top Positions by Count ({key})",
+            "Count",
+            os.path.join(args.output_dir, f"top_positions_count_{safe_key}.png"),
+            top_k=args.top_k,
+        )
+        plot_bar(
+            pos_weight,
+            f"Top Positions by |Delta| ({key})",
+            "Sum |Delta|",
+            os.path.join(args.output_dir, f"top_positions_weight_{safe_key}.png"),
             top_k=args.top_k,
         )
         plot_delta_hist(
             np.array(delta_vals),
-            f"Mean |Delta Score| ({key})",
+            f"|Delta Score| Distribution ({key})",
             os.path.join(args.output_dir, f"delta_hist_{safe_key}.png"),
         )
+        if rel_pos_vals:
+            plt.figure(figsize=(8, 5))
+            plt.hist(rel_pos_vals, bins=20, color="#54a24b", alpha=0.8)
+            plt.title(f"Relative Position Distribution ({key})")
+            plt.xlabel("Position / Length")
+            plt.ylabel("Count")
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.output_dir, f"relative_position_{safe_key}.png"), dpi=150, bbox_inches="tight")
+            plt.close()
 
     print(f"✓ Saved plots to {args.output_dir}")
     return 0
