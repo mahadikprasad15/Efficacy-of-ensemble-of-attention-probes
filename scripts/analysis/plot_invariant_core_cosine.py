@@ -161,6 +161,17 @@ def plot_cosines_per_pooling(
     return out_path
 
 
+def _extract_eval_dict(r: Dict) -> Tuple[Dict, str]:
+    """Find the evaluation dict in a sweep result entry."""
+    for key in ["eval_on_insider", "eval_on_roleplaying", "eval_on_ood", "eval_on_id", "eval"]:
+        if key in r and isinstance(r[key], dict):
+            return r[key], key
+    # Some formats may store metrics at the top level
+    if "invariant_core" in r or "combined" in r:
+        return r, "root"
+    return {}, ""
+
+
 def plot_auc_and_cosine_panel(
     sweep_results: Dict,
     pooling: str,
@@ -177,20 +188,30 @@ def plot_auc_and_cosine_panel(
     if not valid:
         return ""
 
+    # Determine which eval dict key exists
+    eval_dict, eval_key = _extract_eval_dict(valid[0])
+    if not eval_dict:
+        print(f"  ⚠ No eval dict found for pooling={pooling}; skipping AUC panel.")
+        return ""
+
     auc_layers = [r["layer"] for r in valid]
-    auc_invariant = [r["eval_on_insider"]["invariant_core"] for r in valid]
-    auc_roleplaying = [r["eval_on_insider"]["roleplaying_OOD"] for r in valid]
-    auc_insider = [r["eval_on_insider"]["insider_ID"] for r in valid]
-    auc_combined = [r["eval_on_insider"]["combined"] for r in valid]
+    # Safely extract metrics, fall back to NaN if missing
+    auc_invariant = [(_extract_eval_dict(r)[0].get("invariant_core", float("nan"))) for r in valid]
+    auc_roleplaying = [(_extract_eval_dict(r)[0].get("roleplaying_OOD", float("nan"))) for r in valid]
+    auc_insider = [(_extract_eval_dict(r)[0].get("insider_ID", float("nan"))) for r in valid]
+    auc_combined = [(_extract_eval_dict(r)[0].get("combined", float("nan"))) for r in valid]
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 5))
 
     # AUC panel
     ax = axes[0]
     ax.plot(auc_layers, auc_invariant, "o-", label="Invariant Core", linewidth=2)
-    ax.plot(auc_layers, auc_roleplaying, "s--", label="Roleplaying (ID→OOD)", linewidth=1.5, alpha=0.8)
-    ax.plot(auc_layers, auc_insider, "^--", label="Insider (ID→OOD)", linewidth=1.5, alpha=0.8)
-    ax.plot(auc_layers, auc_combined, "d-", label="Combined", linewidth=2, alpha=0.9)
+    if not all(np.isnan(auc_roleplaying)):
+        ax.plot(auc_layers, auc_roleplaying, "s--", label="Roleplaying (ID→OOD)", linewidth=1.5, alpha=0.8)
+    if not all(np.isnan(auc_insider)):
+        ax.plot(auc_layers, auc_insider, "^--", label="Insider (ID→OOD)", linewidth=1.5, alpha=0.8)
+    if not all(np.isnan(auc_combined)):
+        ax.plot(auc_layers, auc_combined, "d-", label="Combined", linewidth=2, alpha=0.9)
     ax.axhline(0.5, color="gray", linestyle=":", alpha=0.6)
     ax.set_xlabel("Layer")
     ax.set_ylabel("OOD AUC")
