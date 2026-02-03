@@ -131,20 +131,23 @@ def main() -> int:
     if missing_token > 0:
         print(f"Warning: {missing_token} token entries missing token text.")
 
-    plot_bar(
-        token_count,
-        "Top Tokens by Count (All Layers/Splits/Domains)",
-        "Count",
-        os.path.join(args.output_dir, "top_tokens_count_all.png"),
-        top_k=args.top_k,
-    )
-    plot_bar(
-        token_weight,
-        "Top Tokens by |Delta| (All Layers/Splits/Domains)",
-        "Sum |Delta|",
-        os.path.join(args.output_dir, "top_tokens_weight_all.png"),
-        top_k=args.top_k,
-    )
+    if total_token == 0:
+        print("No token text found; skipping token plots (position-only mode).")
+    else:
+        plot_bar(
+            token_count,
+            "Top Tokens by Count (All Layers/Splits/Domains)",
+            "Count",
+            os.path.join(args.output_dir, "top_tokens_count_all.png"),
+            top_k=args.top_k,
+        )
+        plot_bar(
+            token_weight,
+            "Top Tokens by |Delta| (All Layers/Splits/Domains)",
+            "Sum |Delta|",
+            os.path.join(args.output_dir, "top_tokens_weight_all.png"),
+            top_k=args.top_k,
+        )
     plot_bar(
         pos_count,
         "Top Positions by Count (All Layers/Splits/Domains)",
@@ -184,6 +187,7 @@ def main() -> int:
         delta_vals = []
         rel_pos_vals = []
 
+        group_token_total = 0
         for r in group:
             length = r.get("length", None)
             for t in r.get("top_tokens", []):
@@ -193,6 +197,7 @@ def main() -> int:
                 if token is not None:
                     token_count[token] += 1
                     token_weight[token] += delta
+                    group_token_total += 1
                 pos_count[str(idx)] += 1
                 pos_weight[str(idx)] += delta
                 delta_vals.append(delta)
@@ -200,20 +205,21 @@ def main() -> int:
                     rel_pos_vals.append(float(idx) / float(length))
 
         safe_key = key.replace("/", "_")
-        plot_bar(
-            token_count,
-            f"Top Tokens by Count ({key})",
-            "Count",
-            os.path.join(args.output_dir, f"top_tokens_count_{safe_key}.png"),
-            top_k=args.top_k,
-        )
-        plot_bar(
-            token_weight,
-            f"Top Tokens by |Delta| ({key})",
-            "Sum |Delta|",
-            os.path.join(args.output_dir, f"top_tokens_weight_{safe_key}.png"),
-            top_k=args.top_k,
-        )
+        if group_token_total > 0:
+            plot_bar(
+                token_count,
+                f"Top Tokens by Count ({key})",
+                "Count",
+                os.path.join(args.output_dir, f"top_tokens_count_{safe_key}.png"),
+                top_k=args.top_k,
+            )
+            plot_bar(
+                token_weight,
+                f"Top Tokens by |Delta| ({key})",
+                "Sum |Delta|",
+                os.path.join(args.output_dir, f"top_tokens_weight_{safe_key}.png"),
+                top_k=args.top_k,
+            )
         plot_bar(
             pos_count,
             f"Top Positions by Count ({key})",
