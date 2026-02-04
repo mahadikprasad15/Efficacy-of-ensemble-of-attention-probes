@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Residual Token Patching (Mean Pooling)
-=====================================
+Residual Token Patching (Multiple Pooling Modes)
+===============================================
 
 For samples where residual is correct but BOTH single-domain probes fail,
 compute token contributions and counterfactual deltas using a position-wise
@@ -119,11 +119,32 @@ def normalize_tokens(x: np.ndarray, mean: Optional[np.ndarray], std: Optional[np
     return (x - mean) / (std + 1e-8)
 
 
-def pooled_score(x_tokens: np.ndarray, w: np.ndarray, b: float = 0.0,
-                 mean: Optional[np.ndarray] = None, std: Optional[np.ndarray] = None) -> float:
+def pool_token_scores(token_scores: np.ndarray, pooling: str, topk_k: int) -> float:
+    if token_scores.size == 0:
+        return 0.0
+    if pooling == "mean":
+        return float(token_scores.mean())
+    if pooling == "max":
+        return float(token_scores.max())
+    if pooling == "topk":
+        k = max(1, min(topk_k, token_scores.size))
+        topk = np.partition(token_scores, -k)[-k:]
+        return float(topk.mean())
+    raise ValueError(f"Unsupported pooling: {pooling}")
+
+
+def pooled_score(
+    x_tokens: np.ndarray,
+    w: np.ndarray,
+    b: float = 0.0,
+    mean: Optional[np.ndarray] = None,
+    std: Optional[np.ndarray] = None,
+    pooling: str = "mean",
+    topk_k: int = 5,
+) -> float:
     x_norm = normalize_tokens(x_tokens, mean, std)
-    pooled = x_norm.mean(axis=0)
-    return float(np.dot(w, pooled) + b)
+    token_scores = x_norm @ w
+    return float(pool_token_scores(token_scores, pooling, topk_k) + b)
 
 
 def compute_position_baseline(
@@ -183,6 +204,32 @@ def select_top_layers(sweep_results: Dict, pooling: str, top_k: int) -> List[int
     return [layer for _, layer in scored[:top_k]]
 
 
+def compute_max_helpers(token_scores: np.ndarray) -> Tuple[float, float, int]:
+    max_val = float(token_scores.max()) if token_scores.size else float("-inf")
+    if token_scores.size <= 1:
+        return max_val, float("-inf"), int(token_scores.size)
+    count_max = int(np.sum(token_scores == max_val))
+    if count_max > 1:
+        second_max = max_val
+    else:
+        lower = token_scores[token_scores < max_val]
+        second_max = float(lower.max()) if lower.size else float("-inf")
+    return max_val, second_max, count_max
+
+
+def compute_topk_helpers(token_scores: np.ndarray, topk_k: int) -> Tuple[int, float, float, np.ndarray, float]:
+    T = token_scores.size
+    k = max(1, min(topk_k, T))
+    sorted_idx = np.argsort(token_scores)[::-1]
+    topk_idx = sorted_idx[:k]
+    topk_sum = float(token_scores[topk_idx].sum())
+    kth_val = float(token_scores[sorted_idx[k - 1]])
+    next_val = float(token_scores[sorted_idx[k]]) if k < T else float("-inf")
+    topk_mask = np.zeros(T, dtype=bool)
+    topk_mask[topk_idx] = True
+    return k, topk_sum, kth_val, topk_mask, next_val
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Residual token patching (mean pooling)")
     parser.add_argument("--base_data_dir", required=True, help="Base data directory")
@@ -194,7 +241,9 @@ def main() -> int:
     parser.add_argument("--probes_b_dir", required=True, help="Domain B probes dir (mean pooling)")
     parser.add_argument("--domain_a", default="Deception-Roleplaying")
     parser.add_argument("--domain_b", default="Deception-InsiderTrading")
-    parser.add_argument("--pooling", default="mean")
+    parser.add_argument("--pooling", default="mean",
+                        help="Comma-separated list of pooling modes: mean,max,topk")
+    parser.add_argument("--pooling_k", type=int, default=5, help="k for top-k pooling")
     parser.add_argument("--splits", default="validation,test")
     parser.add_argument("--top_k", type=int, default=3)
     parser.add_argument("--filter_mode", default="both_fail",
@@ -207,147 +256,212 @@ def main() -> int:
     with open(args.sweep_results, "r") as f:
         sweep_results = json.load(f)
 
-    layers = select_top_layers(sweep_results, args.pooling, args.top_k)
-    if not layers:
-        print("No layers found from sweep_results.")
+    pooling_list = [p.strip() for p in args.pooling.split(",") if p.strip()]
+    if not pooling_list:
+        print("No pooling modes specified.")
         return 1
 
     splits = [s.strip() for s in args.splits.split(",") if s.strip()]
     os.makedirs(args.output_dir, exist_ok=True)
 
-    for layer in layers:
-        print(f"\n=== Layer {layer} ===")
+    pooling_layers: Dict[str, List[int]] = {}
+    for pooling in pooling_list:
+        layers = select_top_layers(sweep_results, pooling, args.top_k)
+        if not layers and pooling != "mean":
+            layers = select_top_layers(sweep_results, "mean", args.top_k)
+            if layers:
+                print(f"Warning: no sweep results for pooling={pooling}; using mean layers.")
+        if not layers:
+            print(f"No layers found from sweep_results for pooling={pooling}.")
+            return 1
+        pooling_layers[pooling] = layers
 
-        w_res = load_invariant_direction(args.invariant_probes_dir, layer)
-        res_norm = np.linalg.norm(w_res)
-        if res_norm < 1e-8:
-            print(f"  Warning: near-zero residual vector at layer {layer}")
-        w_res = w_res / (res_norm + 1e-8)
+    for pooling in pooling_list:
+        layers = pooling_layers[pooling]
+        print(f"\n=== Pooling {pooling} ===")
+        for layer in layers:
+            print(f"\n=== Layer {layer} ===")
 
-        # Load single-domain probes
-        w_a, b_a = load_linear_probe(args.probes_a_dir, layer)
-        w_b, b_b = load_linear_probe(args.probes_b_dir, layer)
+            w_res = load_invariant_direction(args.invariant_probes_dir, layer)
+            res_norm = np.linalg.norm(w_res)
+            if res_norm < 1e-8:
+                print(f"  Warning: near-zero residual vector at layer {layer}")
+            w_res = w_res / (res_norm + 1e-8)
 
-        # Norm stats
-        mean_res, std_res = load_norm_stats(args.combined_probes_dir, layer)
-        if mean_res is None:
-            print("  Warning: combined norm stats not found; using raw activations for residual.")
-        mean_a, std_a = load_norm_stats(args.probes_a_dir, layer)
-        mean_b, std_b = load_norm_stats(args.probes_b_dir, layer)
+            # Load single-domain probes
+            w_a, b_a = load_linear_probe(args.probes_a_dir, layer)
+            w_b, b_b = load_linear_probe(args.probes_b_dir, layer)
 
-        # Sanity check dimension
-        if mean_res is not None and w_res.shape[-1] != mean_res.shape[-1]:
-            raise ValueError(f"Residual dim {w_res.shape[-1]} != norm dim {mean_res.shape[-1]}")
+            # Norm stats
+            mean_res, std_res = load_norm_stats(args.combined_probes_dir, layer)
+            if mean_res is None:
+                print("  Warning: combined norm stats not found; using raw activations for residual.")
+            mean_a, std_a = load_norm_stats(args.probes_a_dir, layer)
+            mean_b, std_b = load_norm_stats(args.probes_b_dir, layer)
 
-        for split in splits:
-            for domain, domain_dir in [(args.domain_a, args.domain_a), (args.domain_b, args.domain_b)]:
-                act_dir = os.path.join(args.base_data_dir, "activations", args.model, domain_dir, split)
-                print(f"  Loading {domain}/{split} from {act_dir}")
-                acts, labels, ids, tokens = load_activations_with_manifest(
-                    act_dir, layer, max_samples=args.max_samples
-                )
-                if not acts:
-                    print("  No activations found.")
-                    continue
+            # Sanity check dimension
+            if mean_res is not None and w_res.shape[-1] != mean_res.shape[-1]:
+                raise ValueError(f"Residual dim {w_res.shape[-1]} != norm dim {mean_res.shape[-1]}")
 
-                # Baseline in residual-normalized space
-                baseline = compute_position_baseline(acts, labels, mean_res, std_res)
+            for split in splits:
+                for domain, domain_dir in [(args.domain_a, args.domain_a), (args.domain_b, args.domain_b)]:
+                    act_dir = os.path.join(args.base_data_dir, "activations", args.model, domain_dir, split)
+                    print(f"  Loading {domain}/{split} from {act_dir}")
+                    acts, labels, ids, tokens = load_activations_with_manifest(
+                        act_dir, layer, max_samples=args.max_samples
+                    )
+                    if not acts:
+                        print("  No activations found.")
+                        continue
 
-                # Evaluate and select samples
-                selected = []
-                for x, y, eid, toks in zip(acts, labels, ids, tokens):
-                    res_score = pooled_score(x, w_res, 0.0, mean_res, std_res)
-                    pred_res = int(res_score > 0)
+                    # Baseline in residual-normalized space
+                    baseline = compute_position_baseline(acts, labels, mean_res, std_res)
 
-                    score_a = pooled_score(x, w_a, b_a, mean_a, std_a)
-                    score_b = pooled_score(x, w_b, b_b, mean_b, std_b)
-                    pred_a = int(score_a > 0)
-                    pred_b = int(score_b > 0)
+                    # Evaluate and select samples
+                    selected = []
+                    for x, y, eid, toks in zip(acts, labels, ids, tokens):
+                        res_score = pooled_score(
+                            x, w_res, 0.0, mean_res, std_res, pooling=pooling, topk_k=args.pooling_k
+                        )
+                        pred_res = int(res_score > 0)
 
-                    keep = False
-                    if pred_res == y:
-                        if args.filter_mode == "both_fail":
-                            keep = (pred_a != y and pred_b != y)
-                        elif args.filter_mode == "either_fail":
-                            keep = (pred_a != y or pred_b != y)
-                        elif args.filter_mode == "residual_only":
-                            keep = True
-                    if keep:
-                        selected.append((x, y, eid, toks, res_score, score_a, score_b))
+                        score_a = pooled_score(x, w_a, b_a, mean_a, std_a)
+                        score_b = pooled_score(x, w_b, b_b, mean_b, std_b)
+                        pred_a = int(score_a > 0)
+                        pred_b = int(score_b > 0)
 
-                if not selected:
-                    print("  No samples matching residual-correct and both single-domain wrong.")
-                    continue
+                        keep = False
+                        if pred_res == y:
+                            if args.filter_mode == "both_fail":
+                                keep = (pred_a != y and pred_b != y)
+                            elif args.filter_mode == "either_fail":
+                                keep = (pred_a != y or pred_b != y)
+                            elif args.filter_mode == "residual_only":
+                                keep = True
+                        if keep:
+                            selected.append((x, y, eid, toks, res_score, score_a, score_b))
 
-                out_dir = os.path.join(args.output_dir, split, domain)
-                os.makedirs(out_dir, exist_ok=True)
-                out_path = os.path.join(out_dir, f"layer_{layer}.jsonl")
-                summary_path = os.path.join(out_dir, f"layer_{layer}_summary.json")
+                    if not selected:
+                        print("  No samples matching residual-correct and both single-domain wrong.")
+                        continue
 
-                pos_counts = {}
-                token_counts = {}
-                deltas_all = []
+                    out_dir = os.path.join(args.output_dir, pooling, split, domain)
+                    os.makedirs(out_dir, exist_ok=True)
+                    out_path = os.path.join(out_dir, f"layer_{layer}.jsonl")
+                    summary_path = os.path.join(out_dir, f"layer_{layer}_summary.json")
 
-                with open(out_path, "w") as f:
-                    for x, y, eid, toks, res_score, score_a, score_b in tqdm(selected, desc="Patching"):
-                        x_norm = normalize_tokens(x, mean_res, std_res)
-                        T = x_norm.shape[0]
-                        contrib = (x_norm @ w_res) / T
+                    pos_counts = {}
+                    token_counts = {}
+                    deltas_all = []
 
-                        top_entries = []
-                        for t in range(T):
-                            b_t = baseline[t] if t < len(baseline) else None
-                            if b_t is None:
+                    with open(out_path, "w") as f:
+                        for x, y, eid, toks, res_score, score_a, score_b in tqdm(selected, desc="Patching"):
+                            x_norm = normalize_tokens(x, mean_res, std_res)
+                            T = x_norm.shape[0]
+                            if T == 0:
                                 continue
-                            delta = float(np.dot(w_res, (b_t - x_norm[t])) / T)
-                            token = None
-                            if toks and t < len(toks):
-                                token = toks[t]
-                            top_entries.append({
-                                "index": t,
-                                "token": token,
-                                "contribution": float(contrib[t]),
-                                "delta_score": delta
-                            })
+                            token_scores = x_norm @ w_res
 
-                        top_entries.sort(key=lambda r: abs(r["delta_score"]), reverse=True)
-                        top_entries = top_entries[:20]
+                            pooling_score = pool_token_scores(token_scores, pooling, args.pooling_k)
+                            if pooling == "mean":
+                                contrib = token_scores / T
+                            else:
+                                contrib = token_scores
 
-                        for te in top_entries:
-                            pos_counts[str(te["index"])] = pos_counts.get(str(te["index"]), 0) + 1
-                            if te["token"] is not None:
-                                token_counts[te["token"]] = token_counts.get(te["token"], 0) + 1
-                            deltas_all.append(te["delta_score"])
+                            max_val, second_max, count_max = (0.0, 0.0, 0)
+                            k = 0
+                            topk_sum = 0.0
+                            kth_val = 0.0
+                            topk_mask = None
+                            next_val = 0.0
+                            if pooling == "max":
+                                max_val, second_max, count_max = compute_max_helpers(token_scores)
+                            elif pooling == "topk":
+                                k, topk_sum, kth_val, topk_mask, next_val = compute_topk_helpers(
+                                    token_scores, args.pooling_k
+                                )
 
-                        record = {
-                            "id": eid,
-                            "label": y,
-                            "residual_score": float(res_score),
-                            "roleplaying_score": float(score_a),
-                            "insider_score": float(score_b),
-                            "length": int(T),
-                            "top_tokens": top_entries,
-                        }
-                        f.write(json.dumps(record) + "\n")
+                            top_entries = []
+                            for t in range(T):
+                                b_t = baseline[t] if t < len(baseline) else None
+                                if b_t is None:
+                                    continue
+                                b_score = float(np.dot(w_res, b_t))
+                                if pooling == "mean":
+                                    delta = (b_score - token_scores[t]) / T
+                                elif pooling == "max":
+                                    if token_scores[t] == max_val and count_max == 1:
+                                        new_max = max(second_max, b_score)
+                                    else:
+                                        new_max = max(max_val, b_score)
+                                    delta = new_max - max_val
+                                elif pooling == "topk":
+                                    if k == 0:
+                                        delta = 0.0
+                                    elif topk_mask is not None and topk_mask[t]:
+                                        replacement = b_score if k == T else max(b_score, next_val)
+                                        new_sum = topk_sum - token_scores[t] + replacement
+                                        delta = (new_sum - topk_sum) / k
+                                    else:
+                                        if b_score > kth_val:
+                                            new_sum = topk_sum - kth_val + b_score
+                                            delta = (new_sum - topk_sum) / k
+                                        else:
+                                            delta = 0.0
+                                else:
+                                    raise ValueError(f"Unsupported pooling: {pooling}")
 
-                summary = {
-                    "layer": layer,
-                    "domain": domain,
-                    "split": split,
-                    "num_samples": len(selected),
-                    "top_positions": sorted(pos_counts.items(), key=lambda x: x[1], reverse=True)[:20],
-                    "top_tokens": sorted(token_counts.items(), key=lambda x: x[1], reverse=True)[:20],
-                    "delta_stats": {
-                        "mean_abs_delta": float(np.mean(np.abs(deltas_all))) if deltas_all else 0.0,
-                        "median_abs_delta": float(np.median(np.abs(deltas_all))) if deltas_all else 0.0,
-                    },
-                }
+                                token = None
+                                if toks and t < len(toks):
+                                    token = toks[t]
+                                top_entries.append({
+                                    "index": t,
+                                    "token": token,
+                                    "token_score": float(token_scores[t]),
+                                    "contribution": float(contrib[t]),
+                                    "delta_score": float(delta),
+                                })
 
-                with open(summary_path, "w") as f:
-                    json.dump(summary, f, indent=2)
+                            top_entries.sort(key=lambda r: abs(r["delta_score"]), reverse=True)
+                            top_entries = top_entries[:20]
 
-                print(f"  ✓ Saved: {out_path}")
-                print(f"  ✓ Saved: {summary_path}")
+                            for te in top_entries:
+                                pos_counts[str(te["index"])] = pos_counts.get(str(te["index"]), 0) + 1
+                                if te["token"] is not None:
+                                    token_counts[te["token"]] = token_counts.get(te["token"], 0) + 1
+                                deltas_all.append(te["delta_score"])
+
+                            record = {
+                                "id": eid,
+                                "label": y,
+                                "pooling": pooling,
+                                "residual_score": float(pooling_score),
+                                "roleplaying_score": float(score_a),
+                                "insider_score": float(score_b),
+                                "length": int(T),
+                                "top_tokens": top_entries,
+                            }
+                            f.write(json.dumps(record) + "\n")
+
+                    summary = {
+                        "layer": layer,
+                        "domain": domain,
+                        "split": split,
+                        "pooling": pooling,
+                        "num_samples": len(selected),
+                        "top_positions": sorted(pos_counts.items(), key=lambda x: x[1], reverse=True)[:20],
+                        "top_tokens": sorted(token_counts.items(), key=lambda x: x[1], reverse=True)[:20],
+                        "delta_stats": {
+                            "mean_abs_delta": float(np.mean(np.abs(deltas_all))) if deltas_all else 0.0,
+                            "median_abs_delta": float(np.median(np.abs(deltas_all))) if deltas_all else 0.0,
+                        },
+                    }
+
+                    with open(summary_path, "w") as f:
+                        json.dump(summary, f, indent=2)
+
+                    print(f"  ✓ Saved: {out_path}")
+                    print(f"  ✓ Saved: {summary_path}")
 
     return 0
 
