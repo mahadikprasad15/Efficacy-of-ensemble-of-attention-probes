@@ -33,6 +33,7 @@ import os
 import sys
 import json
 import glob
+import csv
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -176,7 +177,7 @@ class LayerAgnosticDataset(Dataset):
     
     def __getitem__(self, idx):
         item = self.items[idx]
-        return item['vector'].float(), torch.tensor(item['label'], dtype=torch.float32), item['layer']
+        return item['vector'].float(), torch.tensor(item['label'], dtype=torch.float32), item['layer'], item['sample_id']
 
 
 class LayerAgnosticAttnDataset(Dataset):
@@ -249,7 +250,7 @@ class LayerAgnosticAttnDataset(Dataset):
     
     def __getitem__(self, idx):
         item = self.items[idx]
-        return item['tensor'].float(), torch.tensor(item['label'], dtype=torch.float32), item['layer']
+        return item['tensor'].float(), torch.tensor(item['label'], dtype=torch.float32), item['layer'], item['sample_id']
 
 
 class PerLayerEvalAttnDataset(Dataset):
@@ -428,7 +429,7 @@ class AttentionProbe(nn.Module):
 # Training & Evaluation
 # ============================================================================
 
-def train_probe(model, train_loader, val_loader, device, epochs=20, lr=1e-3):
+def train_probe(model, train_loader, val_loader, device, epochs=20, lr=1e-3, checkpoint_dir=None, checkpoint_every=1):
     """Train the probe and return best model based on validation AUC."""
     
     model = model.to(device)
@@ -438,11 +439,16 @@ def train_probe(model, train_loader, val_loader, device, epochs=20, lr=1e-3):
     best_auc = 0.0
     best_state = None
     
+    checkpoints = []
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
         
-        for x, y, layers in train_loader:
+        for batch in train_loader:
+            if len(batch) == 4:
+                x, y, layers, _ = batch
+            else:
+                x, y, layers = batch
             x, y = x.to(device), y.to(device)
             
             optimizer.zero_grad()
@@ -458,7 +464,11 @@ def train_probe(model, train_loader, val_loader, device, epochs=20, lr=1e-3):
         val_preds, val_targets = [], []
         
         with torch.no_grad():
-            for x, y, layers in val_loader:
+            for batch in val_loader:
+                if len(batch) == 4:
+                    x, y, layers, _ = batch
+                else:
+                    x, y, layers = batch
                 x = x.to(device)
                 logits = model(x).squeeze(-1)
                 probs = torch.sigmoid(logits).cpu().numpy()
@@ -477,6 +487,12 @@ def train_probe(model, train_loader, val_loader, device, epochs=20, lr=1e-3):
         
         logger.info(f"Epoch {epoch+1:2d}/{epochs} | Loss: {total_loss/len(train_loader):.4f} | Val AUC: {val_auc:.4f} | Val Acc: {val_acc:.4f}")
         
+        if checkpoint_dir and (epoch + 1) % checkpoint_every == 0:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch+1}.pt")
+            torch.save(model.state_dict(), ckpt_path)
+            checkpoints.append((epoch + 1, ckpt_path))
+
         if val_auc > best_auc:
             best_auc = val_auc
             best_state = model.state_dict().copy()
@@ -485,7 +501,195 @@ def train_probe(model, train_loader, val_loader, device, epochs=20, lr=1e-3):
     if best_state:
         model.load_state_dict(best_state)
     
-    return model, best_auc
+    return model, best_auc, checkpoints
+
+
+# ============================================================================
+# Attribution Helpers
+# ============================================================================
+
+def _flatten_params(model: nn.Module) -> torch.Tensor:
+    params = []
+    for p in model.parameters():
+        params.append(p.detach().flatten().cpu())
+    if not params:
+        return torch.empty(0)
+    return torch.cat(params)
+
+
+def _flatten_grads(model: nn.Module) -> torch.Tensor:
+    grads = []
+    for p in model.parameters():
+        if p.grad is None:
+            grads.append(torch.zeros_like(p).flatten().cpu())
+        else:
+            grads.append(p.grad.detach().flatten().cpu())
+    if not grads:
+        return torch.empty(0)
+    return torch.cat(grads)
+
+
+def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    if a.numel() == 0 or b.numel() == 0:
+        return 0.0
+    denom = (torch.norm(a) * torch.norm(b)).item()
+    if denom == 0:
+        return 0.0
+    return float(torch.dot(a, b) / denom)
+
+
+def _write_csv(path: str, header: list, rows: list):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def _compute_per_sample_grads(model, x, y, loss_fn):
+    logits = model(x).squeeze(-1)
+    losses = loss_fn(logits, y)
+    grads = []
+    for i in range(len(losses)):
+        model.zero_grad(set_to_none=True)
+        losses[i].backward(retain_graph=True)
+        grads.append(_flatten_grads(model))
+    model.zero_grad(set_to_none=True)
+    return grads
+
+
+def _summarize_per_layer(results: dict):
+    best_layer = max(results.keys(), key=lambda l: results[l]['auc'])
+    return {
+        "best_layer": best_layer,
+        "best_auc": results[best_layer]["auc"],
+        "best_acc": results[best_layer]["accuracy"]
+    }
+
+
+def run_layer_agnostic_attribution(
+    model: nn.Module,
+    checkpoints: list,
+    w_star: torch.Tensor,
+    train_loader: DataLoader,
+    attr_every_n: int,
+    attr_top_n: int,
+    attr_out_dir: str,
+    device: str,
+    val_path: str,
+    ood_path: str,
+    pooling: str,
+    n_layers: int
+):
+    training_dynamics = []
+    checkpoint_metrics = []
+
+    sample_progress = {}
+    sample_influence = {}
+    layer_progress = {}
+    layer_influence = {}
+    layer_counts = {}
+
+    loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+
+    best_id_auc = -1.0
+    best_ood_auc = -1.0
+
+    for epoch, ckpt_path in checkpoints:
+        state = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(state)
+        model.eval()
+
+        w_t = _flatten_params(model)
+        cos_to_final = _cosine(w_t, w_star)
+        w_norm = float(torch.norm(w_t).item()) if w_t.numel() else 0.0
+        training_dynamics.append([epoch, cos_to_final, w_norm])
+
+        # Checkpoint evaluation
+        id_results = evaluate_per_layer(model, val_path, pooling, device, n_layers)
+        id_best = _summarize_per_layer(id_results)
+        best_id_auc = max(best_id_auc, id_best["best_auc"])
+        checkpoint_metrics.append([epoch, "id", id_best["best_auc"], id_best["best_acc"], id_best["best_layer"], 1 if id_best["best_auc"] >= best_id_auc else 0])
+
+        if ood_path and os.path.exists(ood_path):
+            ood_results = evaluate_per_layer(model, ood_path, pooling, device, n_layers)
+            ood_best = _summarize_per_layer(ood_results)
+            best_ood_auc = max(best_ood_auc, ood_best["best_auc"])
+            checkpoint_metrics.append([epoch, "ood", ood_best["best_auc"], ood_best["best_acc"], ood_best["best_layer"], 1 if ood_best["best_auc"] >= best_ood_auc else 0])
+
+        # Attribution pass
+        delta = w_star - w_t
+        for batch_idx, batch in enumerate(train_loader):
+            if attr_every_n > 1 and batch_idx % attr_every_n != 0:
+                continue
+            if len(batch) == 4:
+                x, y, layers, ids = batch
+            else:
+                x, y, layers = batch
+                ids = [f"idx_{batch_idx}_{i}" for i in range(len(y))]
+
+            x = x.to(device)
+            y = y.to(device)
+
+            grads = _compute_per_sample_grads(model, x, y, loss_fn)
+            for i, g in enumerate(grads):
+                sample_id = ids[i]
+                layer_id = int(layers[i])
+                alignment = -_cosine(g, w_star)
+                influence = float(torch.dot(g, delta)) if g.numel() else 0.0
+
+                sample_progress[sample_id] = sample_progress.get(sample_id, 0.0) + alignment
+                sample_influence[sample_id] = sample_influence.get(sample_id, 0.0) + influence
+
+                layer_progress[layer_id] = layer_progress.get(layer_id, 0.0) + alignment
+                layer_influence[layer_id] = layer_influence.get(layer_id, 0.0) + influence
+                layer_counts[layer_id] = layer_counts.get(layer_id, 0) + 1
+
+    # Write outputs
+    _write_csv(
+        os.path.join(attr_out_dir, "training_dynamics.csv"),
+        ["epoch", "cos_to_final", "w_norm"],
+        training_dynamics
+    )
+    _write_csv(
+        os.path.join(attr_out_dir, "checkpoint_metrics.csv"),
+        ["epoch", "split", "auc", "acc", "best_layer", "best_so_far"],
+        checkpoint_metrics
+    )
+
+    layer_rows = []
+    for l, total in layer_progress.items():
+        count = max(layer_counts.get(l, 1), 1)
+        layer_rows.append([l, total / count, count])
+    _write_csv(
+        os.path.join(attr_out_dir, "layer_progress.csv"),
+        ["layer", "mean_grad_alignment", "count"],
+        layer_rows
+    )
+
+    layer_inf_rows = []
+    for l, total in layer_influence.items():
+        count = max(layer_counts.get(l, 1), 1)
+        layer_inf_rows.append([l, total / count, count])
+    _write_csv(
+        os.path.join(attr_out_dir, "layer_influence.csv"),
+        ["layer", "mean_influence", "count"],
+        layer_inf_rows
+    )
+
+    top_prog = sorted(sample_progress.items(), key=lambda x: abs(x[1]), reverse=True)[:attr_top_n]
+    _write_csv(
+        os.path.join(attr_out_dir, f"sample_progress_top{attr_top_n}.csv"),
+        ["sample_id", "grad_alignment"],
+        [[sid, score] for sid, score in top_prog]
+    )
+
+    top_inf = sorted(sample_influence.items(), key=lambda x: abs(x[1]), reverse=True)[:attr_top_n]
+    _write_csv(
+        os.path.join(attr_out_dir, f"sample_influence_top{attr_top_n}.csv"),
+        ["sample_id", "influence"],
+        [[sid, score] for sid, score in top_inf]
+    )
 
 
 def evaluate_per_layer(model, activations_dir: str, pooling: str, device: str, n_layers: int = 28):
@@ -579,6 +783,12 @@ def main():
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     parser.add_argument("--split_train_for_val", action="store_true", help="Use 80/20 split of train for validation")
     parser.add_argument("--n_layers", type=int, default=None, help="Override number of layers (auto-detect if not set)")
+    # Attribution / checkpointing
+    parser.add_argument("--attr_enable", action="store_true", help="Enable attribution logging")
+    parser.add_argument("--attr_every_n", type=int, default=50, help="Batch interval for attribution aggregation")
+    parser.add_argument("--attr_top_n", type=int, default=100, help="Top-N samples to save")
+    parser.add_argument("--attr_checkpoint_every", type=int, default=1, help="Checkpoint frequency (epochs)")
+    parser.add_argument("--attr_out_dir", type=str, default=None, help="Output directory for attribution results")
     
     args = parser.parse_args()
     
@@ -649,7 +859,30 @@ def main():
     else:
         probe = LinearProbe(hidden_dim)
     
-    probe, best_val_auc = train_probe(probe, train_loader, val_loader, device, epochs=args.epochs, lr=args.lr)
+    # Attribution output dir
+    if args.attr_enable:
+        attr_out_dir = args.attr_out_dir or os.path.join(
+            "results/layer_agnostic_attribution",
+            model_dir,
+            args.dataset,
+            args.pooling
+        )
+        os.makedirs(attr_out_dir, exist_ok=True)
+    else:
+        attr_out_dir = None
+
+    checkpoint_dir = os.path.join(attr_out_dir, "checkpoints") if args.attr_enable else None
+
+    probe, best_val_auc, checkpoints = train_probe(
+        probe,
+        train_loader,
+        val_loader,
+        device,
+        epochs=args.epochs,
+        lr=args.lr,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_every=args.attr_checkpoint_every
+    )
     
     logger.info(f"\n✓ Training complete! Best Val AUC: {best_val_auc:.4f}")
     
@@ -705,6 +938,27 @@ def main():
         logger.info(f"\nBest OOD layer: {best_ood_layer} (AUC: {ood_results[best_ood_layer]['auc']:.4f})")
     else:
         logger.warning(f"OOD path not found: {ood_path}")
+
+    # ========================================================================
+    # 6. Attribution (Post-hoc)
+    # ========================================================================
+    if args.attr_enable and checkpoints:
+        w_star = _flatten_params(probe)
+        attr_train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False)
+        run_layer_agnostic_attribution(
+            model=probe,
+            checkpoints=checkpoints,
+            w_star=w_star,
+            train_loader=attr_train_loader,
+            attr_every_n=args.attr_every_n,
+            attr_top_n=args.attr_top_n,
+            attr_out_dir=attr_out_dir,
+            device=device,
+            val_path=val_eval_path if os.path.exists(val_eval_path) else train_path,
+            ood_path=ood_path if os.path.exists(ood_path) else None,
+            pooling=args.pooling,
+            n_layers=n_layers
+        )
     
     # ========================================================================
     # 6. Save Results
