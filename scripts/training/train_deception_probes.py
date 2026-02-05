@@ -725,7 +725,11 @@ def main():
         )
 
     # Get tensor shape and input format from first batch
-    sample_x, _ = next(iter(train_loader))
+    first_batch = next(iter(train_loader))
+    if len(first_batch) == 3:
+        sample_x, _, _ = first_batch
+    else:
+        sample_x, _ = first_batch
     input_format = train_dataset.input_format
     
     model_pooling_type = args.pooling
