@@ -33,6 +33,7 @@ import os
 import sys
 import glob
 import json
+import csv
 import torch
 import numpy as np
 import torch.nn as nn
@@ -69,16 +70,18 @@ class CachedDeceptionDataset(Dataset):
             └── manifest.jsonl
     """
 
-    def __init__(self, activations_dir: str, pool_before_batch: bool = False, pooling_type: str = "mean"):
+    def __init__(self, activations_dir: str, pool_before_batch: bool = False, pooling_type: str = "mean", return_ids: bool = False):
         """
         Args:
             activations_dir: Path to directory with shards and manifest
             pool_before_batch: If True, pool (L, T, D) -> (L, D) during load
             pooling_type: Pooling strategy for pre-batching ("mean", "max", "last")
+            return_ids: If True, __getitem__ returns (tensor, label, sample_id)
         """
         self.items = []
         self.pool_before_batch = pool_before_batch
         self.pooling_type = pooling_type
+        self.return_ids = return_ids
 
         # Find all shard files
         shard_pattern = os.path.join(activations_dir, "shard_*.safetensors")
@@ -168,6 +171,8 @@ class CachedDeceptionDataset(Dataset):
     def __getitem__(self, idx):
         item = self.items[idx]
         # Return tensor as float32 and label as float32 (for BCE loss)
+        if self.return_ids:
+            return item['tensor'].float(), torch.tensor(item['label'], dtype=torch.float32), item['id']
         return item['tensor'].float(), torch.tensor(item['label'], dtype=torch.float32)
 
 # ============================================================================
@@ -189,7 +194,11 @@ def evaluate(model, dataloader, device):
     targets = []
 
     with torch.no_grad():
-        for x, y in dataloader:
+        for batch in dataloader:
+            if len(batch) == 3:
+                x, y, _ = batch
+            else:
+                x, y = batch
             x = x.to(device)
             logits = model(x)
             probs = torch.sigmoid(logits).cpu().numpy()
@@ -213,7 +222,7 @@ def evaluate(model, dataloader, device):
 # Training
 # ============================================================================
 
-def train_probe(model, train_loader, val_loader, device, args):
+def train_probe(model, train_loader, val_loader, device, args, checkpoint_dir=None, checkpoint_every=1):
     """
     Train a single probe with early stopping.
 
@@ -239,6 +248,7 @@ def train_probe(model, train_loader, val_loader, device, args):
     best_epoch = 0
     patience_counter = 0
 
+    checkpoints = []
     for epoch in range(args.epochs):
         # Training
         model.train()
@@ -246,7 +256,11 @@ def train_probe(model, train_loader, val_loader, device, args):
         train_preds = []
         train_targets = []
 
-        for x, y in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False):
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False):
+            if len(batch) == 3:
+                x, y, _ = batch
+            else:
+                x, y = batch
             x = x.to(device)
             y = y.to(device)
 
@@ -280,6 +294,13 @@ def train_probe(model, train_loader, val_loader, device, args):
             f"Val Acc: {val_acc:.4f}"
         )
 
+        # Save checkpoint if requested
+        if checkpoint_dir and (epoch + 1) % checkpoint_every == 0:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch+1}.pt")
+            torch.save(model.state_dict(), ckpt_path)
+            checkpoints.append((epoch + 1, ckpt_path))
+
         # Early stopping
         if val_auc > best_val_auc:
             best_val_auc = val_auc
@@ -296,7 +317,189 @@ def train_probe(model, train_loader, val_loader, device, args):
 
     logger.info(f"✓ Best Val AUC: {best_val_auc:.4f} (epoch {best_epoch})")
 
-    return best_val_auc, best_epoch
+    return best_val_auc, best_epoch, checkpoints
+
+
+# ============================================================================
+# Attribution Helpers
+# ============================================================================
+
+def _flatten_params(model: nn.Module) -> torch.Tensor:
+    params = []
+    for p in model.parameters():
+        params.append(p.detach().flatten().cpu())
+    if not params:
+        return torch.empty(0)
+    return torch.cat(params)
+
+
+def _flatten_grads(model: nn.Module) -> torch.Tensor:
+    grads = []
+    for p in model.parameters():
+        if p.grad is None:
+            grads.append(torch.zeros_like(p).flatten().cpu())
+        else:
+            grads.append(p.grad.detach().flatten().cpu())
+    if not grads:
+        return torch.empty(0)
+    return torch.cat(grads)
+
+
+def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    if a.numel() == 0 or b.numel() == 0:
+        return 0.0
+    denom = (torch.norm(a) * torch.norm(b)).item()
+    if denom == 0:
+        return 0.0
+    return float(torch.dot(a, b) / denom)
+
+
+def _write_csv(path: str, header: list, rows: list):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def _compute_per_sample_grads(model, x, y, loss_fn):
+    """Return list of gradient vectors for each sample in batch."""
+    logits = model(x).squeeze(-1)
+    losses = loss_fn(logits, y)
+    grads = []
+    for i in range(len(losses)):
+        model.zero_grad(set_to_none=True)
+        losses[i].backward(retain_graph=True)
+        grads.append(_flatten_grads(model))
+    model.zero_grad(set_to_none=True)
+    return grads
+
+
+def run_attribution_for_layer(
+    layer_idx: int,
+    model: nn.Module,
+    checkpoints: list,
+    w_star: torch.Tensor,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    ood_loader: DataLoader,
+    attr_every_n: int,
+    attr_top_n: int,
+    attr_out_dir: str,
+    device: str,
+):
+    """
+    Post-hoc attribution and checkpoint eval for a single layer probe.
+    """
+    training_dynamics = []
+    checkpoint_metrics = []
+
+    sample_progress = {}
+    sample_influence = {}
+    layer_progress = {}
+    layer_influence = {}
+    layer_counts = {}
+
+    loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+
+    best_id_auc = -1.0
+    best_ood_auc = -1.0
+
+    for epoch, ckpt_path in checkpoints:
+        # Load checkpoint
+        state = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(state)
+        model.eval()
+
+        w_t = _flatten_params(model)
+        cos_to_final = _cosine(w_t, w_star)
+        w_norm = float(torch.norm(w_t).item()) if w_t.numel() else 0.0
+        training_dynamics.append([epoch, cos_to_final, w_norm])
+
+        # Checkpoint evaluation (ID + OOD)
+        id_auc, id_acc, _, _ = evaluate(model, val_loader, device)
+        best_id_auc = max(best_id_auc, id_auc)
+        checkpoint_metrics.append([epoch, "id", id_auc, id_acc, 1 if id_auc >= best_id_auc else 0])
+
+        if ood_loader is not None:
+            ood_auc, ood_acc, _, _ = evaluate(model, ood_loader, device)
+            best_ood_auc = max(best_ood_auc, ood_auc)
+            checkpoint_metrics.append([epoch, "ood", ood_auc, ood_acc, 1 if ood_auc >= best_ood_auc else 0])
+
+        # Attribution pass (subset of batches)
+        delta = w_star - w_t
+        for batch_idx, batch in enumerate(train_loader):
+            if attr_every_n > 1 and batch_idx % attr_every_n != 0:
+                continue
+            if len(batch) == 3:
+                x, y, ids = batch
+            else:
+                x, y = batch
+                ids = [f"idx_{batch_idx}_{i}" for i in range(len(y))]
+
+            x = x.to(device)
+            y = y.to(device)
+
+            grads = _compute_per_sample_grads(model, x, y, loss_fn)
+            for i, g in enumerate(grads):
+                sample_id = ids[i]
+                alignment = -_cosine(g, w_star)
+                influence = float(torch.dot(g, delta)) if g.numel() else 0.0
+
+                sample_progress[sample_id] = sample_progress.get(sample_id, 0.0) + alignment
+                sample_influence[sample_id] = sample_influence.get(sample_id, 0.0) + influence
+
+                layer_progress[layer_idx] = layer_progress.get(layer_idx, 0.0) + alignment
+                layer_influence[layer_idx] = layer_influence.get(layer_idx, 0.0) + influence
+                layer_counts[layer_idx] = layer_counts.get(layer_idx, 0) + 1
+
+    # Write outputs
+    _write_csv(
+        os.path.join(attr_out_dir, f"training_dynamics_layer_{layer_idx}.csv"),
+        ["epoch", "cos_to_final", "w_norm"],
+        training_dynamics
+    )
+    _write_csv(
+        os.path.join(attr_out_dir, f"checkpoint_metrics_layer_{layer_idx}.csv"),
+        ["epoch", "split", "auc", "acc", "best_so_far"],
+        checkpoint_metrics
+    )
+
+    # Layer progress/influence
+    layer_rows = []
+    for l, total in layer_progress.items():
+        count = max(layer_counts.get(l, 1), 1)
+        layer_rows.append([l, total / count, count])
+    _write_csv(
+        os.path.join(attr_out_dir, f"layer_progress_layer_{layer_idx}.csv"),
+        ["layer", "mean_grad_alignment", "count"],
+        layer_rows
+    )
+
+    layer_inf_rows = []
+    for l, total in layer_influence.items():
+        count = max(layer_counts.get(l, 1), 1)
+        layer_inf_rows.append([l, total / count, count])
+    _write_csv(
+        os.path.join(attr_out_dir, f"layer_influence_layer_{layer_idx}.csv"),
+        ["layer", "mean_influence", "count"],
+        layer_inf_rows
+    )
+
+    # Sample top-N
+    top_prog = sorted(sample_progress.items(), key=lambda x: abs(x[1]), reverse=True)[:attr_top_n]
+    _write_csv(
+        os.path.join(attr_out_dir, f"sample_progress_top{attr_top_n}_layer_{layer_idx}.csv"),
+        ["sample_id", "grad_alignment"],
+        [[sid, score] for sid, score in top_prog]
+    )
+
+    top_inf = sorted(sample_influence.items(), key=lambda x: abs(x[1]), reverse=True)[:attr_top_n]
+    _write_csv(
+        os.path.join(attr_out_dir, f"sample_influence_top{attr_top_n}_layer_{layer_idx}.csv"),
+        ["sample_id", "influence"],
+        [[sid, score] for sid, score in top_inf]
+    )
 
 # ============================================================================
 # Main
@@ -353,6 +556,15 @@ def main():
         action="store_true",
         help="Pool (L,T,D) -> (L,D) before batching (for raw variable-length activations)."
     )
+    # Attribution / checkpointing
+    parser.add_argument("--attr_enable", action="store_true", help="Enable attribution logging")
+    parser.add_argument("--attr_every_n", type=int, default=50, help="Batch interval for attribution aggregation")
+    parser.add_argument("--attr_top_n", type=int, default=100, help="Top-N samples to save")
+    parser.add_argument("--attr_checkpoint_every", type=int, default=1, help="Checkpoint frequency (epochs)")
+    parser.add_argument("--attr_out_dir", type=str, default=None, help="Output directory for attribution results")
+    parser.add_argument("--ood_dataset", type=str, default="Deception-InsiderTrading", help="OOD dataset for checkpoint eval")
+    parser.add_argument("--ood_split", type=str, default="test", help="OOD split for checkpoint eval")
+    parser.add_argument("--ood_activations_dir", type=str, default=None, help="Base activations dir for OOD (default: --activations_dir)")
     parser.add_argument(
         "--suffix_condition",
         type=str,
@@ -428,14 +640,16 @@ def main():
     train_dataset = CachedDeceptionDataset(
         train_dir,
         pool_before_batch=args.pool_before_batch,
-        pooling_type=args.pooling
+        pooling_type=args.pooling,
+        return_ids=args.attr_enable
     )
 
     if splits_exist['validation']:
         val_dataset = CachedDeceptionDataset(
             val_dir,
             pool_before_batch=args.pool_before_batch,
-            pooling_type=args.pooling
+            pooling_type=args.pooling,
+            return_ids=args.attr_enable
         )
     else:
         if args.split_train_for_test:
@@ -455,6 +669,7 @@ def main():
             val_dataset.input_format = train_dataset.input_format
             val_dataset.pool_before_batch = train_dataset.pool_before_batch
             val_dataset.pooling_type = train_dataset.pooling_type
+            val_dataset.return_ids = train_dataset.return_ids
             
             logger.info(f"  Train: {len(train_dataset)} | Val (split): {len(val_dataset)}")
         else:
@@ -465,11 +680,28 @@ def main():
         test_dataset = CachedDeceptionDataset(
             test_dir,
             pool_before_batch=args.pool_before_batch,
-            pooling_type=args.pooling
+            pooling_type=args.pooling,
+            return_ids=args.attr_enable
         )
     else:
         logger.warning("Test split not found")
         test_dataset = None
+
+    # Optional OOD dataset for checkpoint eval
+    ood_dataset = None
+    ood_dir = None
+    if args.attr_enable and args.ood_dataset:
+        ood_base = args.ood_activations_dir or args.activations_dir
+        ood_dir = os.path.join(ood_base, model_dir, args.ood_dataset, args.ood_split)
+        if os.path.exists(ood_dir):
+            ood_dataset = CachedDeceptionDataset(
+                ood_dir,
+                pool_before_batch=args.pool_before_batch,
+                pooling_type=args.pooling,
+                return_ids=args.attr_enable
+            )
+        else:
+            logger.warning(f"OOD activations not found: {ood_dir}")
 
     # Create dataloaders
     train_loader = DataLoader(
@@ -549,6 +781,18 @@ def main():
         )
     os.makedirs(output_dir, exist_ok=True)
 
+    # Attribution output directory
+    if args.attr_enable:
+        attr_out_dir = args.attr_out_dir or os.path.join(
+            "results/probe_attribution",
+            model_dir,
+            args.dataset,
+            args.pooling
+        )
+        os.makedirs(attr_out_dir, exist_ok=True)
+    else:
+        attr_out_dir = None
+
     # Check if probes already exist (skip if so, unless training single layer)
     results_path = os.path.join(output_dir, "layer_results.json")
     if args.layer is None and os.path.exists(results_path):
@@ -570,6 +814,9 @@ def main():
         logger.info(f"Training probe for layer {args.layer}...")
 
         args.output_model_path = os.path.join(output_dir, f"probe_layer_{args.layer}.pt")
+        attr_checkpoint_dir = None
+        if args.attr_enable:
+            attr_checkpoint_dir = os.path.join(attr_out_dir, "checkpoints", f"layer_{args.layer}")
 
         class LayerDataset(Dataset):
             def __init__(self, base_dataset, layer_idx):
@@ -580,7 +827,11 @@ def main():
                 return len(self.base)
 
             def __getitem__(self, idx):
-                x, y = self.base[idx]
+                item = self.base[idx]
+                if len(item) == 3:
+                    x, y, eid = item
+                    return x[self.layer_idx], y, eid
+                x, y = item
                 return x[self.layer_idx], y
 
         layer_train_dataset = LayerDataset(train_dataset, args.layer)
@@ -604,8 +855,14 @@ def main():
             pooling_type=model_pooling_type
         ).to(device)
 
-        best_val_auc, best_epoch = train_probe(
-            model, layer_train_loader, layer_val_loader, device, args
+        best_val_auc, best_epoch, checkpoints = train_probe(
+            model,
+            layer_train_loader,
+            layer_val_loader,
+            device,
+            args,
+            checkpoint_dir=attr_checkpoint_dir if args.attr_enable else None,
+            checkpoint_every=args.attr_checkpoint_every
         )
 
         # Test
@@ -621,6 +878,42 @@ def main():
             test_auc, test_acc, _, _ = evaluate(model, layer_test_loader, device)
             logger.info(f"Test AUC: {test_auc:.4f} | Test Acc: {test_acc:.4f}")
 
+        # Attribution + checkpoint eval
+        if args.attr_enable and checkpoints:
+            model.load_state_dict(torch.load(args.output_model_path))
+            w_star = _flatten_params(model)
+
+            attr_train_loader = DataLoader(
+                layer_train_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=0
+            )
+
+            layer_ood_loader = None
+            if ood_dataset is not None:
+                layer_ood_dataset = LayerDataset(ood_dataset, args.layer)
+                layer_ood_loader = DataLoader(
+                    layer_ood_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=0
+                )
+
+            run_attribution_for_layer(
+                layer_idx=args.layer,
+                model=model,
+                checkpoints=checkpoints,
+                w_star=w_star,
+                train_loader=attr_train_loader,
+                val_loader=layer_val_loader,
+                ood_loader=layer_ood_loader,
+                attr_every_n=args.attr_every_n,
+                attr_top_n=args.attr_top_n,
+                attr_out_dir=attr_out_dir,
+                device=device
+            )
+
     else:
         # Train on all layers
         logger.info(f"Training probes for all {L} layers...")
@@ -633,6 +926,9 @@ def main():
             logger.info(f"{'='*70}")
 
             args.output_model_path = os.path.join(output_dir, f"probe_layer_{layer_idx}.pt")
+            attr_checkpoint_dir = None
+            if args.attr_enable:
+                attr_checkpoint_dir = os.path.join(attr_out_dir, "checkpoints", f"layer_{layer_idx}")
 
             # Extract single layer from batch
             # Need to modify dataset to return single layer? Or slice in training loop?
@@ -654,7 +950,11 @@ def main():
                     return len(self.base)
 
                 def __getitem__(self, idx):
-                    x, y = self.base[idx]
+                    item = self.base[idx]
+                    if len(item) == 3:
+                        x, y, eid = item
+                        return x[self.layer_idx], y, eid
+                    x, y = item
                     return x[self.layer_idx], y  # Select layer
 
             layer_train_dataset = LayerDataset(train_dataset, layer_idx)
@@ -673,8 +973,14 @@ def main():
                 num_workers=0
             )
 
-            best_val_auc, best_epoch = train_probe(
-                model, layer_train_loader, layer_val_loader, device, args
+            best_val_auc, best_epoch, checkpoints = train_probe(
+                model,
+                layer_train_loader,
+                layer_val_loader,
+                device,
+                args,
+                checkpoint_dir=attr_checkpoint_dir if args.attr_enable else None,
+                checkpoint_every=args.attr_checkpoint_every
             )
 
             # Load best model and get final validation accuracy
@@ -687,6 +993,41 @@ def main():
                 'val_acc': best_val_acc,
                 'epoch': best_epoch
             })
+
+            # Attribution + checkpoint eval per layer
+            if args.attr_enable and checkpoints:
+                w_star = _flatten_params(model)
+
+                attr_train_loader = DataLoader(
+                    layer_train_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=0
+                )
+
+                layer_ood_loader = None
+                if ood_dataset is not None:
+                    layer_ood_dataset = LayerDataset(ood_dataset, layer_idx)
+                    layer_ood_loader = DataLoader(
+                        layer_ood_dataset,
+                        batch_size=args.batch_size,
+                        shuffle=False,
+                        num_workers=0
+                    )
+
+                run_attribution_for_layer(
+                    layer_idx=layer_idx,
+                    model=model,
+                    checkpoints=checkpoints,
+                    w_star=w_star,
+                    train_loader=attr_train_loader,
+                    val_loader=layer_val_loader,
+                    ood_loader=layer_ood_loader,
+                    attr_every_n=args.attr_every_n,
+                    attr_top_n=args.attr_top_n,
+                    attr_out_dir=attr_out_dir,
+                    device=device
+                )
 
         # Summary
         logger.info(f"\n{'='*70}")
@@ -701,6 +1042,14 @@ def main():
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2)
         logger.info(f"Saved results to {results_path}")
+
+        if args.attr_enable and attr_out_dir:
+            summary_rows = [[r['layer'], r['val_auc'], r['val_acc'], r['epoch']] for r in results]
+            _write_csv(
+                os.path.join(attr_out_dir, "summary.csv"),
+                ["layer", "val_auc", "val_acc", "epoch"],
+                summary_rows
+            )
 
         # Save best_probe.json for eval_ood.py
         best_probe_info = {
