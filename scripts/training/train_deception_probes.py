@@ -69,12 +69,16 @@ class CachedDeceptionDataset(Dataset):
             └── manifest.jsonl
     """
 
-    def __init__(self, activations_dir: str):
+    def __init__(self, activations_dir: str, pool_before_batch: bool = False, pooling_type: str = "mean"):
         """
         Args:
             activations_dir: Path to directory with shards and manifest
+            pool_before_batch: If True, pool (L, T, D) -> (L, D) during load
+            pooling_type: Pooling strategy for pre-batching ("mean", "max", "last")
         """
         self.items = []
+        self.pool_before_batch = pool_before_batch
+        self.pooling_type = pooling_type
 
         # Find all shard files
         shard_pattern = os.path.join(activations_dir, "shard_*.safetensors")
@@ -117,6 +121,16 @@ class CachedDeceptionDataset(Dataset):
                     # Skip unknown labels
                     if label == -1:
                         continue
+
+                    if self.pool_before_batch and len(tensor.shape) == 3:
+                        if self.pooling_type == "mean":
+                            tensor = tensor.mean(dim=1)
+                        elif self.pooling_type == "max":
+                            tensor = tensor.max(dim=1).values
+                        elif self.pooling_type == "last":
+                            tensor = tensor[:, -1, :]
+                        else:
+                            raise ValueError(f"pool_before_batch does not support pooling '{self.pooling_type}'")
 
                     self.items.append({
                         "id": eid,
@@ -335,6 +349,11 @@ def main():
         help="Input format: 'pooled' (L,T,D), 'final_token' (L,D), or 'auto' to detect"
     )
     parser.add_argument(
+        "--pool_before_batch",
+        action="store_true",
+        help="Pool (L,T,D) -> (L,D) before batching (for raw variable-length activations)."
+    )
+    parser.add_argument(
         "--suffix_condition",
         type=str,
         default=None,
@@ -401,11 +420,23 @@ def main():
         logger.error(f"Training data not found! Run cache_deception_activations.py first.")
         return 1
 
+    if args.pool_before_batch and args.pooling == "attn":
+        logger.error("--pool_before_batch does not support pooling 'attn' (requires token dimension).")
+        return 1
+
     # Load datasets
-    train_dataset = CachedDeceptionDataset(train_dir)
+    train_dataset = CachedDeceptionDataset(
+        train_dir,
+        pool_before_batch=args.pool_before_batch,
+        pooling_type=args.pooling
+    )
 
     if splits_exist['validation']:
-        val_dataset = CachedDeceptionDataset(val_dir)
+        val_dataset = CachedDeceptionDataset(
+            val_dir,
+            pool_before_batch=args.pool_before_batch,
+            pooling_type=args.pooling
+        )
     else:
         if args.split_train_for_test:
             logger.warning("Validation split not found. splitting 20% from TRAIN.")
@@ -422,6 +453,8 @@ def main():
             val_dataset = CachedDeceptionDataset.__new__(CachedDeceptionDataset)
             val_dataset.items = val_items
             val_dataset.input_format = train_dataset.input_format
+            val_dataset.pool_before_batch = train_dataset.pool_before_batch
+            val_dataset.pooling_type = train_dataset.pooling_type
             
             logger.info(f"  Train: {len(train_dataset)} | Val (split): {len(val_dataset)}")
         else:
@@ -429,7 +462,11 @@ def main():
             val_dataset = train_dataset
 
     if splits_exist['test']:
-        test_dataset = CachedDeceptionDataset(test_dir)
+        test_dataset = CachedDeceptionDataset(
+            test_dir,
+            pool_before_batch=args.pool_before_batch,
+            pooling_type=args.pooling
+        )
     else:
         logger.warning("Test split not found")
         test_dataset = None
@@ -459,20 +496,25 @@ def main():
     sample_x, _ = next(iter(train_loader))
     input_format = train_dataset.input_format
     
-    if input_format == 'final_token':
+    model_pooling_type = args.pooling
+    if input_format == 'final_token' or args.pool_before_batch:
         # (B, L, D)
         L, D = sample_x.shape[1], sample_x.shape[2]
         T = 1  # No token dimension
         logger.info(f"\nTensor shape: (batch, {L} layers, {D} dim) - final_token format")
         
         # Force pooling to 'none' for final_token format
-        if args.pooling not in ['none', 'last']:
+        if not args.pool_before_batch and args.pooling not in ['none', 'last']:
             logger.warning(f"Overriding pooling '{args.pooling}' -> 'none' for final_token format")
-            args.pooling = 'none'
+            model_pooling_type = 'none'
     else:
         # (B, L, T, D)
         L, T, D = sample_x.shape[1], sample_x.shape[2], sample_x.shape[3]
         logger.info(f"\nTensor shape: (batch, {L} layers, {T} tokens, {D} dim) - pooled format")
+
+    if args.pool_before_batch:
+        model_pooling_type = 'none'
+        logger.info("Pooling before batch: dataset returns pre-pooled (L, D); using IdentityPooling in model.")
 
     # ========================================================================
     # Training
@@ -529,19 +571,54 @@ def main():
 
         args.output_model_path = os.path.join(output_dir, f"probe_layer_{args.layer}.pt")
 
+        class LayerDataset(Dataset):
+            def __init__(self, base_dataset, layer_idx):
+                self.base = base_dataset
+                self.layer_idx = layer_idx
+
+            def __len__(self):
+                return len(self.base)
+
+            def __getitem__(self, idx):
+                x, y = self.base[idx]
+                return x[self.layer_idx], y
+
+        layer_train_dataset = LayerDataset(train_dataset, args.layer)
+        layer_val_dataset = LayerDataset(val_dataset, args.layer)
+
+        layer_train_loader = DataLoader(
+            layer_train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0
+        )
+        layer_val_loader = DataLoader(
+            layer_val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0
+        )
+
         model = LayerProbe(
             input_dim=D,
-            pooling_type=args.pooling
+            pooling_type=model_pooling_type
         ).to(device)
 
         best_val_auc, best_epoch = train_probe(
-            model, train_loader, val_loader, device, args
+            model, layer_train_loader, layer_val_loader, device, args
         )
 
         # Test
         if test_dataset:
             model.load_state_dict(torch.load(args.output_model_path))
-            test_auc, test_acc, _, _ = evaluate(model, test_loader, device)
+            layer_test_dataset = LayerDataset(test_dataset, args.layer)
+            layer_test_loader = DataLoader(
+                layer_test_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=0
+            )
+            test_auc, test_acc, _, _ = evaluate(model, layer_test_loader, device)
             logger.info(f"Test AUC: {test_auc:.4f} | Test Acc: {test_acc:.4f}")
 
     else:
@@ -563,7 +640,7 @@ def main():
 
             model = LayerProbe(
                 input_dim=D,
-                pooling_type=args.pooling
+                pooling_type=model_pooling_type
             ).to(device)
 
             # Create dataloaders that select specific layer
@@ -633,6 +710,8 @@ def main():
             'best_epoch': best_layer['epoch'],
             'probe_path': os.path.join(output_dir, f"probe_layer_{best_layer['layer']}.pt"),
             'pooling': args.pooling,
+            'pool_before_batch': args.pool_before_batch,
+            'model_pooling_type': model_pooling_type,
             'model': args.model,
             'dataset': args.dataset,
             'suffix_condition': args.suffix_condition if hasattr(args, 'suffix_condition') else None,

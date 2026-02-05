@@ -51,6 +51,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
+# Utilities
+# ============================================================================
+
+def infer_num_layers(activations_dir: str) -> int:
+    """Infer number of layers from the first shard in an activations directory."""
+    shard_pattern = os.path.join(activations_dir, "shard_*.safetensors")
+    shards = sorted(glob.glob(shard_pattern))
+    if not shards:
+        raise FileNotFoundError(f"No shard files found for layer inference: {shard_pattern}")
+    tensors = load_file(shards[0])
+    if not tensors:
+        raise ValueError(f"Empty shard file: {shards[0]}")
+    first_tensor = next(iter(tensors.values()))
+    return int(first_tensor.shape[0])
+
+# ============================================================================
 # Dataset: Load (L, T, D) activations and flatten to (L*N, D) for training
 # ============================================================================
 
@@ -562,6 +578,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     parser.add_argument("--split_train_for_val", action="store_true", help="Use 80/20 split of train for validation")
+    parser.add_argument("--n_layers", type=int, default=None, help="Override number of layers (auto-detect if not set)")
     
     args = parser.parse_args()
     
@@ -640,9 +657,18 @@ def main():
     # 4. Evaluate Per-Layer on ID Validation
     # ========================================================================
     
-    n_layers = 28  # Default for Llama-3B
-    
     val_eval_path = os.path.join(args.activations_dir, model_dir, args.dataset, args.val_split)
+
+    # Infer number of layers if not provided
+    n_layers = args.n_layers
+    if n_layers is None:
+        infer_dir = val_eval_path if os.path.exists(val_eval_path) else train_path
+        try:
+            n_layers = infer_num_layers(infer_dir)
+            logger.info(f"Inferred n_layers={n_layers} from {infer_dir}")
+        except Exception as e:
+            n_layers = 28
+            logger.warning(f"Failed to infer n_layers ({e}); defaulting to {n_layers}")
     if os.path.exists(val_eval_path):
         id_results = evaluate_per_layer(probe, val_eval_path, args.pooling, device, n_layers)
     else:
