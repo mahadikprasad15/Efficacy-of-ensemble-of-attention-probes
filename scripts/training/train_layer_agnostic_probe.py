@@ -843,7 +843,11 @@ def main():
     # ========================================================================
     
     # Get hidden dim from first batch
-    sample_x, _, _ = next(iter(train_loader))
+    first_batch = next(iter(train_loader))
+    if len(first_batch) == 4:
+        sample_x, _, _, _ = first_batch
+    else:
+        sample_x, _, _ = first_batch
     hidden_dim = sample_x.shape[-1]
     
     logger.info(f"\n{'='*70}")
