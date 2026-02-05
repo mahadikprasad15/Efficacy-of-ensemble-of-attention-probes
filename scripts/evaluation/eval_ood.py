@@ -56,8 +56,10 @@ logger = logging.getLogger(__name__)
 class CachedDeceptionDataset(Dataset):
     """Load cached activations from safetensors shards + manifest"""
 
-    def __init__(self, activations_dir: str):
+    def __init__(self, activations_dir: str, pool_before_batch: bool = False, pooling_type: str = "mean"):
         self.items = []
+        self.pool_before_batch = pool_before_batch
+        self.pooling_type = pooling_type
 
         shard_pattern = os.path.join(activations_dir, "shard_*.safetensors")
         shards = sorted(glob.glob(shard_pattern))
@@ -91,6 +93,16 @@ class CachedDeceptionDataset(Dataset):
 
                     if label == -1:
                         continue  # Skip unknown labels
+
+                    if self.pool_before_batch and len(tensor.shape) == 3:
+                        if self.pooling_type == "mean":
+                            tensor = tensor.mean(dim=1)
+                        elif self.pooling_type == "max":
+                            tensor = tensor.max(dim=1).values
+                        elif self.pooling_type == "last":
+                            tensor = tensor[:, -1, :]
+                        else:
+                            raise ValueError(f"pool_before_batch does not support pooling '{self.pooling_type}'")
 
                     self.items.append({
                         "id": eid,
@@ -267,6 +279,11 @@ def main():
         default=None,
         help="Suffix condition subdirectory (e.g., suffix_deception_yesno) for prompted activations"
     )
+    parser.add_argument(
+        "--pool_before_batch",
+        action="store_true",
+        help="Pool (L,T,D) -> (L,D) before batching (for raw activations)"
+    )
 
     args = parser.parse_args()
 
@@ -309,6 +326,15 @@ def main():
     
     sorted_layers = sorted(probes_by_layer.keys())
     logger.info(f"Found {len(sorted_layers)} trained probes (Layers {min(sorted_layers)} to {max(sorted_layers)})")
+
+    # Infer pooling from directory name (usually the parent folder name)
+    pooling = os.path.basename(probe_dir)
+    pooling_original = pooling
+    logger.info(f"Inferring pooling from directory: {pooling}")
+
+    if args.pool_before_batch and pooling_original == "attn":
+        logger.error("--pool_before_batch does not support pooling 'attn' (requires token dimension).")
+        return 1
     
     # ========================================================================
     # 2. Load evaluation dataset
@@ -357,7 +383,11 @@ def main():
         return 1
 
     # Load dataset
-    eval_dataset = CachedDeceptionDataset(eval_dir)
+    eval_dataset = CachedDeceptionDataset(
+        eval_dir,
+        pool_before_batch=args.pool_before_batch,
+        pooling_type=pooling_original
+    )
 
     # Helper class for layer extraction
     class LayerDataset(Dataset):
@@ -376,10 +406,6 @@ def main():
     # 3. Evaluate All Layers
     # ========================================================================
 
-    # Infer pooling from directory name (usually the parent folder name)
-    pooling = os.path.basename(probe_dir)
-    logger.info(f"Inferring pooling from directory: {pooling}")
-
     # Determine dimensions from dataset
     input_format = eval_dataset.input_format
     
@@ -387,10 +413,13 @@ def main():
     sample_x = eval_dataset.items[0]['tensor']
     D = sample_x.shape[-1]
     
-    # Override pooling for final_token format
-    if input_format == 'final_token' and pooling not in ['none', 'last']:
+    # Override pooling for final_token format or pre-pooled data
+    model_pooling_type = pooling
+    if args.pool_before_batch:
+        model_pooling_type = 'none'
+    elif input_format == 'final_token' and pooling not in ['none', 'last']:
         logger.warning(f"Input is final_token format but probe dir is {pooling}. Overriding to 'none'.")
-        pooling = 'none'
+        model_pooling_type = 'none'
 
     logger.info(f"Starting evaluation of {len(sorted_layers)} layers...")
     
@@ -405,7 +434,7 @@ def main():
         
         # Load probe
         probe_path = probes_by_layer[layer_idx]
-        model = LayerProbe(input_dim=D, pooling_type=pooling).to(device)
+        model = LayerProbe(input_dim=D, pooling_type=model_pooling_type).to(device)
         model.load_state_dict(torch.load(probe_path, map_location=device))
         
         # Eval

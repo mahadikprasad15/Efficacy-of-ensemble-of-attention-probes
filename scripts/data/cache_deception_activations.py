@@ -43,6 +43,7 @@ import json
 import torch
 import logging
 import time
+import copy
 from tqdm import tqdm
 from safetensors.torch import save_file
 
@@ -300,6 +301,27 @@ def main():
         default="data/activations",
         help="Output directory for cached activations"
     )
+    parser.add_argument(
+        "--save_raw",
+        action="store_true",
+        help="Also save raw (variable-length) activations"
+    )
+    parser.add_argument(
+        "--skip_resampled",
+        action="store_true",
+        help="Skip saving resampled activations (raw-only mode)"
+    )
+    parser.add_argument(
+        "--raw_output_dir",
+        type=str,
+        default="data/activations_raw",
+        help="Output directory for raw activations (if --save_raw)"
+    )
+    parser.add_argument(
+        "--include_prompt_tokens",
+        action="store_true",
+        help="Include prompt tokens in activations (prompt+completion). Default is completion-only."
+    )
 
     # Labeling configuration
     parser.add_argument(
@@ -342,6 +364,11 @@ def main():
         action="store_true",
         help="Use pre-generated responses from the dataset (skips model generation & labeling)"
     )
+    parser.add_argument(
+        "--use_gold_completions",
+        action="store_true",
+        help="Use Roleplaying honest/deceptive completions from YAML (skips generation & labeling)"
+    )
 
     args = parser.parse_args()
 
@@ -353,6 +380,9 @@ def main():
     logger.info(f"Dataset: {args.dataset} ({args.split})")
     logger.info(f"Target shape: ({args.L_prime}, {args.T_prime}, D)")
     logger.info(f"Batch size: {args.batch_size}")
+    logger.info(f"Include prompt tokens: {args.include_prompt_tokens}")
+    logger.info(f"Save raw activations: {args.save_raw}")
+    logger.info(f"Skip resampled: {args.skip_resampled}")
     if args.limit:
         logger.info(f"Limit: {args.limit} examples")
     logger.info(f"{'='*70}\n")
@@ -365,6 +395,11 @@ def main():
     DSClass = DATASET_MAP[args.dataset]
     ds = DSClass(split=args.split, limit=args.limit)
     ds.load_data()
+
+    # Validate gold completion usage
+    if args.use_gold_completions and args.dataset != "Deception-Roleplaying":
+        logger.error("--use_gold_completions is only supported for Deception-Roleplaying")
+        return 1
     
     # Check if dataset has pre-generated responses (auto-detect or use flag)
     has_pregenerated = False
@@ -374,6 +409,11 @@ def main():
             has_pregenerated = True
             logger.info("  📌 Detected pre-generated responses with labels in dataset")
     
+    # If using gold completions, treat as pre-generated (no Cerebras labeling)
+    if args.use_gold_completions:
+        args.use_pregenerated = True
+        logger.info("  📌 Using gold paired completions from Roleplaying YAML (no Cerebras)")
+
     if args.use_pregenerated or has_pregenerated:
         args.use_pregenerated = True
         logger.info(f"✓ Loaded {len(ds)} examples WITH pre-generated responses & labels\n")
@@ -381,6 +421,42 @@ def main():
         logger.info("  ℹ️  Using Apollo Research's pre-classified labels")
     else:
         logger.info(f"✓ Loaded {len(ds)} examples (prompts only, no labels yet)\n")
+
+    # Expand Roleplaying into gold honest/deceptive completions if requested
+    if args.use_gold_completions:
+        expanded_items = []
+        for item in ds:
+            prompt = item['prompt']
+            meta = item['metadata']
+            base_id = meta.get('id', 'roleplaying')
+
+            honest = meta.get('honest_reference', '')
+            deceptive = meta.get('deceptive_reference', '')
+
+            # Honest sample
+            meta_h = copy.deepcopy(meta)
+            meta_h['id'] = f"{base_id}_honest"
+            expanded_items.append({
+                'prompt': prompt,
+                'completion': honest,
+                'gold_label': 0,
+                'metadata': meta_h
+            })
+
+            # Deceptive sample
+            meta_d = copy.deepcopy(meta)
+            meta_d['id'] = f"{base_id}_deceptive"
+            expanded_items.append({
+                'prompt': prompt,
+                'completion': deceptive,
+                'gold_label': 1,
+                'metadata': meta_d
+            })
+
+        items = expanded_items
+        logger.info(f"✓ Expanded Roleplaying to {len(items)} gold-labeled samples (honest+deceptive)")
+    else:
+        items = list(ds)
 
     # ========================================================================
     # 2. Setup Generation Model
@@ -395,7 +471,7 @@ def main():
     # ========================================================================
 
     labeler = None
-    if not args.use_pregenerated:
+    if not args.use_pregenerated and not args.use_gold_completions:
         logger.info(f"[3/6] Initializing Cerebras labeler ({args.labeling_model})...")
         try:
             cerebras_gen = CerebrasGenerator(
@@ -429,22 +505,54 @@ def main():
     manifest_path = os.path.join(save_dir, "manifest.jsonl")
     logger.info(f"[4/6] Output directory: {save_dir}\n")
 
+    if args.skip_resampled and not args.save_raw:
+        logger.error("--skip_resampled requires --save_raw (otherwise nothing is saved)")
+        return 1
+
+    raw_save_dir = None
+    raw_manifest_path = None
+    if args.save_raw:
+        raw_save_dir = os.path.join(
+            args.raw_output_dir,
+            args.model.replace("/", "_"),
+            args.dataset,
+            args.split
+        )
+        os.makedirs(raw_save_dir, exist_ok=True)
+        raw_manifest_path = os.path.join(raw_save_dir, "manifest.jsonl")
+        logger.info(f"[4/6] Raw output directory: {raw_save_dir}\n")
+
     # Check if activations already exist (skip if so, unless --force)
-    if not args.force and os.path.exists(manifest_path):
-        import glob
-        existing_shards = glob.glob(os.path.join(save_dir, "shard_*.safetensors"))
-        if existing_shards:
-            logger.info(f"⚠️  Activations already exist in {save_dir}")
-            logger.info(f"   Found {len(existing_shards)} shard(s) and manifest.jsonl")
-            logger.info(f"   Skipping generation to avoid overwriting existing data.")
-            logger.info(f"   To regenerate, use --force flag or delete the directory.")
-            return 0
+    import glob
+    existing_shards = glob.glob(os.path.join(save_dir, "shard_*.safetensors"))
+    resampled_exists = os.path.exists(manifest_path) and len(existing_shards) > 0
 
-    if args.force and os.path.exists(manifest_path):
-        logger.info(f"ℹ️  --force flag set: Will overwrite existing activations in {save_dir}")
+    raw_exists = False
+    if args.save_raw and raw_save_dir:
+        raw_shards = glob.glob(os.path.join(raw_save_dir, "shard_*.safetensors"))
+        raw_exists = os.path.exists(raw_manifest_path) and len(raw_shards) > 0
 
-    # Open manifest file for writing
-    manifest_file = open(manifest_path, "w")
+    write_resampled = not args.skip_resampled
+    write_raw = args.save_raw
+
+    if not args.force:
+        if resampled_exists:
+            write_resampled = False
+        if args.save_raw and raw_exists:
+            write_raw = False
+
+    if not write_resampled and not write_raw:
+        logger.info(f"⚠️  Activations already exist in {save_dir}" + (f" and {raw_save_dir}" if args.save_raw else ""))
+        logger.info(f"   Skipping generation to avoid overwriting existing data.")
+        logger.info(f"   To regenerate, use --force flag or delete the directory.")
+        return 0
+
+    if args.force and (resampled_exists or raw_exists):
+        logger.info(f"ℹ️  --force flag set: Will overwrite existing activations.")
+
+    # Open manifest files for writing (only if we will write that format)
+    manifest_file = open(manifest_path, "w") if write_resampled else None
+    raw_manifest_file = open(raw_manifest_path, "w") if write_raw else None
 
     # ========================================================================
     # 5. Processing Loop
@@ -456,8 +564,10 @@ def main():
     batch_prompts = []
     batch_items = []
 
-    shard_idx = 0
-    buffer_tensors = {}  # id -> tensor
+    shard_idx_resampled = 0
+    shard_idx_raw = 0
+    buffer_tensors_resampled = {}  # id -> tensor
+    buffer_tensors_raw = {}  # id -> tensor
     processed_samples = 0
     label_stats = {"honest": 0, "deceptive": 0, "unknown": 0}
 
@@ -465,13 +575,13 @@ def main():
 
     # Progress bar
     pbar = tqdm(
-        total=len(ds),
+        total=len(items),
         desc=f"Processing {args.dataset}",
         unit="sample",
         ncols=100
     )
 
-    for i, item in enumerate(ds):
+    for i, item in enumerate(items):
         batch_prompts.append(item['prompt'])
         batch_items.append(item)
 
@@ -481,7 +591,40 @@ def main():
                 # ============================================================
                 # MODE A: Pre-generated responses (Apollo Insider Trading)
                 # ============================================================
-                if args.use_pregenerated:
+                if args.use_gold_completions:
+                    # Use gold completions from Roleplaying YAML
+                    completions = []
+                    labels_from_dataset = []
+
+                    for bi in batch_items:
+                        completion = bi.get('completion', '')
+                        label = bi.get('gold_label', -1)
+                        completions.append(completion)
+                        labels_from_dataset.append(label)
+
+                    full_texts = [p + c for p, c in zip(batch_prompts, completions)]
+
+                    if args.include_prompt_tokens:
+                        raw_activations = runner.get_activations(full_texts)
+                    else:
+                        prompt_end_indices = []
+                        for prompt in batch_prompts:
+                            prompt_tokens = runner.tokenizer(prompt, return_tensors="pt").input_ids
+                            prompt_end_indices.append(prompt_tokens.shape[1])
+                        raw_activations = runner.get_activations(full_texts, prompt_end_indices=prompt_end_indices)
+
+                    labeled_items = []
+                    for j, (completion, label) in enumerate(zip(completions, labels_from_dataset)):
+                        labeled_items.append({
+                            'completion': completion,
+                            'label': label,
+                            'metadata': batch_items[j]['metadata']
+                        })
+
+                # ============================================================
+                # MODE A: Pre-generated responses (Apollo Insider Trading)
+                # ============================================================
+                elif args.use_pregenerated:
                     # Use pre-generated completions and labels from dataset
                     completions = []
                     labels_from_dataset = []
@@ -508,8 +651,11 @@ def main():
                         prompt_tokens = runner.tokenizer(prompt, return_tensors="pt").input_ids
                         prompt_end_indices.append(prompt_tokens.shape[1])
                     
-                    # Get activations, slicing to only completion tokens
-                    raw_activations = runner.get_activations(full_texts, prompt_end_indices=prompt_end_indices)
+                    if args.include_prompt_tokens:
+                        raw_activations = runner.get_activations(full_texts)
+                    else:
+                        # Get activations, slicing to only completion tokens
+                        raw_activations = runner.get_activations(full_texts, prompt_end_indices=prompt_end_indices)
                     
                     # Create labeled items (no Cerebras needed)
                     labeled_items = []
@@ -529,6 +675,11 @@ def main():
                         batch_prompts,
                         max_new_tokens=args.max_new_tokens
                     )
+
+                    # If we want prompt+completion activations, re-run forward pass on full text
+                    if args.include_prompt_tokens:
+                        full_texts = [p + c for p, c in zip(batch_prompts, completions)]
+                        raw_activations = runner.get_activations(full_texts)
 
                     # STEP B: Label completions using Cerebras LLM judge
                     items_to_label = []
@@ -574,32 +725,50 @@ def main():
                     # Resample activations to fixed size
                     # Input: (L, T_variable, D)
                     # Output: (L_prime, T_prime, D)
-                    resampled = resample_activations(
-                        raw_tensor,
-                        target_L=args.L_prime,
-                        target_T=args.T_prime
-                    )
+                    resampled = None
+                    if write_resampled:
+                        resampled = resample_activations(
+                            raw_tensor,
+                            target_L=args.L_prime,
+                            target_T=args.T_prime
+                        )
 
-                    if resampled is None:
-                        logger.warning(f"Skipping: resampling failed")
-                        continue
+                        if resampled is None:
+                            logger.warning(f"Skipping: resampling failed")
+                            continue
 
-                    # Store tensor in buffer
+                    # Store tensors in buffers
                     eid = batch_items[j]['metadata']['id']
-                    buffer_tensors[eid] = resampled
+                    if write_resampled and resampled is not None:
+                        buffer_tensors_resampled[eid] = resampled
+                    if write_raw:
+                        buffer_tensors_raw[eid] = raw_tensor
 
-                    # Write to manifest
-                    meta = {
-                        "id": eid,
-                        "generated_text": completion,
-                        "label": label,  # 0=honest, 1=deceptive
-                        "generation_length": original_gen_length,
-                        "shard": shard_idx,
-                        # Store truncated scenario for reference
-                        "scenario": batch_items[j]['metadata']['scenario'][:150] + "..."
-                    }
-                    manifest_file.write(json.dumps(meta) + "\n")
-                    manifest_file.flush()  # Ensure immediate write (important for Colab)
+                    # Write to manifests
+                    if manifest_file:
+                        meta = {
+                            "id": eid,
+                            "generated_text": completion,
+                            "label": label,  # 0=honest, 1=deceptive
+                            "generation_length": original_gen_length,
+                            "shard": shard_idx_resampled,
+                            # Store truncated scenario for reference
+                            "scenario": batch_items[j]['metadata']['scenario'][:150] + "..."
+                        }
+                        manifest_file.write(json.dumps(meta) + "\n")
+                        manifest_file.flush()  # Ensure immediate write (important for Colab)
+
+                    if raw_manifest_file:
+                        meta_raw = {
+                            "id": eid,
+                            "generated_text": completion,
+                            "label": label,  # 0=honest, 1=deceptive
+                            "generation_length": original_gen_length,
+                            "shard": shard_idx_raw,
+                            "scenario": batch_items[j]['metadata']['scenario'][:150] + "..."
+                        }
+                        raw_manifest_file.write(json.dumps(meta_raw) + "\n")
+                        raw_manifest_file.flush()
                     processed_samples += 1
 
                 # Update progress bar
@@ -608,7 +777,7 @@ def main():
                     "H": label_stats["honest"],
                     "D": label_stats["deceptive"],
                     "U": label_stats["unknown"],
-                    "shard": shard_idx
+                    "shard": shard_idx_resampled if write_resampled else shard_idx_raw
                 })
 
             except Exception as e:
@@ -621,28 +790,52 @@ def main():
             # Flush buffer to shard when full or at end
             # ============================================================
 
-            if len(buffer_tensors) >= SHARD_SIZE or i == len(ds) - 1:
-                if len(buffer_tensors) > 0:
-                    shard_name = f"shard_{shard_idx:03d}.safetensors"
+            should_flush = (
+                (write_resampled and len(buffer_tensors_resampled) >= SHARD_SIZE) or
+                (write_raw and len(buffer_tensors_raw) >= SHARD_SIZE) or
+                i == len(items) - 1
+            )
+
+            if should_flush:
+                if write_resampled and len(buffer_tensors_resampled) > 0:
+                    shard_name = f"shard_{shard_idx_resampled:03d}.safetensors"
                     shard_path = os.path.join(save_dir, shard_name)
 
                     try:
-                        save_file(buffer_tensors, shard_path)
+                        save_file(buffer_tensors_resampled, shard_path)
                         logger.info(
-                            f"✓ Saved {shard_name} with {len(buffer_tensors)} tensors"
+                            f"✓ Saved {shard_name} with {len(buffer_tensors_resampled)} tensors"
                         )
                     except Exception as e:
                         logger.error(f"Failed to save shard: {e}")
 
-                    buffer_tensors = {}
-                    shard_idx += 1
+                    buffer_tensors_resampled = {}
+                    shard_idx_resampled += 1
+
+                if write_raw and len(buffer_tensors_raw) > 0:
+                    shard_name = f"shard_{shard_idx_raw:03d}.safetensors"
+                    shard_path = os.path.join(raw_save_dir, shard_name)
+
+                    try:
+                        save_file(buffer_tensors_raw, shard_path)
+                        logger.info(
+                            f"✓ Saved RAW {shard_name} with {len(buffer_tensors_raw)} tensors"
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to save raw shard: {e}")
+
+                    buffer_tensors_raw = {}
+                    shard_idx_raw += 1
 
             # Reset batch
             batch_prompts = []
             batch_items = []
 
     pbar.close()
-    manifest_file.close()
+    if manifest_file:
+        manifest_file.close()
+    if raw_manifest_file:
+        raw_manifest_file.close()
 
     # ========================================================================
     # 6. Summary
@@ -655,9 +848,14 @@ def main():
     logger.info(f"  • Honest: {label_stats['honest']} ({100*label_stats['honest']/max(processed_samples,1):.1f}%)")
     logger.info(f"  • Deceptive: {label_stats['deceptive']} ({100*label_stats['deceptive']/max(processed_samples,1):.1f}%)")
     logger.info(f"  • Unknown/Failed: {label_stats['unknown']}")
-    logger.info(f"Shards created: {shard_idx}")
-    logger.info(f"Output directory: {save_dir}")
-    logger.info(f"Manifest: {manifest_path}")
+    if write_resampled:
+        logger.info(f"Shards created (resampled): {shard_idx_resampled}")
+        logger.info(f"Output directory: {save_dir}")
+        logger.info(f"Manifest: {manifest_path}")
+    if write_raw:
+        logger.info(f"Shards created (raw): {shard_idx_raw}")
+        logger.info(f"Raw output directory: {raw_save_dir}")
+        logger.info(f"Raw manifest: {raw_manifest_path}")
     logger.info(f"{'='*70}\n")
 
     # Data quality check
