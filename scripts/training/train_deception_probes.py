@@ -34,6 +34,7 @@ import sys
 import glob
 import json
 import csv
+import re
 import torch
 import numpy as np
 import torch.nn as nn
@@ -502,6 +503,35 @@ def run_attribution_for_layer(
         [[sid, score] for sid, score in top_inf]
     )
 
+
+def _attr_layer_file_paths(attr_out_dir: str, layer_idx: int, attr_top_n: int):
+    return [
+        os.path.join(attr_out_dir, f"training_dynamics_layer_{layer_idx}.csv"),
+        os.path.join(attr_out_dir, f"checkpoint_metrics_layer_{layer_idx}.csv"),
+        os.path.join(attr_out_dir, f"layer_progress_layer_{layer_idx}.csv"),
+        os.path.join(attr_out_dir, f"layer_influence_layer_{layer_idx}.csv"),
+        os.path.join(attr_out_dir, f"sample_progress_top{attr_top_n}_layer_{layer_idx}.csv"),
+        os.path.join(attr_out_dir, f"sample_influence_top{attr_top_n}_layer_{layer_idx}.csv"),
+    ]
+
+
+def _is_attr_layer_complete(attr_out_dir: str, layer_idx: int, attr_top_n: int) -> bool:
+    paths = _attr_layer_file_paths(attr_out_dir, layer_idx, attr_top_n)
+    return all(os.path.exists(p) and os.path.getsize(p) > 0 for p in paths)
+
+
+def _load_saved_checkpoints(checkpoint_dir: str):
+    if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+        return []
+    checkpoints = []
+    for ckpt_path in glob.glob(os.path.join(checkpoint_dir, "epoch_*.pt")):
+        m = re.search(r"epoch_(\d+)\.pt$", ckpt_path)
+        if not m:
+            continue
+        checkpoints.append((int(m.group(1)), ckpt_path))
+    checkpoints.sort(key=lambda x: x[0])
+    return checkpoints
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -566,6 +596,11 @@ def main():
     parser.add_argument("--ood_dataset", type=str, default="Deception-InsiderTrading", help="OOD dataset for checkpoint eval")
     parser.add_argument("--ood_split", type=str, default="test", help="OOD split for checkpoint eval")
     parser.add_argument("--ood_activations_dir", type=str, default=None, help="Base activations dir for OOD (default: --activations_dir)")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume interrupted runs: skip completed layers and recover attribution from saved checkpoints."
+    )
     parser.add_argument(
         "--suffix_condition",
         type=str,
@@ -814,6 +849,17 @@ def main():
         except Exception as e:
             logger.warning(f"Could not load existing results: {e}, will retrain")
 
+    existing_results_map = {}
+    if os.path.exists(results_path):
+        try:
+            with open(results_path, 'r') as f:
+                existing_results = json.load(f)
+            for row in existing_results:
+                if isinstance(row, dict) and 'layer' in row:
+                    existing_results_map[int(row['layer'])] = row
+        except Exception:
+            existing_results_map = {}
+
     if args.layer is not None:
         # Train single layer
         logger.info(f"Training probe for layer {args.layer}...")
@@ -977,6 +1023,70 @@ def main():
                 shuffle=False,
                 num_workers=0
             )
+
+            # Resume mode: reuse existing trained probe and recover attribution if needed
+            if args.resume and os.path.exists(args.output_model_path):
+                logger.info(f"Resume mode: found existing probe for layer {layer_idx}, skipping retraining.")
+                model.load_state_dict(torch.load(args.output_model_path, map_location=device))
+
+                best_val_auc, best_val_acc, _, _ = evaluate(model, layer_val_loader, device)
+                best_epoch = existing_results_map.get(layer_idx, {}).get('epoch', 0)
+
+                if args.attr_enable:
+                    if _is_attr_layer_complete(attr_out_dir, layer_idx, args.attr_top_n):
+                        logger.info(f"Resume mode: attribution already complete for layer {layer_idx}, skipping.")
+                    else:
+                        checkpoints = _load_saved_checkpoints(attr_checkpoint_dir)
+                        if checkpoints:
+                            logger.info(
+                                f"Resume mode: recovering attribution for layer {layer_idx} "
+                                f"from {len(checkpoints)} checkpoint(s)."
+                            )
+                            w_star = _flatten_params(model)
+
+                            attr_train_loader = DataLoader(
+                                layer_train_dataset,
+                                batch_size=args.batch_size,
+                                shuffle=False,
+                                num_workers=0
+                            )
+
+                            layer_ood_loader = None
+                            if ood_dataset is not None:
+                                layer_ood_dataset = LayerDataset(ood_dataset, layer_idx)
+                                layer_ood_loader = DataLoader(
+                                    layer_ood_dataset,
+                                    batch_size=args.batch_size,
+                                    shuffle=False,
+                                    num_workers=0
+                                )
+
+                            run_attribution_for_layer(
+                                layer_idx=layer_idx,
+                                model=model,
+                                checkpoints=checkpoints,
+                                w_star=w_star,
+                                train_loader=attr_train_loader,
+                                val_loader=layer_val_loader,
+                                ood_loader=layer_ood_loader,
+                                attr_every_n=args.attr_every_n,
+                                attr_top_n=args.attr_top_n,
+                                attr_out_dir=attr_out_dir,
+                                device=device
+                            )
+                        else:
+                            logger.warning(
+                                f"Resume mode: attribution incomplete for layer {layer_idx}, "
+                                f"but no saved checkpoints found in {attr_checkpoint_dir}."
+                            )
+
+                results.append({
+                    'layer': layer_idx,
+                    'val_auc': best_val_auc,
+                    'val_acc': best_val_acc,
+                    'epoch': best_epoch
+                })
+                continue
 
             best_val_auc, best_epoch, checkpoints = train_probe(
                 model,
