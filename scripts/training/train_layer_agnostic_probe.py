@@ -595,7 +595,7 @@ def run_layer_agnostic_attribution(
     best_id_auc = -1.0
     best_ood_auc = -1.0
 
-    for epoch, ckpt_path in checkpoints:
+    for epoch, ckpt_path in tqdm(checkpoints, desc="Attribution checkpoints"):
         state = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(state)
         model.eval()
@@ -619,7 +619,8 @@ def run_layer_agnostic_attribution(
 
         # Attribution pass
         delta = w_star - w_t
-        for batch_idx, batch in enumerate(train_loader):
+        batch_iter = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch} batches", leave=False)
+        for batch_idx, batch in batch_iter:
             if attr_every_n > 1 and batch_idx % attr_every_n != 0:
                 continue
             if len(batch) == 4:

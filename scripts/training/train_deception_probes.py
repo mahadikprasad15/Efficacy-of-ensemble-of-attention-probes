@@ -405,7 +405,7 @@ def run_attribution_for_layer(
     best_id_auc = -1.0
     best_ood_auc = -1.0
 
-    for epoch, ckpt_path in checkpoints:
+    for epoch, ckpt_path in tqdm(checkpoints, desc=f"Attribution L{layer_idx} checkpoints"):
         # Load checkpoint
         state = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(state)
@@ -428,7 +428,8 @@ def run_attribution_for_layer(
 
         # Attribution pass (subset of batches)
         delta = w_star - w_t
-        for batch_idx, batch in enumerate(train_loader):
+        batch_iter = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"L{layer_idx} epoch {epoch} batches", leave=False)
+        for batch_idx, batch in batch_iter:
             if attr_every_n > 1 and batch_idx % attr_every_n != 0:
                 continue
             if len(batch) == 3:
