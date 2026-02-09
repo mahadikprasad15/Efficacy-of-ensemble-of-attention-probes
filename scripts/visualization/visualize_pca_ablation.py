@@ -27,8 +27,13 @@ Writes:
     - cross_pooling_best_ood_auc_heatmap.png
     - cross_pooling_best_k_by_layer_heatmap.png
     - cross_pooling_k_curves_grid_ood.png
+    - cross_pooling_layer_k_ood_auc_grid.png
+    - cross_pooling_layer_k_beats_prior_best_ood_grid.png (if layer_results provided)
+    - cross_pooling_3way_best_ood_bar_comparison.png
     - cross_pooling_summary.csv
     - cross_pooling_overview.json
+    - cross_pooling_beats_prior_best_summary.csv (if layer_results provided)
+    - cross_pooling_3way_best_ood_bar_values.csv
 """
 
 import argparse
@@ -41,6 +46,7 @@ from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import ListedColormap
 
 POOLING_ORDER_DEFAULT = ["mean", "max", "last", "attn"]
 
@@ -653,7 +659,7 @@ def plot_cross_pooling_best_ood_auc_heatmap(
         vmax = vmin + 1e-3
 
     masked = np.ma.masked_invalid(best_ood_auc)
-    im = plt.imshow(masked, aspect="auto", cmap="YlGn", vmin=vmin, vmax=vmax)
+    im = plt.imshow(masked, aspect="auto", cmap="cividis", vmin=vmin, vmax=vmax)
     cbar = plt.colorbar(im)
     cbar.set_label("Best OOD AUC (max over k)")
 
@@ -700,7 +706,7 @@ def plot_cross_pooling_best_k_heatmap(
         vmax = vmin + 1.0
 
     masked = np.ma.masked_invalid(best_k_map)
-    im = plt.imshow(masked, aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
+    im = plt.imshow(masked, aspect="auto", cmap="cividis", vmin=vmin, vmax=vmax)
     cbar = plt.colorbar(im)
     cbar.set_label("Best k (by OOD AUC)")
 
@@ -906,6 +912,414 @@ def write_cross_pooling_overview_json(
         json.dump(overview, f, indent=2)
 
 
+def load_prior_best_ood_by_pooling(
+    layer_results_root: Optional[str],
+    poolings: List[str],
+) -> Tuple[Dict[str, dict], Dict[str, str]]:
+    if not layer_results_root:
+        return {}, {p: "layer_results_root not provided" for p in poolings}
+
+    metric_priority = ["ood_auc", "test_auc", "auc", "val_auc", "min_val_auc"]
+    prior: Dict[str, dict] = {}
+    skipped: Dict[str, str] = {}
+
+    for pooling in poolings:
+        path = os.path.join(layer_results_root, pooling, "layer_results.json")
+        if not os.path.exists(path):
+            skipped[pooling] = f"missing file: {path}"
+            continue
+
+        try:
+            with open(path, "r") as f:
+                raw = json.load(f)
+        except Exception as e:
+            skipped[pooling] = f"failed to read {path}: {e}"
+            continue
+
+        if isinstance(raw, dict):
+            if isinstance(raw.get("results"), list):
+                rows = raw["results"]
+            else:
+                rows = [raw]
+        elif isinstance(raw, list):
+            rows = raw
+        else:
+            skipped[pooling] = f"unsupported JSON shape in {path}"
+            continue
+
+        if not rows:
+            skipped[pooling] = f"empty results in {path}"
+            continue
+
+        metric_key = None
+        for k in metric_priority:
+            if any(isinstance(r, dict) and k in r for r in rows):
+                metric_key = k
+                break
+
+        if metric_key is None:
+            skipped[pooling] = f"no OOD-like metric found in {path}"
+            continue
+
+        vals = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            v = r.get(metric_key, np.nan)
+            try:
+                vals.append(float(v))
+            except Exception:
+                continue
+
+        if not vals:
+            skipped[pooling] = f"no numeric values for metric '{metric_key}' in {path}"
+            continue
+
+        prior[pooling] = {
+            "path": path,
+            "metric_key": metric_key,
+            "best_prior_ood": float(np.nanmax(vals)),
+        }
+
+    return prior, skipped
+
+
+def plot_cross_pooling_layer_k_ood_auc_grid(
+    poolings: List[str],
+    layers: List[int],
+    all_k_values: List[int],
+    aligned: Dict[str, dict],
+    out_path: str,
+    title_prefix: str = "",
+) -> None:
+    n = len(poolings)
+    cols = 2 if n > 1 else 1
+    rows = int(math.ceil(n / cols))
+
+    global_vals = []
+    for p in poolings:
+        m = aligned[p]["ood_auc_aligned"]
+        if np.isfinite(m).any():
+            global_vals.extend(m[np.isfinite(m)].tolist())
+    vmin = max(0.0, min(global_vals) - 0.01) if global_vals else 0.0
+    vmax = min(1.0, max(global_vals) + 0.01) if global_vals else 1.0
+    if vmin == vmax:
+        vmax = vmin + 1e-3
+
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 8.2, rows * 4.8), sharex=True, sharey=True)
+    if rows == 1 and cols == 1:
+        axes = np.array([[axes]])
+    elif rows == 1:
+        axes = axes.reshape(1, -1)
+    elif cols == 1:
+        axes = axes.reshape(-1, 1)
+
+    img = None
+    for idx, pooling in enumerate(poolings):
+        r = idx // cols
+        c = idx % cols
+        ax = axes[r, c]
+        mat = aligned[pooling]["ood_auc_aligned"]
+        masked = np.ma.masked_invalid(mat)
+        img = ax.imshow(masked, aspect="auto", cmap="cividis", vmin=vmin, vmax=vmax)
+        ax.set_title(pooling.upper(), fontweight="bold")
+        ax.set_xticks(range(len(layers)))
+        ax.set_xticklabels(layers, rotation=45, fontsize=8)
+        ax.set_yticks(range(len(all_k_values)))
+        ax.set_yticklabels(all_k_values, fontsize=8)
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("k removed PCs")
+
+    for idx in range(n, rows * cols):
+        r = idx // cols
+        c = idx % cols
+        axes[r, c].axis("off")
+
+    if img is not None:
+        cbar = fig.colorbar(img, ax=axes.ravel().tolist(), shrink=0.88)
+        cbar.set_label("OOD AUC")
+
+    title = "Layer x k OOD AUC Heatmaps by Pooling"
+    if title_prefix:
+        title = f"{title_prefix} | {title}"
+    fig.suptitle(title, y=1.01, fontsize=14, fontweight="bold")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UserWarning)
+        plt.tight_layout()
+    plt.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close()
+
+
+def plot_cross_pooling_beats_prior_best_grid(
+    poolings: List[str],
+    layers: List[int],
+    all_k_values: List[int],
+    aligned: Dict[str, dict],
+    prior_best_map: Dict[str, dict],
+    out_path: str,
+    title_prefix: str = "",
+) -> None:
+    n = len(poolings)
+    cols = 2 if n > 1 else 1
+    rows = int(math.ceil(n / cols))
+
+    beat_cmap = ListedColormap(["#d9dde3", "#3f8f83"])
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 8.2, rows * 4.8), sharex=True, sharey=True)
+    if rows == 1 and cols == 1:
+        axes = np.array([[axes]])
+    elif rows == 1:
+        axes = axes.reshape(1, -1)
+    elif cols == 1:
+        axes = axes.reshape(-1, 1)
+
+    img = None
+    for idx, pooling in enumerate(poolings):
+        r = idx // cols
+        c = idx % cols
+        ax = axes[r, c]
+        mat = aligned[pooling]["ood_auc_aligned"]
+        prior = prior_best_map.get(pooling, {})
+        threshold = float(prior.get("best_prior_ood", np.nan))
+
+        if np.isfinite(threshold):
+            beat = (mat > threshold).astype(np.float32)
+            beat[~np.isfinite(mat)] = np.nan
+            subtitle = f"{pooling.upper()} | prior best={threshold:.3f} ({prior.get('metric_key', 'n/a')})"
+        else:
+            beat = np.full_like(mat, np.nan, dtype=np.float32)
+            subtitle = f"{pooling.upper()} | prior best unavailable"
+
+        masked = np.ma.masked_invalid(beat)
+        img = ax.imshow(masked, aspect="auto", cmap=beat_cmap, vmin=0.0, vmax=1.0)
+        ax.set_title(subtitle, fontsize=10, fontweight="bold")
+        ax.set_xticks(range(len(layers)))
+        ax.set_xticklabels(layers, rotation=45, fontsize=8)
+        ax.set_yticks(range(len(all_k_values)))
+        ax.set_yticklabels(all_k_values, fontsize=8)
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("k removed PCs")
+
+    for idx in range(n, rows * cols):
+        r = idx // cols
+        c = idx % cols
+        axes[r, c].axis("off")
+
+    if img is not None:
+        cbar = fig.colorbar(img, ax=axes.ravel().tolist(), shrink=0.88, ticks=[0, 1])
+        cbar.ax.set_yticklabels(["No", "Yes"])
+        cbar.set_label("Beats prior best OOD")
+
+    title = "Layer x k Cells Beating Prior Best OOD (by Pooling)"
+    if title_prefix:
+        title = f"{title_prefix} | {title}"
+    fig.suptitle(title, y=1.01, fontsize=14, fontweight="bold")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UserWarning)
+        plt.tight_layout()
+    plt.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close()
+
+
+def write_cross_pooling_beats_summary_csv(
+    poolings: List[str],
+    aligned: Dict[str, dict],
+    prior_best_map: Dict[str, dict],
+    out_path: str,
+) -> None:
+    rows = []
+    for pooling in poolings:
+        mat = aligned[pooling]["ood_auc_aligned"]
+        finite = np.isfinite(mat)
+        total_cells = int(finite.sum())
+        prior = prior_best_map.get(pooling, {})
+        threshold = float(prior.get("best_prior_ood", np.nan))
+
+        if total_cells > 0 and np.isfinite(threshold):
+            beats = np.logical_and(finite, mat > threshold)
+            num_beating = int(beats.sum())
+            frac_beating = float(num_beating / total_cells)
+            best_idx = int(np.nanargmax(mat))
+            best_ood = float(mat[np.unravel_index(best_idx, mat.shape)])
+        else:
+            num_beating = 0
+            frac_beating = np.nan
+            best_ood = float(np.nanmax(mat)) if total_cells > 0 else np.nan
+
+        rows.append(
+            {
+                "pooling": pooling,
+                "prior_metric_key": prior.get("metric_key", ""),
+                "prior_best_ood": threshold,
+                "total_cells": total_cells,
+                "cells_beating_prior_best": num_beating,
+                "fraction_beating_prior_best": frac_beating,
+                "best_ood_auc_in_pca_grid": best_ood,
+            }
+        )
+
+    with open(out_path, "w", newline="") as f:
+        fieldnames = [
+            "pooling",
+            "prior_metric_key",
+            "prior_best_ood",
+            "total_cells",
+            "cells_beating_prior_best",
+            "fraction_beating_prior_best",
+            "best_ood_auc_in_pca_grid",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def load_attribution_best_ood_by_pooling(
+    attribution_tables_root: Optional[str],
+    poolings: List[str],
+) -> Tuple[Dict[str, dict], Dict[str, str]]:
+    if not attribution_tables_root:
+        return {}, {p: "attribution_tables_root not provided" for p in poolings}
+
+    out: Dict[str, dict] = {}
+    skipped: Dict[str, str] = {}
+    metric_priority = ["best_ood_auc", "final_ood_auc", "ood_auc", "auc"]
+
+    for pooling in poolings:
+        candidates = [
+            os.path.join(attribution_tables_root, pooling, "tables", "derived_layer_metrics.csv"),
+            os.path.join(attribution_tables_root, pooling, "derived_layer_metrics.csv"),
+        ]
+        path = next((p for p in candidates if os.path.exists(p)), None)
+        if path is None:
+            skipped[pooling] = f"missing derived_layer_metrics.csv under {attribution_tables_root}/{pooling}"
+            continue
+
+        try:
+            with open(path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+        except Exception as e:
+            skipped[pooling] = f"failed to read {path}: {e}"
+            continue
+
+        if not rows:
+            skipped[pooling] = f"empty CSV in {path}"
+            continue
+
+        metric_key = next((k for k in metric_priority if k in rows[0]), None)
+        if metric_key is None:
+            skipped[pooling] = f"no metric columns {metric_priority} in {path}"
+            continue
+
+        vals = []
+        for r in rows:
+            v = r.get(metric_key, "")
+            try:
+                vals.append(float(v))
+            except Exception:
+                continue
+
+        if not vals:
+            skipped[pooling] = f"no numeric metric values for '{metric_key}' in {path}"
+            continue
+
+        out[pooling] = {
+            "path": path,
+            "metric_key": metric_key,
+            "best_attr_ood": float(np.nanmax(vals)),
+        }
+
+    return out, skipped
+
+
+def plot_cross_pooling_3way_best_ood_bar(
+    poolings: List[str],
+    probe_best: Dict[str, dict],
+    attr_best: Dict[str, dict],
+    pca_best: Dict[str, float],
+    out_path: str,
+    title_prefix: str = "",
+) -> List[dict]:
+    labels = poolings
+    n = len(labels)
+    x = np.arange(n)
+    width = 0.25
+
+    series_names = [
+        "Probe Best OOD",
+        "Attribution Best OOD",
+        "PCA Best OOD (Layer x k)",
+    ]
+    colors = ["#5D7290", "#6D9F8B", "#C3A46A"]  # muted slate, muted green, muted ochre
+
+    y_probe = np.array([float(probe_best.get(p, {}).get("best_prior_ood", np.nan)) for p in labels], dtype=np.float32)
+    y_attr = np.array([float(attr_best.get(p, {}).get("best_attr_ood", np.nan)) for p in labels], dtype=np.float32)
+    y_pca = np.array([float(pca_best.get(p, np.nan)) for p in labels], dtype=np.float32)
+    ys = [y_probe, y_attr, y_pca]
+
+    rows = []
+    for i, p in enumerate(labels):
+        rows.append(
+            {
+                "pooling": p,
+                "probe_best_ood": float(y_probe[i]) if np.isfinite(y_probe[i]) else np.nan,
+                "attribution_best_ood": float(y_attr[i]) if np.isfinite(y_attr[i]) else np.nan,
+                "pca_best_layer_k_ood": float(y_pca[i]) if np.isfinite(y_pca[i]) else np.nan,
+            }
+        )
+
+    plt.figure(figsize=(max(9, n * 2.4), 5.8))
+    plotted_vals = []
+    for i, (name, vals, color) in enumerate(zip(series_names, ys, colors)):
+        xpos = x + (i - 1) * width
+        draw_vals = np.where(np.isfinite(vals), vals, 0.0)
+        bars = plt.bar(xpos, draw_vals, width=width, color=color, edgecolor="#3b3b3b", linewidth=0.9, label=name, alpha=0.9)
+        for j, b in enumerate(bars):
+            v = vals[j]
+            if np.isfinite(v):
+                plotted_vals.append(float(v))
+                plt.text(
+                    b.get_x() + b.get_width() / 2,
+                    v + 0.006,
+                    f"{v:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    color="#222222",
+                )
+            else:
+                b.set_facecolor("#e7e7e7")
+                b.set_hatch("//")
+                b.set_edgecolor("#9a9a9a")
+                plt.text(
+                    b.get_x() + b.get_width() / 2,
+                    0.515,
+                    "NA",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    color="#666666",
+                )
+
+    ymin = 0.5
+    ymax = min(1.0, max(plotted_vals) + 0.06) if plotted_vals else 0.75
+    plt.ylim(ymin, ymax)
+    plt.axhline(0.5, linestyle="--", color="#8a8a8a", linewidth=1.2, alpha=0.7)
+    plt.grid(axis="y", alpha=0.22)
+    plt.xticks(x, [p.upper() for p in labels])
+    plt.ylabel("OOD AUC")
+    plt.xlabel("Pooling")
+    title = "Best OOD Comparison by Pooling (Probe vs Attribution vs PCA)"
+    if title_prefix:
+        title = f"{title_prefix} | {title}"
+    plt.title(title)
+    plt.legend(framealpha=0.92)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=240, bbox_inches="tight")
+    plt.close()
+
+    return rows
+
+
 def run_single_mode(args: argparse.Namespace) -> int:
     output_dir = args.output_dir or args.input_dir
     ensure_dir(output_dir)
@@ -1076,6 +1490,14 @@ def run_cross_pooling_mode(args: argparse.Namespace) -> int:
         os.path.join(output_dir, "cross_pooling_k_curves_grid_ood.png"),
         title_prefix=args.title_prefix,
     )
+    plot_cross_pooling_layer_k_ood_auc_grid(
+        valid_poolings,
+        all_layers,
+        all_k_values,
+        aligned,
+        os.path.join(output_dir, "cross_pooling_layer_k_ood_auc_grid.png"),
+        title_prefix=args.title_prefix,
+    )
 
     write_cross_pooling_summary_csv(
         valid_poolings,
@@ -1093,6 +1515,62 @@ def run_cross_pooling_mode(args: argparse.Namespace) -> int:
         os.path.join(output_dir, "cross_pooling_overview.json"),
     )
 
+    prior_best_map, prior_skipped = load_prior_best_ood_by_pooling(args.layer_results_root, valid_poolings)
+    if prior_best_map:
+        plot_cross_pooling_beats_prior_best_grid(
+            valid_poolings,
+            all_layers,
+            all_k_values,
+            aligned,
+            prior_best_map,
+            os.path.join(output_dir, "cross_pooling_layer_k_beats_prior_best_ood_grid.png"),
+            title_prefix=args.title_prefix,
+        )
+        write_cross_pooling_beats_summary_csv(
+            valid_poolings,
+            aligned,
+            prior_best_map,
+            os.path.join(output_dir, "cross_pooling_beats_prior_best_summary.csv"),
+        )
+    else:
+        print("[WARN] No prior best OOD references available from --layer_results_root.")
+
+    if prior_skipped:
+        for pooling, reason in prior_skipped.items():
+            print(f"[WARN] Prior best OOD unavailable for '{pooling}': {reason}")
+
+    # 3-way grouped bar comparison:
+    # 1) best OOD from probe layer_results
+    # 2) best OOD during attribution/checkpoint training summaries
+    # 3) best OOD in PCA layer x k grid
+    attr_best_map, attr_skipped = load_attribution_best_ood_by_pooling(
+        args.attribution_tables_root, valid_poolings
+    )
+    pca_best_map: Dict[str, float] = {}
+    for pooling in valid_poolings:
+        mat = aligned[pooling]["ood_auc_aligned"]
+        pca_best_map[pooling] = float(np.nanmax(mat)) if np.isfinite(mat).any() else np.nan
+
+    bar_rows = plot_cross_pooling_3way_best_ood_bar(
+        valid_poolings,
+        prior_best_map,
+        attr_best_map,
+        pca_best_map,
+        os.path.join(output_dir, "cross_pooling_3way_best_ood_bar_comparison.png"),
+        title_prefix=args.title_prefix,
+    )
+    with open(os.path.join(output_dir, "cross_pooling_3way_best_ood_bar_values.csv"), "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["pooling", "probe_best_ood", "attribution_best_ood", "pca_best_layer_k_ood"],
+        )
+        writer.writeheader()
+        writer.writerows(bar_rows)
+
+    if attr_skipped:
+        for pooling, reason in attr_skipped.items():
+            print(f"[WARN] Attribution best OOD unavailable for '{pooling}': {reason}")
+
     print("=" * 90)
     print("PCA ABLATION VISUALIZATION COMPLETE (cross-pooling mode)")
     print("=" * 90)
@@ -1100,6 +1578,8 @@ def run_cross_pooling_mode(args: argparse.Namespace) -> int:
     print(f"Output dir:   {output_dir}")
     print(f"Valid poolings: {valid_poolings}")
     print(f"Skipped poolings: {skipped}")
+    print(f"Prior-best references loaded: {sorted(list(prior_best_map.keys()))}")
+    print(f"Attribution references loaded: {sorted(list(attr_best_map.keys()))}")
     print(f"Global layers: {all_layers}")
     print(f"Global k values: {all_k_values}")
     return 0
@@ -1134,6 +1614,21 @@ def main() -> int:
         type=str,
         default="mean,max,last,attn",
         help="Cross-pooling mode: comma-separated pooling order",
+    )
+    parser.add_argument(
+        "--layer_results_root",
+        type=str,
+        default=None,
+        help="Cross-pooling mode: root with {pooling}/layer_results.json for prior-best OOD comparison",
+    )
+    parser.add_argument(
+        "--attribution_tables_root",
+        type=str,
+        default=None,
+        help=(
+            "Cross-pooling mode: root with {pooling}/tables/derived_layer_metrics.csv "
+            "for best-OOD-during-training comparison"
+        ),
     )
     parser.add_argument(
         "--primary_metric",
