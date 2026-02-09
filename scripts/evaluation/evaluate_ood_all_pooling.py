@@ -386,6 +386,62 @@ def plot_ood_comparison(
     plt.close()
 
 
+def plot_single_pooling_dual_metric(
+    pooling: str,
+    result: Dict,
+    save_path: str,
+    ood_dataset_name: str = "OOD"
+):
+    """
+    Plot single-pooling OOD results with AUC and Accuracy on one chart.
+
+    This matches the style used by eval_ood.py for per-layer OOD analysis.
+    """
+    layers = result['layers']
+    aucs = result['aucs']
+    accs = result['accuracies']
+
+    best_idx = int(np.argmax(aucs))
+    best_layer = layers[best_idx]
+    best_auc = aucs[best_idx]
+
+    plt.figure(figsize=(12, 6))
+
+    # AUC (blue)
+    plt.plot(layers, aucs, 'o-', label='AUC', color='#1f77b4', linewidth=2.5, markersize=8)
+    # Accuracy (green)
+    plt.plot(
+        layers, accs, 's--', label='Accuracy', color='#2ca02c',
+        linewidth=2.5, markersize=7, alpha=0.7
+    )
+
+    # Highlight best AUC layer
+    plt.plot(best_layer, best_auc, 'r*', markersize=20, label=f'Best (L{best_layer})', zorder=10)
+
+    plt.title(f"Best OOD Performance on {ood_dataset_name}", fontsize=20, pad=8)
+    plt.xlabel("Layer", fontsize=20)
+    plt.ylabel("Metric Score", fontsize=20)
+    plt.legend(loc='upper right', fontsize=14, framealpha=0.95)
+    plt.grid(True, alpha=0.25)
+    plt.tick_params(axis='both', labelsize=12)
+
+    plt.annotate(
+        f"Best OOD Performance\nLayer {best_layer}",
+        xy=(best_layer, best_auc),
+        xytext=(0, 14),
+        textcoords='offset points',
+        ha='center',
+        va='bottom',
+        fontsize=10,
+        bbox=dict(boxstyle='round,pad=0.45', facecolor='yellow', alpha=0.45, edgecolor='black')
+    )
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"✓ Saved single-pooling dual-metric plot: {save_path}")
+    plt.close()
+
+
 def generate_summary(all_results: Dict[str, Dict]) -> str:
     """Generate text summary of OOD evaluation."""
     lines = []
@@ -456,7 +512,7 @@ def main():
     device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Check if OOD evaluation already exists (skip if so)
+    # Check if OOD evaluation already exists and resume from artifacts if possible
     results_path = os.path.join(args.output_dir, "ood_results_all_pooling.json")
     logits_dir = os.path.join(args.output_dir, "logits")
     if os.path.exists(results_path) and os.path.exists(logits_dir):
@@ -464,12 +520,31 @@ def main():
         existing_logits = glob.glob(os.path.join(logits_dir, "*_logits.npy"))
         if existing_logits:
             print("=" * 90)
-            print("⚠️  OOD EVALUATION RESULTS ALREADY EXIST")
+            print("⚠️  OOD EVALUATION RESULTS ALREADY EXIST - RESUMING FROM SAVED ARTIFACTS")
             print("=" * 90)
             print(f"Found: {results_path}")
             print(f"Found: {len(existing_logits)} logit files in {logits_dir}")
-            print("Skipping evaluation to avoid overwriting existing results.")
-            print("To re-evaluate, delete the output directory and run again.")
+            print("Skipping re-evaluation and regenerating summary/plot from saved results.")
+            with open(results_path, 'r') as f:
+                saved_results = json.load(f)
+
+            summary = generate_summary(saved_results)
+            summary_path = os.path.join(args.output_dir, "ood_best_probes_summary.txt")
+            with open(summary_path, 'w') as f:
+                f.write(summary)
+            print(f"✓ Refreshed summary: {summary_path}")
+
+            plot_path = os.path.join(args.output_dir, "ood_layerwise_comparison.png")
+            if len(saved_results) == 1:
+                only_pooling = next(iter(saved_results.keys()))
+                plot_single_pooling_dual_metric(
+                    pooling=only_pooling,
+                    result=saved_results[only_pooling],
+                    save_path=plot_path,
+                    ood_dataset_name=args.ood_dataset_name
+                )
+            else:
+                plot_ood_comparison(saved_results, plot_path, args.ood_dataset_name)
             print("=" * 90)
             return 0
 
@@ -560,7 +635,16 @@ def main():
 
     # Generate plot
     plot_path = os.path.join(args.output_dir, "ood_layerwise_comparison.png")
-    plot_ood_comparison(all_results, plot_path, args.ood_dataset_name)
+    if len(all_results) == 1:
+        only_pooling = next(iter(all_results.keys()))
+        plot_single_pooling_dual_metric(
+            pooling=only_pooling,
+            result=all_results[only_pooling],
+            save_path=plot_path,
+            ood_dataset_name=args.ood_dataset_name
+        )
+    else:
+        plot_ood_comparison(all_results, plot_path, args.ood_dataset_name)
 
     print()
     print("=" * 90)
