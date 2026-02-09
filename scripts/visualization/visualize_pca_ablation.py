@@ -38,6 +38,7 @@ Writes:
 
 import argparse
 import csv
+import glob
 import json
 import math
 import os
@@ -925,61 +926,108 @@ def load_prior_best_ood_by_pooling(
 
     for pooling in poolings:
         path = os.path.join(layer_results_root, pooling, "layer_results.json")
-        if not os.path.exists(path):
-            skipped[pooling] = f"missing file: {path}"
-            continue
+        loaded = False
 
-        try:
-            with open(path, "r") as f:
-                raw = json.load(f)
-        except Exception as e:
-            skipped[pooling] = f"failed to read {path}: {e}"
-            continue
-
-        if isinstance(raw, dict):
-            if isinstance(raw.get("results"), list):
-                rows = raw["results"]
-            else:
-                rows = [raw]
-        elif isinstance(raw, list):
-            rows = raw
-        else:
-            skipped[pooling] = f"unsupported JSON shape in {path}"
-            continue
-
-        if not rows:
-            skipped[pooling] = f"empty results in {path}"
-            continue
-
-        metric_key = None
-        for k in metric_priority:
-            if any(isinstance(r, dict) and k in r for r in rows):
-                metric_key = k
-                break
-
-        if metric_key is None:
-            skipped[pooling] = f"no OOD-like metric found in {path}"
-            continue
-
-        vals = []
-        for r in rows:
-            if not isinstance(r, dict):
-                continue
-            v = r.get(metric_key, np.nan)
+        # 1) Try layer_results.json first (only if it truly has OOD-like metrics)
+        if os.path.exists(path):
             try:
-                vals.append(float(v))
-            except Exception:
-                continue
+                with open(path, "r") as f:
+                    raw = json.load(f)
+            except Exception as e:
+                skipped[pooling] = f"failed to read {path}: {e}"
+                raw = None
 
-        if not vals:
-            skipped[pooling] = f"no numeric values for metric '{metric_key}' in {path}"
-            continue
+            if raw is not None:
+                if isinstance(raw, dict):
+                    if isinstance(raw.get("results"), list):
+                        rows = raw["results"]
+                    else:
+                        rows = [raw]
+                elif isinstance(raw, list):
+                    rows = raw
+                else:
+                    rows = []
 
-        prior[pooling] = {
-            "path": path,
-            "metric_key": metric_key,
-            "best_prior_ood": float(np.nanmax(vals)),
-        }
+                metric_key = None
+                for k in metric_priority:
+                    if any(isinstance(r, dict) and k in r for r in rows):
+                        metric_key = k
+                        break
+
+                if metric_key is not None:
+                    vals = []
+                    for r in rows:
+                        if not isinstance(r, dict):
+                            continue
+                        v = r.get(metric_key, np.nan)
+                        try:
+                            vals.append(float(v))
+                        except Exception:
+                            continue
+                    if vals:
+                        prior[pooling] = {
+                            "path": path,
+                            "metric_key": metric_key,
+                            "best_prior_ood": float(np.nanmax(vals)),
+                        }
+                        loaded = True
+
+        # 2) Fallback: eval_ood_*.json (preferred when layer_results has only val metrics)
+        if not loaded:
+            eval_candidates = sorted(
+                glob.glob(os.path.join(layer_results_root, pooling, "eval_ood_*_test.json"))
+                + glob.glob(os.path.join(layer_results_root, pooling, "eval_ood_*.json"))
+            )
+            best_val = np.nan
+            best_path = None
+            best_key = None
+
+            for ep in eval_candidates:
+                try:
+                    with open(ep, "r") as f:
+                        payload = json.load(f)
+                except Exception:
+                    continue
+
+                candidate = np.nan
+                candidate_key = None
+                if isinstance(payload, dict):
+                    if "best_ood_auc" in payload:
+                        try:
+                            candidate = float(payload["best_ood_auc"])
+                            candidate_key = "best_ood_auc"
+                        except Exception:
+                            candidate = np.nan
+                    elif isinstance(payload.get("layer_results"), list):
+                        vals = []
+                        for row in payload["layer_results"]:
+                            if isinstance(row, dict) and "auc" in row:
+                                try:
+                                    vals.append(float(row["auc"]))
+                                except Exception:
+                                    pass
+                        if vals:
+                            candidate = float(np.nanmax(vals))
+                            candidate_key = "layer_results[].auc"
+
+                if np.isfinite(candidate) and (not np.isfinite(best_val) or candidate > best_val):
+                    best_val = candidate
+                    best_path = ep
+                    best_key = candidate_key
+
+            if np.isfinite(best_val):
+                prior[pooling] = {
+                    "path": best_path,
+                    "metric_key": best_key or "eval_ood",
+                    "best_prior_ood": float(best_val),
+                }
+                loaded = True
+
+        if not loaded and pooling not in skipped:
+            skipped[pooling] = (
+                f"no OOD-like metric in {path} and no usable eval_ood_*.json under "
+                f"{os.path.join(layer_results_root, pooling)}"
+            )
 
     return prior, skipped
 
@@ -1567,24 +1615,28 @@ def run_cross_pooling_mode(args: argparse.Namespace) -> int:
     probe_best_map = dict(prior_best_map)
     probe_best_map.update(ood_eval_map)
 
-    if prior_best_map:
+    # For beat-map threshold, prefer OOD eval summary, fallback to per-pooling prior files.
+    beat_ref_map = dict(prior_best_map)
+    beat_ref_map.update(ood_eval_map)
+
+    if beat_ref_map:
         plot_cross_pooling_beats_prior_best_grid(
             valid_poolings,
             all_layers,
             all_k_values,
             aligned,
-            prior_best_map,
+            beat_ref_map,
             os.path.join(output_dir, "cross_pooling_layer_k_beats_prior_best_ood_grid.png"),
             title_prefix=args.title_prefix,
         )
         write_cross_pooling_beats_summary_csv(
             valid_poolings,
             aligned,
-            prior_best_map,
+            beat_ref_map,
             os.path.join(output_dir, "cross_pooling_beats_prior_best_summary.csv"),
         )
     else:
-        print("[WARN] No prior best OOD references available from --layer_results_root.")
+        print("[WARN] No prior/eval best OOD references available for beat-threshold comparisons.")
 
     if prior_skipped:
         for pooling, reason in prior_skipped.items():
