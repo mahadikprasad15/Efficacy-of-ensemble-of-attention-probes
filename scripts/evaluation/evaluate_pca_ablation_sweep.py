@@ -16,6 +16,7 @@ import datetime as dt
 import glob
 import json
 import os
+import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -26,6 +27,10 @@ from safetensors.torch import load_file
 from sklearn.decomposition import PCA
 from sklearn.metrics import accuracy_score, roc_auc_score
 from tqdm import tqdm
+
+sys.path.append(os.path.join(os.getcwd(), "actprobe", "src"))
+
+from actprobe.probes.models import LayerProbe
 
 
 def parse_k_values(raw: str) -> List[int]:
@@ -156,6 +161,73 @@ def load_pooled_split(
     return x_by_layer, y, sample_ids
 
 
+def load_token_split(
+    activations_dir: str,
+    layers: List[int],
+    desc: str,
+) -> Tuple[Dict[int, np.ndarray], np.ndarray, List[str]]:
+    label_map = load_label_map(activations_dir)
+    shard_paths = sorted(glob.glob(os.path.join(activations_dir, "shard_*.safetensors")))
+    if not shard_paths:
+        raise FileNotFoundError(f"No shard_*.safetensors in {activations_dir}")
+
+    feature_buckets: Dict[int, List[np.ndarray]] = {l: [] for l in layers}
+    labels: List[int] = []
+    sample_ids: List[str] = []
+    skipped_unknown = 0
+    loaded = 0
+    token_len: Optional[int] = None
+    hidden_dim: Optional[int] = None
+
+    for shard_path in tqdm(shard_paths, desc=f"Loading {desc} shards"):
+        shard = load_file(shard_path)
+        for sid, tensor in shard.items():
+            if sid not in label_map:
+                continue
+            label = label_map[sid]
+            if label == -1:
+                skipped_unknown += 1
+                continue
+
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"Expected tensor shape (L,T,D), got {tuple(tensor.shape)} for sample {sid}"
+                )
+            if max(layers) >= tensor.shape[0]:
+                raise ValueError(
+                    f"Layer index out of range for sample {sid}: max layer {max(layers)} "
+                    f"but tensor has {tensor.shape[0]} layers."
+                )
+
+            for layer in layers:
+                x_layer = tensor[layer, :, :].detach().cpu().numpy().astype(np.float32, copy=False)
+                if token_len is None:
+                    token_len = int(x_layer.shape[0])
+                    hidden_dim = int(x_layer.shape[1])
+                elif x_layer.shape[0] != token_len or x_layer.shape[1] != hidden_dim:
+                    raise ValueError(
+                        "Inconsistent token activation shape detected. "
+                        f"Expected (T,D)=({token_len},{hidden_dim}), got {x_layer.shape} for sample {sid}"
+                    )
+                feature_buckets[layer].append(x_layer)
+
+            labels.append(label)
+            sample_ids.append(sid)
+            loaded += 1
+
+    if loaded == 0:
+        raise ValueError(f"No labeled examples loaded from {activations_dir}")
+
+    x_by_layer = {layer: np.stack(rows).astype(np.float32) for layer, rows in feature_buckets.items()}
+    y = np.asarray(labels, dtype=np.int64)
+
+    print(
+        f"Loaded {desc}: N={len(y)}, T={token_len}, D={hidden_dim}, "
+        f"unknown_skipped={skipped_unknown}"
+    )
+    return x_by_layer, y, sample_ids
+
+
 def maybe_subsample_train(
     x_by_layer: Dict[int, np.ndarray],
     y: np.ndarray,
@@ -217,6 +289,39 @@ def remove_top_k_pcs(
     return (x_centered - proj) + mean[None, :]
 
 
+def remove_top_k_pcs_tokens(
+    x_ntd: np.ndarray,
+    mean: np.ndarray,
+    components: np.ndarray,
+    k: int,
+) -> np.ndarray:
+    n, t, d = x_ntd.shape
+    x_flat = x_ntd.reshape(n * t, d)
+    x_centered = x_flat - mean[None, :]
+    u = components[:k, :]
+    proj = (x_centered @ u.T) @ u
+    x_clean = (x_centered - proj) + mean[None, :]
+    return x_clean.reshape(n, t, d)
+
+
+def run_attn_probe_logits(
+    probe: LayerProbe,
+    x_ntd: np.ndarray,
+    batch_size: int,
+    device: torch.device,
+) -> np.ndarray:
+    probe.eval()
+    logits_all: List[np.ndarray] = []
+    n = x_ntd.shape[0]
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            batch = torch.from_numpy(x_ntd[start:end]).to(device=device, dtype=torch.float32)
+            logits = probe(batch).squeeze(-1).detach().cpu().numpy()
+            logits_all.append(logits)
+    return np.concatenate(logits_all, axis=0)
+
+
 @dataclass
 class PcaLayerArtifact:
     mean: np.ndarray
@@ -266,6 +371,50 @@ def fit_layer_pca(
         sign_flips=sign_flips,
         n_train_samples=n_samples,
         dim=dim,
+    )
+
+
+def fit_layer_pca_tokens(
+    x_train_ntd: np.ndarray,
+    y_train: np.ndarray,
+    n_components_to_save: int,
+    pca_solver: str,
+    seed: int,
+    pc_sign_rule: str,
+) -> PcaLayerArtifact:
+    n, t, d = x_train_ntd.shape
+    x_flat = x_train_ntd.reshape(n * t, d)
+
+    max_allowed = min(x_flat.shape[0], d)
+    n_components = min(n_components_to_save, max_allowed)
+    if n_components < 1:
+        raise ValueError("PCA needs at least one component")
+
+    pca = PCA(n_components=n_components, svd_solver=pca_solver, random_state=seed)
+    pca.fit(x_flat)
+
+    components = pca.components_.astype(np.float32, copy=True)
+    sign_flips = np.zeros(n_components, dtype=np.int8)
+
+    if pc_sign_rule == "deceptive_positive":
+        deceptive_mask = y_train == 1
+        if deceptive_mask.any():
+            centered = x_flat - pca.mean_[None, :]
+            proj = centered @ components.T  # (N*T, K)
+            proj_per_sample = proj.reshape(n, t, n_components).mean(axis=1)  # (N, K)
+            deceptive_means = proj_per_sample[deceptive_mask].mean(axis=0)
+            flips = deceptive_means < 0
+            components[flips, :] *= -1.0
+            sign_flips = flips.astype(np.int8)
+
+    return PcaLayerArtifact(
+        mean=pca.mean_.astype(np.float32),
+        components=components,
+        explained_variance=pca.explained_variance_.astype(np.float32),
+        explained_variance_ratio=pca.explained_variance_ratio_.astype(np.float32),
+        sign_flips=sign_flips,
+        n_train_samples=int(x_flat.shape[0]),
+        dim=d,
     )
 
 
@@ -341,7 +490,7 @@ def main() -> int:
     parser.add_argument("--id_val_activations_dir", type=str, required=True)
     parser.add_argument("--ood_test_activations_dir", type=str, required=True)
     parser.add_argument("--probes_dir", type=str, required=True)
-    parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "max", "last"])
+    parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "max", "last", "attn"])
     parser.add_argument("--k_values", type=str, default="1,2,3,4,5,7,10,15,20")
     parser.add_argument("--layers", type=str, default="all")
     parser.add_argument("--output_dir", type=str, required=True)
@@ -349,6 +498,8 @@ def main() -> int:
     parser.add_argument("--pca_solver", type=str, default="randomized")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_train_samples_for_pca", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--pc_sign_rule",
         type=str,
@@ -359,6 +510,7 @@ def main() -> int:
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    device = torch.device(args.device)
 
     probe_map = find_probe_files(args.probes_dir)
     if not probe_map:
@@ -384,19 +536,33 @@ def main() -> int:
 
     k_values = parse_k_values(args.k_values)
     max_k = max(k_values)
+    is_attn = args.pooling == "attn"
+    pca_fit_level = "token" if is_attn else "pooled"
+    evaluation_mode = "full_probe_forward" if is_attn else "linear_head_shortcut"
 
     # ---------------------------------------------------------------------
-    # Load pooled activations
+    # Load activations
     # ---------------------------------------------------------------------
-    x_train, y_train, train_ids = load_pooled_split(
-        args.id_train_activations_dir, layers, args.pooling, desc="ID train"
-    )
-    x_val, y_val, _ = load_pooled_split(
-        args.id_val_activations_dir, layers, args.pooling, desc="ID validation"
-    )
-    x_ood, y_ood, _ = load_pooled_split(
-        args.ood_test_activations_dir, layers, args.pooling, desc="OOD test"
-    )
+    if is_attn:
+        x_train, y_train, train_ids = load_token_split(
+            args.id_train_activations_dir, layers, desc="ID train"
+        )
+        x_val, y_val, _ = load_token_split(
+            args.id_val_activations_dir, layers, desc="ID validation"
+        )
+        x_ood, y_ood, _ = load_token_split(
+            args.ood_test_activations_dir, layers, desc="OOD test"
+        )
+    else:
+        x_train, y_train, train_ids = load_pooled_split(
+            args.id_train_activations_dir, layers, args.pooling, desc="ID train"
+        )
+        x_val, y_val, _ = load_pooled_split(
+            args.id_val_activations_dir, layers, args.pooling, desc="ID validation"
+        )
+        x_ood, y_ood, _ = load_pooled_split(
+            args.ood_test_activations_dir, layers, args.pooling, desc="OOD test"
+        )
 
     x_train, y_train, train_ids, sampled_idx = maybe_subsample_train(
         x_train, y_train, train_ids, args.max_train_samples_for_pca, args.seed
@@ -411,6 +577,8 @@ def main() -> int:
     pca_manifest = {
         "model_name": args.model_name,
         "pooling": args.pooling,
+        "pca_fit_level": pca_fit_level,
+        "evaluation_mode": evaluation_mode,
         "fit_split": "id_train",
         "fit_path": args.id_train_activations_dir,
         "pca_solver": args.pca_solver,
@@ -421,14 +589,24 @@ def main() -> int:
     }
 
     for layer in tqdm(layers, desc="Fitting PCA by layer"):
-        artifact = fit_layer_pca(
-            x_train[layer],
-            y_train,
-            n_components_to_save=args.pca_components_to_save,
-            pca_solver=args.pca_solver,
-            seed=args.seed,
-            pc_sign_rule=args.pc_sign_rule,
-        )
+        if is_attn:
+            artifact = fit_layer_pca_tokens(
+                x_train[layer],
+                y_train,
+                n_components_to_save=args.pca_components_to_save,
+                pca_solver=args.pca_solver,
+                seed=args.seed,
+                pc_sign_rule=args.pc_sign_rule,
+            )
+        else:
+            artifact = fit_layer_pca(
+                x_train[layer],
+                y_train,
+                n_components_to_save=args.pca_components_to_save,
+                pca_solver=args.pca_solver,
+                seed=args.seed,
+                pc_sign_rule=args.pc_sign_rule,
+            )
         if artifact.components.shape[0] < max_k:
             raise ValueError(
                 f"Layer {layer} has only {artifact.components.shape[0]} saved PCs, "
@@ -454,63 +632,102 @@ def main() -> int:
         json.dump(pca_manifest, f, indent=2)
 
     # ---------------------------------------------------------------------
-    # Load probe classifier params
-    # ---------------------------------------------------------------------
-    probe_params = {}
-    for layer in layers:
-        state = torch.load(probe_map[layer], map_location="cpu")
-        w, b = extract_classifier_params(state)
-        probe_params[layer] = (w, b)
-
-    # ---------------------------------------------------------------------
-    # Baseline and sweep
+    # Evaluate baseline and sweep
     # ---------------------------------------------------------------------
     baseline = {}
     sweep = {str(k): {} for k in k_values}
 
-    for layer in tqdm(layers, desc="Evaluating baseline + k sweep"):
-        w, b = probe_params[layer]
-        dim = x_val[layer].shape[1]
-        if w.shape[0] != dim:
-            raise ValueError(
-                f"Probe dim mismatch at layer {layer}: probe={w.shape[0]} vs features={dim}"
-            )
+    if is_attn:
+        for layer in tqdm(layers, desc="Evaluating baseline + k sweep (attn)"):
+            state = torch.load(probe_map[layer], map_location="cpu")
+            dim = x_val[layer].shape[2]
+            probe = LayerProbe(input_dim=dim, pooling_type="attn").to(device)
+            probe.load_state_dict(state)
+            probe.eval()
 
-        # Baseline (k=0)
-        val_logits_base = x_val[layer] @ w + b
-        ood_logits_base = x_ood[layer] @ w + b
-        val_auc_base, val_acc_base = compute_metrics(y_val, val_logits_base)
-        ood_auc_base, ood_acc_base = compute_metrics(y_ood, ood_logits_base)
+            val_logits_base = run_attn_probe_logits(probe, x_val[layer], args.batch_size, device)
+            ood_logits_base = run_attn_probe_logits(probe, x_ood[layer], args.batch_size, device)
+            val_auc_base, val_acc_base = compute_metrics(y_val, val_logits_base)
+            ood_auc_base, ood_acc_base = compute_metrics(y_ood, ood_logits_base)
 
-        baseline[layer] = {
-            "id_val_auc": val_auc_base,
-            "id_val_acc": val_acc_base,
-            "ood_test_auc": ood_auc_base,
-            "ood_test_acc": ood_acc_base,
-            "generalization_gap": val_auc_base - ood_auc_base,
-        }
-
-        # k sweep
-        pca_art = pca_by_layer[layer]
-        for k in k_values:
-            x_val_clean = remove_top_k_pcs(x_val[layer], pca_art.mean, pca_art.components, k)
-            x_ood_clean = remove_top_k_pcs(x_ood[layer], pca_art.mean, pca_art.components, k)
-
-            val_logits = x_val_clean @ w + b
-            ood_logits = x_ood_clean @ w + b
-            val_auc, val_acc = compute_metrics(y_val, val_logits)
-            ood_auc, ood_acc = compute_metrics(y_ood, ood_logits)
-
-            sweep[str(k)][layer] = {
-                "id_val_auc": val_auc,
-                "id_val_acc": val_acc,
-                "ood_test_auc": ood_auc,
-                "ood_test_acc": ood_acc,
-                "generalization_gap": val_auc - ood_auc,
-                "delta_id_auc_vs_baseline": val_auc - val_auc_base,
-                "delta_ood_auc_vs_baseline": ood_auc - ood_auc_base,
-                "delta_gap_vs_baseline": (val_auc - ood_auc) - (val_auc_base - ood_auc_base),
+            baseline[layer] = {
+                "id_val_auc": val_auc_base,
+                "id_val_acc": val_acc_base,
+                "ood_test_auc": ood_auc_base,
+                "ood_test_acc": ood_acc_base,
+                "generalization_gap": val_auc_base - ood_auc_base,
             }
+
+            pca_art = pca_by_layer[layer]
+            for k in k_values:
+                x_val_clean = remove_top_k_pcs_tokens(x_val[layer], pca_art.mean, pca_art.components, k)
+                x_ood_clean = remove_top_k_pcs_tokens(x_ood[layer], pca_art.mean, pca_art.components, k)
+
+                val_logits = run_attn_probe_logits(probe, x_val_clean, args.batch_size, device)
+                ood_logits = run_attn_probe_logits(probe, x_ood_clean, args.batch_size, device)
+                val_auc, val_acc = compute_metrics(y_val, val_logits)
+                ood_auc, ood_acc = compute_metrics(y_ood, ood_logits)
+
+                sweep[str(k)][layer] = {
+                    "id_val_auc": val_auc,
+                    "id_val_acc": val_acc,
+                    "ood_test_auc": ood_auc,
+                    "ood_test_acc": ood_acc,
+                    "generalization_gap": val_auc - ood_auc,
+                    "delta_id_auc_vs_baseline": val_auc - val_auc_base,
+                    "delta_ood_auc_vs_baseline": ood_auc - ood_auc_base,
+                    "delta_gap_vs_baseline": (val_auc - ood_auc) - (val_auc_base - ood_auc_base),
+                }
+    else:
+        probe_params = {}
+        for layer in layers:
+            state = torch.load(probe_map[layer], map_location="cpu")
+            w, b = extract_classifier_params(state)
+            probe_params[layer] = (w, b)
+
+        for layer in tqdm(layers, desc="Evaluating baseline + k sweep"):
+            w, b = probe_params[layer]
+            dim = x_val[layer].shape[1]
+            if w.shape[0] != dim:
+                raise ValueError(
+                    f"Probe dim mismatch at layer {layer}: probe={w.shape[0]} vs features={dim}"
+                )
+
+            # Baseline (k=0)
+            val_logits_base = x_val[layer] @ w + b
+            ood_logits_base = x_ood[layer] @ w + b
+            val_auc_base, val_acc_base = compute_metrics(y_val, val_logits_base)
+            ood_auc_base, ood_acc_base = compute_metrics(y_ood, ood_logits_base)
+
+            baseline[layer] = {
+                "id_val_auc": val_auc_base,
+                "id_val_acc": val_acc_base,
+                "ood_test_auc": ood_auc_base,
+                "ood_test_acc": ood_acc_base,
+                "generalization_gap": val_auc_base - ood_auc_base,
+            }
+
+            # k sweep
+            pca_art = pca_by_layer[layer]
+            for k in k_values:
+                x_val_clean = remove_top_k_pcs(x_val[layer], pca_art.mean, pca_art.components, k)
+                x_ood_clean = remove_top_k_pcs(x_ood[layer], pca_art.mean, pca_art.components, k)
+
+                val_logits = x_val_clean @ w + b
+                ood_logits = x_ood_clean @ w + b
+                val_auc, val_acc = compute_metrics(y_val, val_logits)
+                ood_auc, ood_acc = compute_metrics(y_ood, ood_logits)
+
+                sweep[str(k)][layer] = {
+                    "id_val_auc": val_auc,
+                    "id_val_acc": val_acc,
+                    "ood_test_auc": ood_auc,
+                    "ood_test_acc": ood_acc,
+                    "generalization_gap": val_auc - ood_auc,
+                    "delta_id_auc_vs_baseline": val_auc - val_auc_base,
+                    "delta_ood_auc_vs_baseline": ood_auc - ood_auc_base,
+                    "delta_gap_vs_baseline": (val_auc - ood_auc) - (val_auc_base - ood_auc_base),
+                }
 
     # ---------------------------------------------------------------------
     # Summaries + plots
@@ -596,6 +813,8 @@ def main() -> int:
     config = {
         "model_name": args.model_name,
         "pooling": args.pooling,
+        "pca_fit_level": pca_fit_level,
+        "evaluation_mode": evaluation_mode,
         "id_train_activations_dir": args.id_train_activations_dir,
         "id_val_activations_dir": args.id_val_activations_dir,
         "ood_test_activations_dir": args.ood_test_activations_dir,
@@ -607,6 +826,8 @@ def main() -> int:
         "pca_solver": args.pca_solver,
         "pc_sign_rule": args.pc_sign_rule,
         "max_train_samples_for_pca": args.max_train_samples_for_pca,
+        "batch_size": args.batch_size,
+        "device": str(device),
         "created_at_utc": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
 
