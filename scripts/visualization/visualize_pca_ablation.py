@@ -919,7 +919,7 @@ def load_prior_best_ood_by_pooling(
     if not layer_results_root:
         return {}, {p: "layer_results_root not provided" for p in poolings}
 
-    metric_priority = ["ood_auc", "test_auc", "auc", "val_auc", "min_val_auc"]
+    metric_priority = ["ood_auc", "test_auc", "auc"]
     prior: Dict[str, dict] = {}
     skipped: Dict[str, str] = {}
 
@@ -982,6 +982,52 @@ def load_prior_best_ood_by_pooling(
         }
 
     return prior, skipped
+
+
+def load_ood_eval_best_by_pooling(
+    ood_results_json: Optional[str],
+    poolings: List[str],
+) -> Tuple[Dict[str, dict], Dict[str, str]]:
+    if not ood_results_json:
+        return {}, {p: "ood_results_json not provided" for p in poolings}
+    if not os.path.exists(ood_results_json):
+        return {}, {p: f"missing file: {ood_results_json}" for p in poolings}
+
+    try:
+        with open(ood_results_json, "r") as f:
+            payload = json.load(f)
+    except Exception as e:
+        return {}, {p: f"failed to read {ood_results_json}: {e}" for p in poolings}
+
+    if not isinstance(payload, dict):
+        return {}, {p: f"unexpected JSON shape in {ood_results_json}" for p in poolings}
+
+    out: Dict[str, dict] = {}
+    skipped: Dict[str, str] = {}
+    for pooling in poolings:
+        block = payload.get(pooling)
+        if not isinstance(block, dict):
+            skipped[pooling] = f"pooling '{pooling}' not found in {ood_results_json}"
+            continue
+
+        best_auc = block.get("best_auc", np.nan)
+        try:
+            best_auc = float(best_auc)
+        except Exception:
+            skipped[pooling] = f"non-numeric best_auc for '{pooling}' in {ood_results_json}"
+            continue
+
+        if not np.isfinite(best_auc):
+            skipped[pooling] = f"invalid best_auc for '{pooling}' in {ood_results_json}"
+            continue
+
+        out[pooling] = {
+            "path": ood_results_json,
+            "metric_key": "best_auc",
+            "best_prior_ood": best_auc,
+        }
+
+    return out, skipped
 
 
 def plot_cross_pooling_layer_k_ood_auc_grid(
@@ -1245,7 +1291,7 @@ def plot_cross_pooling_3way_best_ood_bar(
     width = 0.25
 
     series_names = [
-        "Probe Best OOD",
+        "Best OOD (Eval)",
         "Attribution Best OOD",
         "PCA Best OOD (Layer x k)",
     ]
@@ -1515,7 +1561,12 @@ def run_cross_pooling_mode(args: argparse.Namespace) -> int:
         os.path.join(output_dir, "cross_pooling_overview.json"),
     )
 
+    # Prefer explicit OOD evaluation summary for the "best OOD (eval)" bar.
+    ood_eval_map, ood_eval_skipped = load_ood_eval_best_by_pooling(args.ood_results_json, valid_poolings)
     prior_best_map, prior_skipped = load_prior_best_ood_by_pooling(args.layer_results_root, valid_poolings)
+    probe_best_map = dict(prior_best_map)
+    probe_best_map.update(ood_eval_map)
+
     if prior_best_map:
         plot_cross_pooling_beats_prior_best_grid(
             valid_poolings,
@@ -1538,6 +1589,9 @@ def run_cross_pooling_mode(args: argparse.Namespace) -> int:
     if prior_skipped:
         for pooling, reason in prior_skipped.items():
             print(f"[WARN] Prior best OOD unavailable for '{pooling}': {reason}")
+    if ood_eval_skipped:
+        for pooling, reason in ood_eval_skipped.items():
+            print(f"[WARN] OOD eval best unavailable for '{pooling}': {reason}")
 
     # 3-way grouped bar comparison:
     # 1) best OOD from probe layer_results
@@ -1553,7 +1607,7 @@ def run_cross_pooling_mode(args: argparse.Namespace) -> int:
 
     bar_rows = plot_cross_pooling_3way_best_ood_bar(
         valid_poolings,
-        prior_best_map,
+        probe_best_map,
         attr_best_map,
         pca_best_map,
         os.path.join(output_dir, "cross_pooling_3way_best_ood_bar_comparison.png"),
@@ -1578,7 +1632,8 @@ def run_cross_pooling_mode(args: argparse.Namespace) -> int:
     print(f"Output dir:   {output_dir}")
     print(f"Valid poolings: {valid_poolings}")
     print(f"Skipped poolings: {skipped}")
-    print(f"Prior-best references loaded: {sorted(list(prior_best_map.keys()))}")
+    print(f"OOD-eval references loaded: {sorted(list(ood_eval_map.keys()))}")
+    print(f"Fallback prior references loaded: {sorted(list(prior_best_map.keys()))}")
     print(f"Attribution references loaded: {sorted(list(attr_best_map.keys()))}")
     print(f"Global layers: {all_layers}")
     print(f"Global k values: {all_k_values}")
@@ -1628,6 +1683,15 @@ def main() -> int:
         help=(
             "Cross-pooling mode: root with {pooling}/tables/derived_layer_metrics.csv "
             "for best-OOD-during-training comparison"
+        ),
+    )
+    parser.add_argument(
+        "--ood_results_json",
+        type=str,
+        default=None,
+        help=(
+            "Cross-pooling mode: path to ood_results_all_pooling.json. "
+            "Used as primary source for 'Best OOD (Eval)' bar."
         ),
     )
     parser.add_argument(
