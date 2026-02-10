@@ -438,6 +438,134 @@ def build_all_point_rankings(df_long: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     }
 
 
+def build_best_k_per_layer_by_ood(df_long: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "pooling",
+        "layer",
+        "k",
+        "baseline_ood_test_auc",
+        "ood_test_auc",
+        "delta_ood_auc_vs_baseline",
+        "baseline_id_val_auc",
+        "id_val_auc",
+        "delta_id_auc_vs_baseline",
+        "baseline_gap",
+        "generalization_gap",
+        "delta_gap_vs_baseline",
+    ]
+    if df_long.empty:
+        return pd.DataFrame(
+            columns=[
+                "pooling",
+                "layer",
+                "best_k",
+                "baseline_ood_test_auc",
+                "ood_test_auc",
+                "delta_ood_auc_vs_baseline",
+                "baseline_id_val_auc",
+                "id_val_auc",
+                "delta_id_auc_vs_baseline",
+                "baseline_gap",
+                "generalization_gap",
+                "delta_gap_vs_baseline",
+            ]
+        )
+
+    view = df_long[cols].copy()
+    best = (
+        view.sort_values(
+            ["pooling", "layer", "delta_ood_auc_vs_baseline", "k"],
+            ascending=[True, True, False, True],
+        )
+        .drop_duplicates(["pooling", "layer"], keep="first")
+        .rename(columns={"k": "best_k"})
+        .sort_values(["pooling", "layer"])
+        .reset_index(drop=True)
+    )
+    return best
+
+
+def build_lowk_topn_rankings(
+    df_long: pd.DataFrame,
+    k_cap: int,
+    top_n: int,
+) -> Dict[str, pd.DataFrame]:
+    cols = [
+        "pooling",
+        "layer",
+        "k",
+        "baseline_ood_test_auc",
+        "ood_test_auc",
+        "delta_ood_auc_vs_baseline",
+        "baseline_id_val_auc",
+        "id_val_auc",
+        "delta_id_auc_vs_baseline",
+        "baseline_gap",
+        "generalization_gap",
+        "delta_gap_vs_baseline",
+    ]
+    empty = pd.DataFrame(columns=cols)
+    if df_long.empty:
+        return {"global": empty.copy(), "by_pooling": empty.copy()}
+
+    lowk = df_long[df_long["k"] <= int(k_cap)][cols].copy()
+    if lowk.empty:
+        return {"global": empty.copy(), "by_pooling": empty.copy()}
+
+    ordered = lowk.sort_values(
+        ["delta_ood_auc_vs_baseline", "k", "pooling", "layer"],
+        ascending=[False, True, True, True],
+    ).reset_index(drop=True)
+    global_top = ordered.head(int(top_n)).reset_index(drop=True)
+
+    by_pooling_frames: List[pd.DataFrame] = []
+    for pooling, sub in ordered.groupby("pooling", sort=True):
+        top_pooling = sub.head(int(top_n)).copy()
+        top_pooling.insert(0, "rank_within_pooling", np.arange(1, len(top_pooling) + 1))
+        by_pooling_frames.append(top_pooling)
+
+    by_pooling = (
+        pd.concat(by_pooling_frames, ignore_index=True)
+        if by_pooling_frames
+        else pd.DataFrame(columns=["rank_within_pooling"] + cols)
+    )
+    return {"global": global_top, "by_pooling": by_pooling}
+
+
+def build_pareto_k_vs_ood_table(df_long: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "pooling",
+        "layer",
+        "k",
+        "baseline_ood_test_auc",
+        "ood_test_auc",
+        "delta_ood_auc_vs_baseline",
+        "baseline_id_val_auc",
+        "id_val_auc",
+        "delta_id_auc_vs_baseline",
+        "baseline_gap",
+        "generalization_gap",
+        "delta_gap_vs_baseline",
+    ]
+    if df_long.empty:
+        return pd.DataFrame(columns=cols + ["pareto_k_vs_ood"])
+
+    view = df_long[cols].dropna(subset=["k", "delta_ood_auc_vs_baseline"]).copy()
+    if view.empty:
+        return pd.DataFrame(columns=cols + ["pareto_k_vs_ood"])
+
+    k_vals = view["k"].to_numpy(dtype=np.float64)
+    ood_delta = view["delta_ood_auc_vs_baseline"].to_numpy(dtype=np.float64)
+    # Lower k and higher delta_ood are preferred. Convert to maximizing (-k, delta_ood).
+    mask = pareto_nondominated(-k_vals, ood_delta)
+    view["pareto_k_vs_ood"] = mask.astype(int)
+    view = view.sort_values(
+        ["pareto_k_vs_ood", "k", "delta_ood_auc_vs_baseline", "pooling", "layer"],
+        ascending=[False, True, False, True, True],
+    ).reset_index(drop=True)
+    return view
+
+
 def build_k_aggregate_summary(df_long: pd.DataFrame) -> pd.DataFrame:
     if df_long.empty:
         return pd.DataFrame(
@@ -487,6 +615,12 @@ def save_table(df: pd.DataFrame, csv_path: Path, parquet_path: Optional[Path] = 
         except Exception:
             # Parquet engine may be unavailable in some colab kernels.
             pass
+
+
+def csv_row_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return int(pd.read_csv(path).shape[0])
 
 
 def plot_heatmap_by_pooling(
@@ -623,6 +757,72 @@ def plot_pareto_front(df_long: pd.DataFrame, out_path: Path) -> Optional[Path]:
     plt.title("Pareto Frontier: ID/OOD Delta Tradeoff")
     plt.grid(alpha=0.25)
     plt.legend()
+    plt.tight_layout()
+    ensure_dir(out_path.parent)
+    plt.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close()
+    return out_path
+
+
+def plot_pareto_k_vs_ood(
+    df_long: pd.DataFrame,
+    pareto_df: pd.DataFrame,
+    out_path: Path,
+) -> Optional[Path]:
+    if df_long.empty or pareto_df.empty:
+        return None
+
+    all_points = df_long[["k", "delta_ood_auc_vs_baseline"]].dropna()
+    if all_points.empty:
+        return None
+
+    frontier = pareto_df[pareto_df["pareto_k_vs_ood"] == 1].copy()
+    if frontier.empty:
+        return None
+
+    frontier = frontier.sort_values(["k", "delta_ood_auc_vs_baseline"], ascending=[True, False])
+    colors = {
+        "mean": "#1f77b4",
+        "max": "#d62728",
+        "last": "#2ca02c",
+        "attn": "#9467bd",
+    }
+
+    plt.figure(figsize=(8.6, 6.5))
+    plt.scatter(
+        all_points["k"].to_numpy(dtype=np.float64),
+        all_points["delta_ood_auc_vs_baseline"].to_numpy(dtype=np.float64),
+        s=24,
+        alpha=0.25,
+        color="#8f8f8f",
+        label="All points",
+    )
+
+    for pooling, sub in frontier.groupby("pooling", sort=True):
+        plt.scatter(
+            sub["k"].to_numpy(dtype=np.float64),
+            sub["delta_ood_auc_vs_baseline"].to_numpy(dtype=np.float64),
+            s=72,
+            alpha=0.95,
+            color=colors.get(pooling, "#333333"),
+            edgecolor="black",
+            linewidth=0.6,
+            label=f"Pareto ({pooling})",
+        )
+
+    plt.plot(
+        frontier["k"].to_numpy(dtype=np.float64),
+        frontier["delta_ood_auc_vs_baseline"].to_numpy(dtype=np.float64),
+        color="#111111",
+        linewidth=1.3,
+        alpha=0.8,
+    )
+    plt.axhline(0.0, linestyle="--", color="#555555", linewidth=1.0, alpha=0.7)
+    plt.xlabel("k removed PCs (lower is better)")
+    plt.ylabel("Delta OOD AUC vs baseline (higher is better)")
+    plt.title("Pareto Frontier: k vs OOD Delta")
+    plt.grid(alpha=0.25)
+    plt.legend(loc="best", fontsize=8)
     plt.tight_layout()
     ensure_dir(out_path.parent)
     plt.savefig(out_path, dpi=220, bbox_inches="tight")
@@ -888,6 +1088,8 @@ def run_analysis(args: argparse.Namespace) -> int:
         "analysis_subdir": args.analysis_subdir,
         "force_rebuild": bool(args.force_rebuild),
         "strict": bool(args.strict),
+        "efficient_k_cap": int(args.efficient_k_cap),
+        "top_n": int(args.top_n),
         "git_commit": try_get_git_commit(Path(args.repo_root).resolve()),
     }
     write_json(meta_dir / "run_manifest.json", manifest)
@@ -898,6 +1100,21 @@ def run_analysis(args: argparse.Namespace) -> int:
         poolings = parse_poolings(args.poolings)
         if not poolings:
             raise ValueError("No poolings selected.")
+        if int(args.efficient_k_cap) < 1:
+            raise ValueError("--efficient_k_cap must be >= 1")
+        if int(args.top_n) < 1:
+            raise ValueError("--top_n must be >= 1")
+
+        best_k_path = tables_dir / "best_k_per_pooling_layer_by_max_ood_delta.csv"
+        lowk_top_global_path = (
+            tables_dir / f"top{int(args.top_n)}_ood_gain_lowk_leq{int(args.efficient_k_cap)}.csv"
+        )
+        lowk_top_by_pooling_path = (
+            tables_dir / f"top{int(args.top_n)}_ood_gain_lowk_leq{int(args.efficient_k_cap)}_by_pooling.csv"
+        )
+        pareto_table_path = tables_dir / "pareto_k_vs_ood_delta.csv"
+        pareto_frontier_only_path = tables_dir / "pareto_k_vs_ood_delta_frontier_only.csv"
+        pareto_k_plot_path = figures_dir / "pareto_k_vs_ood_delta.png"
 
         discover_outputs = [meta_dir / "discovered_inputs.json"]
         if args.force_rebuild or STEP_DISCOVER not in completed_steps or not outputs_exist(discover_outputs):
@@ -937,6 +1154,11 @@ def run_analysis(args: argparse.Namespace) -> int:
             tables_dir / "rank_all_points_by_ood_gain_ascending.csv",
             tables_dir / "rank_all_points_by_ood_gain_desc.csv",
             tables_dir / "ood_gain_summary_by_pooling_k.csv",
+            best_k_path,
+            lowk_top_global_path,
+            lowk_top_by_pooling_path,
+            pareto_table_path,
+            pareto_frontier_only_path,
         ]
         if args.force_rebuild or STEP_BUILD_TABLES not in completed_steps or not outputs_exist(tables_outputs):
             baseline_frames: List[pd.DataFrame] = []
@@ -965,6 +1187,19 @@ def run_analysis(args: argparse.Namespace) -> int:
             ranking = build_ranking_tables(leastk_df)
             all_point_ranking = build_all_point_rankings(long_df)
             k_summary_df = build_k_aggregate_summary(long_df)
+            best_k_df = build_best_k_per_layer_by_ood(long_df)
+            lowk_rankings = build_lowk_topn_rankings(
+                long_df,
+                k_cap=int(args.efficient_k_cap),
+                top_n=int(args.top_n),
+            )
+            pareto_with_flag_df = build_pareto_k_vs_ood_table(long_df)
+            pareto_frontier_df = (
+                pareto_with_flag_df[pareto_with_flag_df["pareto_k_vs_ood"] == 1]
+                .copy()
+                .sort_values(["k", "delta_ood_auc_vs_baseline"], ascending=[True, False])
+                .reset_index(drop=True)
+            )
 
             save_table(
                 long_df,
@@ -997,6 +1232,11 @@ def run_analysis(args: argparse.Namespace) -> int:
                 None,
             )
             save_table(k_summary_df, tables_dir / "ood_gain_summary_by_pooling_k.csv", None)
+            save_table(best_k_df, best_k_path, None)
+            save_table(lowk_rankings["global"], lowk_top_global_path, None)
+            save_table(lowk_rankings["by_pooling"], lowk_top_by_pooling_path, None)
+            save_table(pareto_with_flag_df, pareto_table_path, None)
+            save_table(pareto_frontier_df, pareto_frontier_only_path, None)
 
             mark_step_completed(progress, STEP_BUILD_TABLES, tables_outputs)
             save_progress(progress_path, progress)
@@ -1011,6 +1251,7 @@ def run_analysis(args: argparse.Namespace) -> int:
             figures_dir / "id_vs_ood_delta_scatter.png",
             figures_dir / "id_vs_ood_delta_pareto.png",
             figures_dir / "best_leastk_ood_gain_by_pooling.png",
+            pareto_k_plot_path,
         ]
         for pooling in sorted(available_inputs.keys()):
             plot_outputs.append(figures_dir / f"delta_ood_heatmap_{pooling}.png")
@@ -1045,6 +1286,10 @@ def run_analysis(args: argparse.Namespace) -> int:
             bar = plot_best_ood_gain_by_pooling(leastk_df, figures_dir / "best_leastk_ood_gain_by_pooling.png")
             if bar:
                 output_paths.append(bar)
+            pareto_k_df = build_pareto_k_vs_ood_table(long_df)
+            pareto_k = plot_pareto_k_vs_ood(long_df, pareto_k_df, pareto_k_plot_path)
+            if pareto_k:
+                output_paths.append(pareto_k)
 
             mark_step_completed(progress, STEP_PLOTS, output_paths)
             save_progress(progress_path, progress)
@@ -1140,10 +1385,15 @@ def run_analysis(args: argparse.Namespace) -> int:
             "output_root": str(output_root),
             "poolings_analyzed": sorted(list(available_inputs.keys())),
             "counts": {
-                "long_rows": int(pd.read_csv(tables_dir / "pca_sweep_long.csv").shape[0]),
-                "baseline_rows": int(pd.read_csv(tables_dir / "pca_baseline_by_layer.csv").shape[0]),
-                "least_k_rows": int(pd.read_csv(tables_dir / "least_k_ood_gain_per_pooling_layer.csv").shape[0]),
-                "direction_catalog_rows": int(pd.read_csv(phase2_dir / "pca_direction_catalog.csv").shape[0]),
+                "long_rows": csv_row_count(tables_dir / "pca_sweep_long.csv"),
+                "baseline_rows": csv_row_count(tables_dir / "pca_baseline_by_layer.csv"),
+                "least_k_rows": csv_row_count(tables_dir / "least_k_ood_gain_per_pooling_layer.csv"),
+                "best_k_rows": csv_row_count(best_k_path),
+                "lowk_top_global_rows": csv_row_count(lowk_top_global_path),
+                "lowk_top_by_pooling_rows": csv_row_count(lowk_top_by_pooling_path),
+                "pareto_rows": csv_row_count(pareto_table_path),
+                "pareto_frontier_rows": csv_row_count(pareto_frontier_only_path),
+                "direction_catalog_rows": csv_row_count(phase2_dir / "pca_direction_catalog.csv"),
             },
             "table_paths": [str(p) for p in sorted(tables_dir.glob("*")) if p.is_file()],
             "figure_paths": [str(p) for p in sorted(figures_dir.glob("*")) if p.is_file()],
@@ -1209,6 +1459,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="pca_ablation_results.json",
         help="Per-pooling results JSON file name.",
+    )
+    parser.add_argument(
+        "--efficient_k_cap",
+        type=int,
+        default=5,
+        help="Strategy-C low-k cap (keep rows with k <= efficient_k_cap).",
+    )
+    parser.add_argument(
+        "--top_n",
+        type=int,
+        default=20,
+        help="Top-N size for strategy-C low-k ranking outputs.",
     )
     parser.add_argument(
         "--repo_root",
