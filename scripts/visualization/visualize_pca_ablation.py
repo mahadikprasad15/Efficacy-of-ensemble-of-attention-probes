@@ -181,6 +181,7 @@ def plot_tradeoff(
     mean_ood_auc: np.ndarray,
     baseline_id_mean: float,
     baseline_ood_mean: float,
+    best_probe_ood: Optional[float],
     out_path: str,
     title_prefix: str = "",
 ) -> None:
@@ -192,7 +193,16 @@ def plot_tradeoff(
     plt.plot(k_values, mean_id_auc, marker="o", linewidth=2.0, label="Mean ID Val AUC")
     plt.plot(k_values, mean_ood_auc, marker="s", linewidth=2.0, label="Mean OOD Test AUC")
     plt.axhline(baseline_id_mean, linestyle="--", alpha=0.5, color="#1f77b4", label="Baseline ID mean")
-    plt.axhline(baseline_ood_mean, linestyle="--", alpha=0.5, color="#ff7f0e", label="Baseline OOD mean")
+    plt.axhline(baseline_ood_mean, linestyle="--", alpha=0.65, color="#ff7f0e", linewidth=1.4, label="Baseline OOD mean")
+    if best_probe_ood is not None and np.isfinite(best_probe_ood):
+        plt.axhline(
+            float(best_probe_ood),
+            linestyle="--",
+            color="black",
+            linewidth=1.4,
+            alpha=0.8,
+            label="Best OOD (Probe)",
+        )
     plt.xlabel("k removed PCs")
     plt.ylabel("AUC")
     plt.title(title)
@@ -210,6 +220,7 @@ def plot_layerwise_grid(
     ood_auc: np.ndarray,
     base_id: np.ndarray,
     base_ood: np.ndarray,
+    best_probe_ood: Optional[float],
     out_path: str,
     grid_cols: int,
     title_prefix: str = "",
@@ -244,7 +255,15 @@ def plot_layerwise_grid(
         if np.isfinite(base_id[idx]):
             ax.axhline(base_id[idx], linestyle="--", color="#1f77b4", alpha=0.45, linewidth=1.2)
         if np.isfinite(base_ood[idx]):
-            ax.axhline(base_ood[idx], linestyle="--", color="#ff7f0e", alpha=0.45, linewidth=1.2)
+            ax.axhline(base_ood[idx], linestyle="--", color="#ff7f0e", alpha=0.65, linewidth=1.2)
+        if best_probe_ood is not None and np.isfinite(best_probe_ood):
+            ax.axhline(
+                float(best_probe_ood),
+                linestyle="--",
+                color="black",
+                alpha=0.8,
+                linewidth=1.1,
+            )
         ax.set_title(f"Layer {layer}", fontsize=9, fontweight="bold")
         ax.set_ylim(y_min, y_max)
         ax.grid(alpha=0.25)
@@ -1446,12 +1465,21 @@ def run_single_mode(args: argparse.Namespace) -> int:
         "OOD Test AUC Delta vs Baseline",
         os.path.join(output_dir, "delta_heatmap_ood.png"),
     )
+    # Optional best OOD probe reference line (from ood_results_all_pooling.json)
+    best_probe_ood = None
+    if args.ood_results_json:
+        pooling = os.path.basename(os.path.normpath(args.input_dir))
+        ood_eval_map, _ = load_ood_eval_best_by_pooling(args.ood_results_json, [pooling])
+        if pooling in ood_eval_map:
+            best_probe_ood = float(ood_eval_map[pooling].get("best_prior_ood", float("nan")))
+
     plot_tradeoff(
         k_values,
         mean_id_auc,
         mean_ood_auc,
         baseline_mean_id,
         baseline_mean_ood,
+        best_probe_ood,
         os.path.join(output_dir, "id_vs_ood_tradeoff.png"),
         title_prefix=args.title_prefix,
     )
@@ -1463,6 +1491,7 @@ def run_single_mode(args: argparse.Namespace) -> int:
         ood_auc,
         base_id,
         base_ood,
+        best_probe_ood,
         os.path.join(output_dir, "layerwise_id_ood_vs_k_grid.png"),
         grid_cols=args.grid_cols,
         title_prefix=args.title_prefix,
