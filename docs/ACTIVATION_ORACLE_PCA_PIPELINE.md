@@ -58,7 +58,7 @@ Repeat for per-PC jobs by swapping `exp1_combined_jobs.jsonl` with `exp3_per_pc_
 
 Both scripts emit live `tqdm` progress bars and periodic log lines to stdout.
 
-## Exp2: Prepare flip-mined jobs (orig vs clean)
+## Exp2: Prepare flip-mined jobs (orig vs clean, separate runs)
 
 ```bash
 python -u scripts/activation_oracle/prepare_oracle_vectors_exp2.py \
@@ -75,7 +75,7 @@ python -u scripts/activation_oracle/prepare_oracle_vectors_exp2.py \
 
 This creates:
 - `results/tables/exp2_top_flips.csv`
-- `results/jobs/exp2_compare_jobs.jsonl`
+- `results/jobs/exp2_single_jobs.jsonl`
 
 Run AO inference on exp2 jobs with the same `run_activation_oracle.py` command, swapping `--jobs_jsonl`.
 

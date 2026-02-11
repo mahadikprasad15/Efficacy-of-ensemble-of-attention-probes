@@ -1,9 +1,9 @@
 {
   "name": "exp2_v1",
-  "exp2_compare": [
+  "exp2_single": [
     {
-      "id": "exp2_q1",
-      "text": "The first ? is A (original last-token state). The second ? is B (PCA-cleaned last-token state).\n\nTask: Describe what information is present in A but missing in B.\nAnswer in JSON with keys:\n\nsummary (1 sentence)\nsurface_markers (5 likely tokens/phrases)\nspeech_act (one of: request, apology, excuse, justification, denial, confession, compliance, refusal, tool_action_log, other)\ndeception_tactic (one of: externalizing_blame, family_emergency, illness, technical_issue, vague_unavoidable, moral_justification, pressure_appeal, plausible_deniability, none/unclear)\nartifact_vs_semantic (artifact/style/semantic/mixed)\nconfidence (0-1)"
+      "id": "exp2_single",
+      "text": "Task: Describe what information is present\nAnswer in JSON with keys:\n\nsummary (1 sentence)\nsurface_markers (5 likely tokens/phrases)\nspeech_act (one of: request, apology, excuse, justification, denial, confession, compliance, refusal, tool_action_log, other)\ndeception_tactic (one of: externalizing_blame, family_emergency, illness, technical_issue, vague_unavoidable, moral_justification, pressure_appeal, plausible_deniability, none/unclear)\nartifact_vs_semantic (artifact/style/semantic/mixed)\nconfidence (0-1)"
     }
   ]
 }
