@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Prepare persisted PCA-removal vectors and AO job manifests from saved PCA artifacts."""
+"""Prepare global PCA vectors and AO job manifests from saved PCA artifacts.
+
+This script does not use per-sample activations. It builds:
+- Exp1: combined top-k PC sums per pooling/layer/k (global, raw direction sums)
+- Exp3: individual PC directions per pooling/layer up to max k (global)
+"""
 
 from __future__ import annotations
 
 import argparse
 import csv
-import glob
 import hashlib
 import json
 import os
@@ -14,9 +18,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
-import torch
-from safetensors.torch import load_file
 from tqdm import tqdm
 
 from common import (
@@ -41,20 +42,6 @@ STEP_VALIDATE = "validate_inputs"
 STEP_PERSIST_VECTORS = "persist_vectors"
 STEP_BUILD_JOBS = "build_jobs"
 STEP_FINALIZE = "finalize"
-
-
-def parse_key_value_list(raw: Iterable[str]) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for item in raw:
-        if "=" not in item:
-            raise ValueError(f"Expected KEY=VALUE, got: {item}")
-        k, v = item.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        if not k or not v:
-            raise ValueError(f"Invalid KEY=VALUE item: {item}")
-        out[k] = v
-    return out
 
 
 def parse_csv_values(raw: str) -> List[str]:
@@ -117,109 +104,8 @@ def load_questions(questions_json: Optional[str]) -> dict:
     return cfg
 
 
-def load_label_map(activations_dir: str) -> Dict[str, int]:
-    manifest_path = os.path.join(activations_dir, "manifest.jsonl")
-    if not os.path.exists(manifest_path):
-        raise FileNotFoundError(f"Missing manifest.jsonl in {activations_dir}")
-
-    label_map: Dict[str, int] = {}
-    with open(manifest_path, "r") as f:
-        for line in f:
-            entry = json.loads(line)
-            label_map[entry["id"]] = int(entry.get("label", -1))
-    return label_map
-
-
-def pool_tokens(x_layer: torch.Tensor, pooling: str) -> np.ndarray:
-    if pooling == "mean":
-        pooled = x_layer.mean(dim=0)
-    elif pooling == "last":
-        pooled = x_layer[-1, :]
-    else:
-        raise ValueError(f"Unsupported pooling for this pipeline: {pooling}")
-    return pooled.detach().cpu().numpy().astype(np.float32, copy=False)
-
-
-def load_pooled_split(
-    activations_dir: str,
-    layers: List[int],
-    pooling: str,
-    desc: str,
-    limit: int,
-) -> Tuple[Dict[int, np.ndarray], np.ndarray, List[str]]:
-    label_map = load_label_map(activations_dir)
-    shard_paths = sorted(glob.glob(os.path.join(activations_dir, "shard_*.safetensors")))
-    if not shard_paths:
-        raise FileNotFoundError(f"No shard_*.safetensors in {activations_dir}")
-
-    feature_buckets: Dict[int, List[np.ndarray]] = {l: [] for l in layers}
-    labels: List[int] = []
-    sample_ids: List[str] = []
-
-    for shard_path in tqdm(shard_paths, desc=f"{desc}: load shards", unit="shard", leave=False):
-        shard = load_file(shard_path)
-        for sid, tensor in shard.items():
-            if sid not in label_map:
-                continue
-            label = label_map[sid]
-            if label == -1:
-                continue
-            if tensor.dim() != 3:
-                continue
-            if max(layers) >= tensor.shape[0]:
-                continue
-
-            for layer in layers:
-                feature_buckets[layer].append(pool_tokens(tensor[layer, :, :], pooling))
-            labels.append(label)
-            sample_ids.append(sid)
-
-            if limit > 0 and len(labels) >= limit:
-                break
-        if limit > 0 and len(labels) >= limit:
-            break
-
-    if not labels:
-        raise ValueError(f"No labeled examples loaded for {desc}: {activations_dir}")
-
-    x_by_layer = {layer: np.stack(rows).astype(np.float32) for layer, rows in feature_buckets.items()}
-    y = np.asarray(labels, dtype=np.int64)
-    return x_by_layer, y, sample_ids
-
-
-def find_probe_path(probes_root: Path, pooling: str, layer: int) -> Optional[Path]:
-    candidates = [
-        probes_root / pooling / f"probe_layer_{layer}.pt",
-        probes_root / f"probe_layer_{layer}.pt",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
-
-
-def extract_classifier_params(state_dict: Dict[str, torch.Tensor]) -> Tuple[np.ndarray, float]:
-    weight_key = None
-    bias_key = None
-    for key in state_dict:
-        if key.endswith("classifier.weight"):
-            weight_key = key
-        if key.endswith("classifier.bias"):
-            bias_key = key
-    if weight_key is None or bias_key is None:
-        raise KeyError("Could not find classifier.weight/classifier.bias in probe state dict")
-
-    w = state_dict[weight_key].detach().cpu().numpy().reshape(-1).astype(np.float32)
-    b = float(state_dict[bias_key].detach().cpu().numpy().reshape(-1)[0])
-    return w, b
-
-
-def sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
-
-
-def sanitize_sample_id(sample_id: str) -> str:
-    digest = hashlib.sha1(sample_id.encode("utf-8")).hexdigest()[:12]
+def sanitize_id(raw: str) -> str:
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
     return digest
 
 
@@ -255,14 +141,18 @@ def ensure_csv(path: Path, rows: List[dict], fieldnames: List[str]) -> None:
         writer.writerows(rows)
 
 
+def _relpath(child: Path, base: Path) -> str:
+    return os.path.relpath(child, base)
+
+
 def run(args: argparse.Namespace) -> int:
-    eval_splits = parse_key_value_list(args.eval_split)
-    if not eval_splits:
-        raise ValueError("At least one --eval_split KEY=PATH is required")
     progress_every = max(1, int(args.progress_every))
 
     matrix_cfg = load_matrix(args.matrix_preset, args.matrix_json)
     questions_cfg = load_questions(args.questions_config)
+    selected_experiments = set(parse_csv_values(args.experiments))
+    if not selected_experiments:
+        raise ValueError("--experiments must include exp1_combined and/or exp3_per_pc")
 
     model_name = args.model_name
     run_id = args.run_id or make_run_id()
@@ -301,27 +191,24 @@ def run(args: argparse.Namespace) -> int:
         "run_id": run_id,
         "generated_at_utc": utc_now_iso(),
         "script": "scripts/activation_oracle/prepare_oracle_vectors_from_saved_pca.py",
+        "mode": "global",
         "model_name": model_name,
         "dataset_name": args.dataset_name,
         "probe_set": args.probe_set,
         "variant": args.variant,
         "saved_pca_root": str(Path(args.saved_pca_root).resolve()),
-        "eval_splits": eval_splits,
-        "probes_root": str(Path(args.probes_root).resolve()),
         "matrix": matrix_cfg,
         "questions_config": questions_cfg,
-        "job_splits": parse_csv_values(args.job_splits),
-        "experiments": parse_csv_values(args.experiments),
-        "max_samples_per_split": int(args.max_samples_per_split),
-        "max_samples_for_jobs": int(args.max_samples_for_jobs),
+        "experiments": sorted(selected_experiments),
         "force_rebuild": bool(args.force_rebuild),
     }
     write_json(meta_dir / "run_manifest.json", manifest)
     write_json(inputs_dir / "matrix_locked.json", matrix_cfg)
     write_json(inputs_dir / "questions_default.json", questions_cfg)
+
     logger.info("Run root: %s", run_root)
-    logger.info("Eval splits: %s", ", ".join(sorted(eval_splits.keys())))
     logger.info("Poolings: %s", ", ".join(sorted(matrix_cfg["poolings"].keys())))
+    logger.info("Experiments: %s", ", ".join(sorted(selected_experiments)))
 
     init_status(meta_dir, run_id=run_id, state="running", current_step=STEP_VALIDATE)
 
@@ -332,7 +219,6 @@ def run(args: argparse.Namespace) -> int:
             raise ValueError("This pipeline currently supports only mean and last pooling")
 
         pca_root = Path(args.saved_pca_root).resolve()
-        probes_root = Path(args.probes_root).resolve()
 
         if args.force_rebuild or STEP_VALIDATE not in completed_steps:
             validation_units: List[Tuple[str, int, int]] = []
@@ -343,7 +229,7 @@ def run(args: argparse.Namespace) -> int:
 
             for pooling, layer, max_k in tqdm(
                 validation_units,
-                desc="Validate PCA/probe inputs",
+                desc="Validate PCA inputs",
                 unit="layer",
                 leave=True,
             ):
@@ -356,11 +242,6 @@ def run(args: argparse.Namespace) -> int:
                         raise ValueError(
                             f"PCA artifact {pca_path} has {comps.shape[0]} components, needs >= {max_k}"
                         )
-                probe_path = find_probe_path(probes_root, pooling, int(layer))
-                if probe_path is None and args.strict:
-                    raise FileNotFoundError(
-                        f"Missing probe for pooling={pooling} layer={layer} under {probes_root}"
-                    )
             mark_step_completed(progress, STEP_VALIDATE)
             save_progress(progress_path, progress)
             completed_steps.add(STEP_VALIDATE)
@@ -368,238 +249,132 @@ def run(args: argparse.Namespace) -> int:
         update_status(meta_dir, state="running", current_step=STEP_PERSIST_VECTORS)
 
         vectors_root = results_dir / "vectors"
-        tables_root = results_dir / "tables"
         jobs_root = results_dir / "jobs"
-        payloads_root = jobs_root / "payloads"
         ensure_dir(vectors_root)
-        ensure_dir(tables_root)
         ensure_dir(jobs_root)
-        ensure_dir(payloads_root)
 
-        # Load split activations once per split/pooling.
-        features_cache: Dict[Tuple[str, str], Tuple[Dict[int, np.ndarray], np.ndarray, List[str]]] = {}
-        load_units: List[Tuple[str, str, str, List[int]]] = []
-        for split_name, split_dir in eval_splits.items():
-            for pooling, spec in poolings.items():
-                layers = sorted(int(x) for x in spec["layers"])
-                load_units.append((split_name, split_dir, pooling, layers))
+        if args.force_rebuild:
+            for stale in vectors_root.rglob("*.npz"):
+                stale.unlink()
+            for stale in vectors_root.rglob("*.json"):
+                stale.unlink()
+            if jobs_root.exists():
+                for stale in jobs_root.rglob("*.jsonl"):
+                    stale.unlink()
+                for stale in jobs_root.rglob("*.json"):
+                    stale.unlink()
 
-        for split_name, split_dir, pooling, layers in tqdm(
-            load_units,
-            desc="Load pooled activations",
-            unit="split/pooling",
-            leave=True,
-        ):
-            logger.info("Loading split=%s pooling=%s from %s", split_name, pooling, split_dir)
-            features_cache[(split_name, pooling)] = load_pooled_split(
-                activations_dir=split_dir,
-                layers=layers,
-                pooling=pooling,
-                desc=f"{split_name}/{pooling}",
-                limit=int(args.max_samples_per_split),
-            )
+        vector_done = get_completed_set(progress, "vector_units")
+        vector_rows: List[dict] = []
+        written_vectors = 0
+        skipped_vectors = 0
 
-        bundle_done = get_completed_set(progress, "bundle_units")
-        bundle_rows: List[dict] = []
-        prediction_rows: List[dict] = []
+        vector_units: List[Tuple[str, str, int, Optional[int], str]] = []
+        for pooling, spec in poolings.items():
+            layers = sorted(int(v) for v in spec["layers"])
+            k_values = sorted(int(v) for v in spec["k_values"])
+            max_k = max(k_values)
+            for layer in layers:
+                if "exp1_combined" in selected_experiments:
+                    for k in k_values:
+                        vector_units.append(("exp1_combined", pooling, layer, k, f"k_{k}"))
+                if "exp3_per_pc" in selected_experiments:
+                    for pc_idx in range(max_k):
+                        vector_units.append(("exp3_per_pc", pooling, layer, pc_idx, f"pc_{pc_idx+1}"))
 
-        persist_units: List[Tuple[str, str, str, int, int]] = []
-        for split_name, split_dir in eval_splits.items():
-            for pooling, spec in poolings.items():
-                for layer in sorted(int(v) for v in spec["layers"]):
-                    for k in sorted(int(v) for v in spec["k_values"]):
-                        persist_units.append((split_name, split_dir, pooling, layer, k))
+        vector_bar = tqdm(vector_units, desc="Persist PCA vectors", unit="vector", leave=True)
 
-        written_bundles = 0
-        skipped_bundles = 0
-        persist_bar = tqdm(persist_units, desc="Persist vector bundles", unit="bundle", leave=True)
-        for split_name, split_dir, pooling, layer, k in persist_bar:
-            x_by_layer, y, sample_ids = features_cache[(split_name, pooling)]
+        components_cache: Dict[Tuple[str, int], np.ndarray] = {}
+        dims_cache: Dict[Tuple[str, int], int] = {}
 
-            pca_path = pca_root / pooling / "pca_artifacts" / f"layer_{layer}.npz"
-            with np.load(pca_path, allow_pickle=False) as pca_data:
-                mean = pca_data["mean"].astype(np.float32)
-                components = pca_data["components"].astype(np.float32)
-                evr = pca_data["explained_variance_ratio"].astype(np.float32)
+        for exp_name, pooling, layer, idx, idx_tag in vector_bar:
+            cache_key = (pooling, layer)
+            if cache_key not in components_cache:
+                pca_path = pca_root / pooling / "pca_artifacts" / f"layer_{layer}.npz"
+                with np.load(pca_path, allow_pickle=False) as pca_data:
+                    components_cache[cache_key] = pca_data["components"].astype(np.float32)
+                dims_cache[cache_key] = int(components_cache[cache_key].shape[1])
+            components = components_cache[cache_key]
+            dim = dims_cache[cache_key]
 
-            probe_path = find_probe_path(probes_root, pooling, layer)
-            w: Optional[np.ndarray] = None
-            b: Optional[float] = None
-            if probe_path is not None:
-                state = torch.load(probe_path, map_location="cpu")
-                w, b = extract_classifier_params(state)
-
-            x = x_by_layer[layer].astype(np.float32)
-            dim = x.shape[1]
-            if mean.shape[0] != dim:
-                raise ValueError(
-                    f"Dim mismatch for split={split_name} pooling={pooling} layer={layer}: "
-                    f"activations dim={dim}, pca mean dim={mean.shape[0]}"
-                )
-            centered = x - mean[None, :]
-
-            unit_id = f"{split_name}|{pooling}|{layer}|{k}"
-            bundle_dir = vectors_root / split_name / pooling / f"layer_{layer}" / f"k_{k}"
-            bundle_path = bundle_dir / "bundle.npz"
-            meta_path = bundle_dir / "bundle_meta.json"
-
-            if (unit_id in bundle_done) and bundle_path.exists() and meta_path.exists() and not args.force_rebuild:
-                bundle_rows.append(
-                    {
-                        "unit_id": unit_id,
-                        "split": split_name,
-                        "pooling": pooling,
-                        "layer": layer,
-                        "k": k,
-                        "n_samples": int(len(sample_ids)),
-                        "status": "skipped_existing",
-                        "bundle_path": str(bundle_path),
-                    }
-                )
-                skipped_bundles += 1
-                persist_bar.set_postfix({"written": written_bundles, "skipped": skipped_bundles})
+            unit_id = f"{exp_name}|{pooling}|{layer}|{idx_tag}"
+            if (unit_id in vector_done) and not args.force_rebuild:
+                skipped_vectors += 1
+                vector_bar.set_postfix({"written": written_vectors, "skipped": skipped_vectors})
                 continue
 
-            comps_k = components[:k, :]
-            coeff = centered @ comps_k.T
-            removed_sum = coeff @ comps_k
-            clean = x - removed_sum
-
-            ensure_dir(bundle_dir)
-            np.savez_compressed(
-                bundle_path,
-                sample_ids=np.asarray(sample_ids),
-                labels=y,
-                orig=x,
-                removed_sum=removed_sum.astype(np.float32),
-                clean=clean.astype(np.float32),
-                coeff_topk=coeff.astype(np.float32),
-                pc_indices=np.arange(k, dtype=np.int32),
-            )
-
-            write_json(
-                meta_path,
-                {
+            if exp_name == "exp1_combined":
+                k = int(idx) if idx is not None else 0
+                vec = components[:k, :].sum(axis=0)
+                vector_dir = vectors_root / "exp1_combined" / pooling / f"layer_{layer}" / f"k_{k}"
+                meta = {
                     "generated_at_utc": utc_now_iso(),
-                    "model_name": model_name,
-                    "split": split_name,
-                    "source_activation_dir": split_dir,
+                    "experiment": "exp1_combined",
                     "pooling": pooling,
                     "layer": layer,
                     "k": k,
-                    "n_samples": int(len(sample_ids)),
-                    "dim": int(dim),
-                    "pca_path": str(pca_path),
-                    "probe_path": str(probe_path) if probe_path else None,
-                    "explained_variance_ratio_topk": [float(v) for v in evr[:k]],
-                },
-            )
+                    "pc_indices": list(range(k)),
+                    "vector_dim": dim,
+                    "pca_path": str(pca_root / pooling / "pca_artifacts" / f"layer_{layer}.npz"),
+                    "vector_strategy": "raw_pc_sum",
+                }
+            elif exp_name == "exp3_per_pc":
+                pc_idx = int(idx) if idx is not None else 0
+                vec = components[pc_idx, :]
+                vector_dir = vectors_root / "exp3_per_pc" / pooling / f"layer_{layer}" / f"pc_{pc_idx+1}"
+                meta = {
+                    "generated_at_utc": utc_now_iso(),
+                    "experiment": "exp3_per_pc",
+                    "pooling": pooling,
+                    "layer": layer,
+                    "pc_index": pc_idx,
+                    "pc_rank": pc_idx + 1,
+                    "vector_dim": dim,
+                    "pca_path": str(pca_root / pooling / "pca_artifacts" / f"layer_{layer}.npz"),
+                    "vector_strategy": "raw_pc_direction",
+                }
+            else:
+                raise ValueError(f"Unsupported experiment: {exp_name}")
 
-            bundle_rows.append(
+            ensure_dir(vector_dir)
+            vector_path = vector_dir / "vector.npz"
+            meta_path = vector_dir / "vector_meta.json"
+            np.savez_compressed(vector_path, vectors=vec.reshape(1, -1).astype(np.float32))
+            write_json(meta_path, meta)
+
+            vector_rows.append(
                 {
                     "unit_id": unit_id,
-                    "split": split_name,
+                    "experiment": exp_name,
                     "pooling": pooling,
                     "layer": layer,
-                    "k": k,
-                    "n_samples": int(len(sample_ids)),
-                    "status": "written",
-                    "bundle_path": str(bundle_path),
+                    "index_tag": idx_tag,
+                    "vector_path": str(vector_path),
+                    "meta_path": str(meta_path),
                 }
             )
 
-            if w is not None and b is not None:
-                if w.shape[0] != dim:
-                    raise ValueError(
-                        f"Probe dim mismatch at pooling={pooling} layer={layer}: "
-                        f"probe dim={w.shape[0]}, activation dim={dim}"
-                    )
-                baseline_logits = x @ w + b
-                clean_logits = clean @ w + b
-                baseline_probs = sigmoid(baseline_logits)
-                clean_probs = sigmoid(clean_logits)
-                baseline_pred = (baseline_probs >= 0.5).astype(np.int64)
-                clean_pred = (clean_probs >= 0.5).astype(np.int64)
-
-                for i, sid in enumerate(sample_ids):
-                    was_correct = int(baseline_pred[i] == y[i])
-                    is_correct = int(clean_pred[i] == y[i])
-                    prediction_rows.append(
-                        {
-                            "split": split_name,
-                            "pooling": pooling,
-                            "layer": layer,
-                            "k": k,
-                            "sample_id": sid,
-                            "label": int(y[i]),
-                            "baseline_logit": float(baseline_logits[i]),
-                            "baseline_prob": float(baseline_probs[i]),
-                            "baseline_pred": int(baseline_pred[i]),
-                            "clean_logit": float(clean_logits[i]),
-                            "clean_prob": float(clean_probs[i]),
-                            "clean_pred": int(clean_pred[i]),
-                            "was_correct_baseline": was_correct,
-                            "is_correct_clean": is_correct,
-                            "flip_wrong_to_right": int((was_correct == 0) and (is_correct == 1)),
-                        }
-                    )
-
-            bundle_done.add(unit_id)
-            written_bundles += 1
-            persist_bar.set_postfix({"written": written_bundles, "skipped": skipped_bundles})
-            if written_bundles % progress_every == 0:
-                logger.info(
-                    "Persist progress: written=%d skipped=%d predictions=%d",
-                    written_bundles,
-                    skipped_bundles,
-                    len(prediction_rows),
-                )
-            save_completed_set(progress, "bundle_units", bundle_done)
+            vector_done.add(unit_id)
+            written_vectors += 1
+            vector_bar.set_postfix({"written": written_vectors, "skipped": skipped_vectors})
+            if written_vectors % progress_every == 0:
+                logger.info("Vector progress: written=%d skipped=%d", written_vectors, skipped_vectors)
+            save_completed_set(progress, "vector_units", vector_done)
             save_progress(progress_path, progress)
 
+        vector_bar.close()
+
         ensure_csv(
-            tables_root / "vector_bundles.csv",
-            bundle_rows,
-            ["unit_id", "split", "pooling", "layer", "k", "n_samples", "status", "bundle_path"],
+            vectors_root / "vectors_index.csv",
+            vector_rows,
+            ["unit_id", "experiment", "pooling", "layer", "index_tag", "vector_path", "meta_path"],
         )
-
-        if prediction_rows:
-            key_cols = ["split", "pooling", "layer", "k", "sample_id"]
-            pred_df_new = pd.DataFrame(prediction_rows)
-
-            parquet_path = tables_root / "predictions_by_sample.parquet"
-            csv_path = tables_root / "predictions_by_sample.csv"
-
-            pred_df_all = pred_df_new
-            if parquet_path.exists():
-                try:
-                    pred_df_existing = pd.read_parquet(parquet_path)
-                    pred_df_all = pd.concat([pred_df_existing, pred_df_new], ignore_index=True)
-                except Exception:
-                    pred_df_all = pred_df_new
-            elif csv_path.exists():
-                try:
-                    pred_df_existing = pd.read_csv(csv_path)
-                    pred_df_all = pd.concat([pred_df_existing, pred_df_new], ignore_index=True)
-                except Exception:
-                    pred_df_all = pred_df_new
-
-            pred_df_all = pred_df_all.drop_duplicates(subset=key_cols, keep="last")
-            try:
-                pred_df_all.to_parquet(parquet_path, index=False)
-            except Exception:
-                pred_df_all.to_csv(csv_path, index=False)
 
         mark_step_completed(progress, STEP_PERSIST_VECTORS)
         save_progress(progress_path, progress)
         completed_steps.add(STEP_PERSIST_VECTORS)
 
         update_status(meta_dir, state="running", current_step=STEP_BUILD_JOBS)
-
-        selected_experiments = set(parse_csv_values(args.experiments))
-        selected_splits = set(parse_csv_values(args.job_splits))
-        if not selected_splits:
-            selected_splits = set(eval_splits.keys())
 
         exp1_jobs_path = jobs_root / "exp1_combined_jobs.jsonl"
         exp3_jobs_path = jobs_root / "exp3_per_pc_jobs.jsonl"
@@ -609,8 +384,6 @@ def run(args: argparse.Namespace) -> int:
                 exp1_jobs_path.unlink()
             if exp3_jobs_path.exists():
                 exp3_jobs_path.unlink()
-            for stale_payload in payloads_root.glob("*.npz"):
-                stale_payload.unlink()
             existing_exp1 = set()
             existing_exp3 = set()
             done_jobs = set()
@@ -620,144 +393,105 @@ def run(args: argparse.Namespace) -> int:
             done_jobs = get_completed_set(progress, "job_units")
 
         created_counts = {"exp1_combined": 0, "exp3_per_pc": 0}
-        jobs_sample_processed = 0
-        jobs_bar = tqdm(desc="Build AO jobs", unit="sample", leave=True)
+        jobs_bar = tqdm(desc="Build AO jobs", unit="job", leave=True)
 
         for pooling, spec in poolings.items():
-            for layer in sorted(int(v) for v in spec["layers"]):
-                pca_path = pca_root / pooling / "pca_artifacts" / f"layer_{layer}.npz"
-                with np.load(pca_path, allow_pickle=False) as pca_data:
-                    components = pca_data["components"].astype(np.float32)
+            layers = sorted(int(v) for v in spec["layers"])
+            k_values = sorted(int(v) for v in spec["k_values"])
+            max_k = max(k_values)
+            for layer in layers:
+                if "exp1_combined" in selected_experiments:
+                    for k in k_values:
+                        vector_dir = vectors_root / "exp1_combined" / pooling / f"layer_{layer}" / f"k_{k}"
+                        vector_path = vector_dir / "vector.npz"
+                        if not vector_path.exists():
+                            raise FileNotFoundError(f"Missing vector payload: {vector_path}")
+                        payload_rel = _relpath(vector_path, jobs_root)
+                        for q in questions_cfg["exp1_combined"]:
+                            job_id = build_job_id([
+                                "exp1",
+                                pooling,
+                                str(layer),
+                                str(k),
+                                q["id"],
+                            ])
+                            if (job_id in existing_exp1) or (job_id in done_jobs):
+                                continue
 
-                for split_name in sorted(selected_splits):
-                    if split_name not in eval_splits:
-                        continue
-                    for k in sorted(int(v) for v in spec["k_values"]):
-                        bundle_path = vectors_root / split_name / pooling / f"layer_{layer}" / f"k_{k}" / "bundle.npz"
-                        if not bundle_path.exists():
-                            continue
-
-                        with np.load(bundle_path, allow_pickle=False) as bundle:
-                            sample_ids = bundle["sample_ids"].tolist()
-                            labels = bundle["labels"].astype(np.int64)
-                            removed_sum = bundle["removed_sum"].astype(np.float32)
-                            coeff_topk = bundle["coeff_topk"].astype(np.float32)
-
-                        total_n = len(sample_ids)
-                        job_n = total_n if args.max_samples_for_jobs <= 0 else min(total_n, int(args.max_samples_for_jobs))
-
-                        for i in range(job_n):
-                            jobs_sample_processed += 1
+                            row = {
+                                "job_id": job_id,
+                                "experiment": "exp1_combined",
+                                "scope": "global",
+                                "split": "global",
+                                "pooling": pooling,
+                                "layer": layer,
+                                "k": k,
+                                "target_layer": layer,
+                                "question_id": q["id"],
+                                "question_text": q["text"],
+                                "num_vectors": 1,
+                                "vector_payload_path": payload_rel,
+                                "prompt_template_version": "layer_placeholder_v1",
+                                "vector_strategy": "raw_pc_sum",
+                            }
+                            append_jsonl(exp1_jobs_path, [row])
+                            existing_exp1.add(job_id)
+                            done_jobs.add(job_id)
+                            created_counts["exp1_combined"] += 1
                             jobs_bar.update(1)
-                            sid = str(sample_ids[i])
-                            sid_hash = sanitize_sample_id(sid)
-                            label = int(labels[i])
 
-                            if "exp1_combined" in selected_experiments:
-                                vec = removed_sum[i : i + 1, :]
-                                for q in questions_cfg["exp1_combined"]:
-                                    job_id = build_job_id(
-                                        [
-                                            "exp1",
-                                            split_name,
-                                            pooling,
-                                            str(layer),
-                                            str(k),
-                                            sid,
-                                            q["id"],
-                                        ]
-                                    )
-                                    if (job_id in existing_exp1) or (job_id in done_jobs):
-                                        continue
+                if "exp3_per_pc" in selected_experiments:
+                    for pc_idx in range(max_k):
+                        vector_dir = vectors_root / "exp3_per_pc" / pooling / f"layer_{layer}" / f"pc_{pc_idx+1}"
+                        vector_path = vector_dir / "vector.npz"
+                        if not vector_path.exists():
+                            raise FileNotFoundError(f"Missing vector payload: {vector_path}")
+                        payload_rel = _relpath(vector_path, jobs_root)
+                        for q in questions_cfg["exp3_per_pc"]:
+                            job_id = build_job_id([
+                                "exp3",
+                                pooling,
+                                str(layer),
+                                str(max_k),
+                                str(pc_idx),
+                                q["id"],
+                            ])
+                            if (job_id in existing_exp3) or (job_id in done_jobs):
+                                continue
 
-                                    payload_path = payloads_root / f"{job_id}.npz"
-                                    np.savez_compressed(payload_path, vectors=vec)
+                            row = {
+                                "job_id": job_id,
+                                "experiment": "exp3_per_pc",
+                                "scope": "global",
+                                "split": "global",
+                                "pooling": pooling,
+                                "layer": layer,
+                                "k": max_k,
+                                "pc_index": pc_idx,
+                                "pc_rank": pc_idx + 1,
+                                "pc_limit": max_k,
+                                "target_layer": layer,
+                                "question_id": q["id"],
+                                "question_text": q["text"],
+                                "num_vectors": 1,
+                                "vector_payload_path": payload_rel,
+                                "prompt_template_version": "layer_placeholder_v1",
+                                "vector_strategy": "raw_pc_direction",
+                            }
+                            append_jsonl(exp3_jobs_path, [row])
+                            existing_exp3.add(job_id)
+                            done_jobs.add(job_id)
+                            created_counts["exp3_per_pc"] += 1
+                            jobs_bar.update(1)
 
-                                    row = {
-                                        "job_id": job_id,
-                                        "experiment": "exp1_combined",
-                                        "split": split_name,
-                                        "pooling": pooling,
-                                        "layer": layer,
-                                        "k": k,
-                                        "sample_id": sid,
-                                        "sample_id_hash": sid_hash,
-                                        "label": label,
-                                        "target_layer": layer,
-                                        "question_id": q["id"],
-                                        "question_text": q["text"],
-                                        "num_vectors": 1,
-                                        "vector_payload_path": str(payload_path.relative_to(jobs_root)),
-                                        "prompt_template_version": "layer_placeholder_v1",
-                                    }
-                                    append_jsonl(exp1_jobs_path, [row])
-                                    existing_exp1.add(job_id)
-                                    done_jobs.add(job_id)
-                                    created_counts["exp1_combined"] += 1
-
-                            if "exp3_per_pc" in selected_experiments:
-                                for pc_idx in range(k):
-                                    comp_vec = (coeff_topk[i, pc_idx] * components[pc_idx, :]).astype(np.float32)
-                                    vec = comp_vec.reshape(1, -1)
-                                    for q in questions_cfg["exp3_per_pc"]:
-                                        job_id = build_job_id(
-                                            [
-                                                "exp3",
-                                                split_name,
-                                                pooling,
-                                                str(layer),
-                                                str(k),
-                                                sid,
-                                                str(pc_idx),
-                                                q["id"],
-                                            ]
-                                        )
-                                        if (job_id in existing_exp3) or (job_id in done_jobs):
-                                            continue
-
-                                        payload_path = payloads_root / f"{job_id}.npz"
-                                        np.savez_compressed(payload_path, vectors=vec)
-
-                                        row = {
-                                            "job_id": job_id,
-                                            "experiment": "exp3_per_pc",
-                                            "split": split_name,
-                                            "pooling": pooling,
-                                            "layer": layer,
-                                            "k": k,
-                                            "pc_index": pc_idx,
-                                            "pc_rank": pc_idx + 1,
-                                            "coefficient": float(coeff_topk[i, pc_idx]),
-                                            "sample_id": sid,
-                                            "sample_id_hash": sid_hash,
-                                            "label": label,
-                                            "target_layer": layer,
-                                            "question_id": q["id"],
-                                            "question_text": q["text"],
-                                            "num_vectors": 1,
-                                            "vector_payload_path": str(payload_path.relative_to(jobs_root)),
-                                            "prompt_template_version": "layer_placeholder_v1",
-                                        }
-                                        append_jsonl(exp3_jobs_path, [row])
-                                        existing_exp3.add(job_id)
-                                        done_jobs.add(job_id)
-                                        created_counts["exp3_per_pc"] += 1
-
-                            jobs_bar.set_postfix(
-                                {
-                                    "exp1_new": created_counts["exp1_combined"],
-                                    "exp3_new": created_counts["exp3_per_pc"],
-                                }
-                            )
-                            if jobs_sample_processed % progress_every == 0:
-                                logger.info(
-                                    "Job build progress: processed_samples=%d exp1_new=%d exp3_new=%d",
-                                    jobs_sample_processed,
-                                    created_counts["exp1_combined"],
-                                    created_counts["exp3_per_pc"],
-                                )
-                            save_completed_set(progress, "job_units", done_jobs)
-                            save_progress(progress_path, progress)
+                if (created_counts["exp1_combined"] + created_counts["exp3_per_pc"]) % progress_every == 0:
+                    logger.info(
+                        "Job build progress: exp1_new=%d exp3_new=%d",
+                        created_counts["exp1_combined"],
+                        created_counts["exp3_per_pc"],
+                    )
+                save_completed_set(progress, "job_units", done_jobs)
+                save_progress(progress_path, progress)
 
         jobs_bar.close()
 
@@ -774,8 +508,8 @@ def run(args: argparse.Namespace) -> int:
             "run_id": run_id,
             "run_root": str(run_root),
             "counts": {
-                "bundle_rows": len(bundle_rows),
-                "prediction_rows": len(prediction_rows),
+                "vectors_written": written_vectors,
+                "vectors_skipped": skipped_vectors,
                 "exp1_jobs_created": created_counts["exp1_combined"],
                 "exp3_jobs_created": created_counts["exp3_per_pc"],
                 "exp1_jobs_total": len(existing_exp1),
@@ -783,7 +517,6 @@ def run(args: argparse.Namespace) -> int:
             },
             "paths": {
                 "vectors_root": str(vectors_root),
-                "tables_root": str(tables_root),
                 "jobs_root": str(jobs_root),
                 "exp1_jobs": str(exp1_jobs_path),
                 "exp3_jobs": str(exp3_jobs_path),
@@ -806,33 +539,21 @@ def run(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Prepare AO vectors/jobs using saved PCA artifacts")
+    p = argparse.ArgumentParser(description="Prepare global AO vectors/jobs using saved PCA artifacts")
     p.add_argument("--model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
     p.add_argument("--saved_pca_root", type=str, required=True)
-    p.add_argument(
-        "--eval_split",
-        type=str,
-        action="append",
-        required=True,
-        help="Repeatable KEY=PATH, e.g. id_val=/.../validation",
-    )
-    p.add_argument("--probes_root", type=str, required=True)
     p.add_argument("--matrix_preset", type=str, default="locked_v1")
     p.add_argument("--matrix_json", type=str, default=None)
     p.add_argument("--questions_config", type=str, default=None)
-    p.add_argument("--job_splits", type=str, default="ood_test")
     p.add_argument("--experiments", type=str, default="exp1_combined,exp3_per_pc")
     p.add_argument("--output_root", type=str, default="artifacts")
-    p.add_argument("--experiment_name", type=str, default="activation_oracle_pca")
+    p.add_argument("--experiment_name", type=str, default="activation_oracle_pca_global")
     p.add_argument("--dataset_name", type=str, default="Deception-Roleplaying")
     p.add_argument("--probe_set", type=str, default="roleplaying_probes")
     p.add_argument("--variant", type=str, default="locked_v1")
     p.add_argument("--run_id", type=str, default=None)
-    p.add_argument("--max_samples_per_split", type=int, default=0)
-    p.add_argument("--max_samples_for_jobs", type=int, default=0)
-    p.add_argument("--progress_every", type=int, default=100, help="Emit log progress every N units")
+    p.add_argument("--progress_every", type=int, default=25, help="Emit log progress every N units")
     p.add_argument("--force_rebuild", action="store_true")
-    p.add_argument("--strict", action="store_true")
     return p
 
 
