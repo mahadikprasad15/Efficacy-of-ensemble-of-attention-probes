@@ -1,0 +1,35 @@
+{
+  "name": "default_v1",
+  "exp1_combined": [
+    {
+      "id": "exp1_q1",
+      "text": "What kind of information is emphasized in this activation?"
+    },
+    {
+      "id": "exp1_q2",
+      "text": "What property of the text would change if this signal were removed?"
+    },
+    {
+      "id": "exp1_q3",
+      "text": "Give 3 hypotheses: topic, style, and intent."
+    },
+    {
+      "id": "exp1_q4",
+      "text": "What label would a linear probe likely latch onto in this signal?"
+    }
+  ],
+  "exp3_per_pc": [
+    {
+      "id": "exp3_q1",
+      "text": "What does this component encode?"
+    },
+    {
+      "id": "exp3_q2",
+      "text": "Is this component more about style or format, or semantic content?"
+    },
+    {
+      "id": "exp3_q3",
+      "text": "Does this component resemble a dataset artifact such as template style, refusal style, hedging, or citation style?"
+    }
+  ]
+}
