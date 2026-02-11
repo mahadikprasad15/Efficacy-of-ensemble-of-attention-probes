@@ -1,0 +1,13 @@
+{
+  "name": "locked_v1",
+  "poolings": {
+    "mean": {
+      "layers": [0, 1],
+      "k_values": [5, 7, 10]
+    },
+    "last": {
+      "layers": [7, 8, 9],
+      "k_values": [15, 20]
+    }
+  }
+}
