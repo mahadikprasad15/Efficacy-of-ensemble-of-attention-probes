@@ -3,7 +3,8 @@
 
 This script scans cached OOD activations, applies probes to original and
 PCA-removed activations per (pooling, layer, k), selects top-N wrong->right
-flips, and creates AO jobs that compare orig vs clean vectors.
+flips, and creates AO jobs that interpret orig and clean activations
+separately using a shared single-activation prompt.
 """
 
 from __future__ import annotations
@@ -93,8 +94,8 @@ def load_matrix(matrix_preset: str, matrix_json: Optional[str]) -> dict:
 def load_questions(questions_json: Optional[str]) -> dict:
     path = Path(questions_json) if questions_json else default_questions_config_path()
     cfg = read_json(path)
-    if "exp2_compare" not in cfg or not cfg["exp2_compare"]:
-        raise ValueError("Questions config missing non-empty key: exp2_compare")
+    if "exp2_single" not in cfg or not cfg["exp2_single"]:
+        raise ValueError("Questions config missing non-empty key: exp2_single")
     return cfg
 
 
@@ -516,7 +517,7 @@ def run(args: argparse.Namespace) -> int:
         for p in (tables_root, jobs_root, payloads_root):
             ensure_dir(p)
 
-        exp2_jobs_path = jobs_root / "exp2_compare_jobs.jsonl"
+        exp2_jobs_path = jobs_root / "exp2_single_jobs.jsonl"
         if args.force_rebuild:
             if exp2_jobs_path.exists():
                 exp2_jobs_path.unlink()
@@ -557,54 +558,64 @@ def run(args: argparse.Namespace) -> int:
                     }
                 )
 
-                vectors = np.stack([item["orig_vec"], item["clean_vec"]]).astype(np.float32)
+                pair_id = f"{pooling}|{layer}|{k}|{item['sample_id']}"
                 sid_hash = sanitize_id(item["sample_id"])
 
-                for q in questions_cfg["exp2_compare"]:
-                    job_id = build_job_id(
-                        [
-                            "exp2",
-                            pooling,
-                            str(layer),
-                            str(k),
-                            item["sample_id"],
-                            q["id"],
-                        ]
-                    )
-                    if (job_id in existing_exp2) or (job_id in done_jobs):
-                        continue
+                role_payloads = [
+                    ("orig", item["orig_vec"]),
+                    ("clean", item["clean_vec"]),
+                ]
 
-                    payload_path = payloads_root / f"{job_id}.npz"
-                    np.savez_compressed(payload_path, vectors=vectors)
+                for role, vec in role_payloads:
+                    vectors = vec.reshape(1, -1).astype(np.float32)
+                    for q in questions_cfg["exp2_single"]:
+                        job_id = build_job_id(
+                            [
+                                "exp2",
+                                pooling,
+                                str(layer),
+                                str(k),
+                                item["sample_id"],
+                                role,
+                                q["id"],
+                            ]
+                        )
+                        if (job_id in existing_exp2) or (job_id in done_jobs):
+                            continue
 
-                    row = {
-                        "job_id": job_id,
-                        "experiment": "exp2_compare",
-                        "split": args.split_name,
-                        "pooling": pooling,
-                        "layer": layer,
-                        "k": k,
-                        "sample_id": item["sample_id"],
-                        "sample_id_hash": sid_hash,
-                        "label": item["label"],
-                        "target_layer": layer,
-                        "question_id": q["id"],
-                        "question_text": q["text"],
-                        "num_vectors": 2,
-                        "vector_payload_path": str(payload_path.relative_to(jobs_root)),
-                        "prompt_template_version": "layer_placeholder_v1",
-                        "vector_strategy": "orig_vs_clean",
-                        "orig_logit": item["orig_logit"],
-                        "clean_logit": item["clean_logit"],
-                        "delta_logit": item["delta_logit"],
-                        "orig_prob": item["orig_prob"],
-                        "clean_prob": item["clean_prob"],
-                        "delta_prob": item["delta_prob"],
-                    }
-                    append_jsonl(exp2_jobs_path, [row])
-                    existing_exp2.add(job_id)
-                    done_jobs.add(job_id)
-                    created_jobs += 1
+                        payload_path = payloads_root / f"{job_id}.npz"
+                        np.savez_compressed(payload_path, vectors=vectors)
+
+                        row = {
+                            "job_id": job_id,
+                            "experiment": "exp2_single",
+                            "split": args.split_name,
+                            "pooling": pooling,
+                            "layer": layer,
+                            "k": k,
+                            "sample_id": item["sample_id"],
+                            "sample_id_hash": sid_hash,
+                            "pair_id": pair_id,
+                            "role": role,
+                            "label": item["label"],
+                            "target_layer": layer,
+                            "question_id": q["id"],
+                            "question_text": q["text"],
+                            "num_vectors": 1,
+                            "vector_payload_path": str(payload_path.relative_to(jobs_root)),
+                            "prompt_template_version": "layer_placeholder_v1",
+                            "vector_strategy": role,
+                            "orig_logit": item["orig_logit"],
+                            "clean_logit": item["clean_logit"],
+                            "delta_logit": item["delta_logit"],
+                            "orig_prob": item["orig_prob"],
+                            "clean_prob": item["clean_prob"],
+                            "delta_prob": item["delta_prob"],
+                        }
+                        append_jsonl(exp2_jobs_path, [row])
+                        existing_exp2.add(job_id)
+                        done_jobs.add(job_id)
+                        created_jobs += 1
 
             save_completed_set(progress, "job_units", done_jobs)
             save_progress(progress_path, progress)
