@@ -1,13 +1,13 @@
-# Activation Oracle PCA Pipeline
+# Activation Oracle PCA Pipeline (Global PC Mode)
 
-This pipeline uses **existing PCA artifacts** from prior ablations to create durable activation-vector artifacts and run activation-oracle inference.
+This pipeline uses **existing PCA artifacts** to create global activation-vector artifacts and run activation-oracle inference.
 
 Implemented now:
-- Experiment 1: combined removed-PC interpretation.
-- Experiment 3: per-PC attribution.
+- Experiment 1: combined PC interpretation (global, raw PC sum).
+- Experiment 3: per-PC attribution (global, raw PC direction).
 
 Deferred:
-- Experiment 2 (wrong-to-right OOD flips with orig vs clean comparison), but prerequisite prediction artifacts are persisted.
+- Experiment 2 (wrong-to-right flips with orig vs clean comparisons). Not part of this pipeline.
 
 ## Inputs
 
@@ -24,27 +24,27 @@ Locked matrix config:
 Question config:
 - `configs/activation_oracle/questions_default_v1.json`
 
-## Step 1: Prepare persisted vectors + jobs
+## Step 1: Prepare global vectors + jobs
 
 ```bash
 python -u scripts/activation_oracle/prepare_oracle_vectors_from_saved_pca.py \
   --model_name meta-llama/Llama-3.2-1B-Instruct \
   --saved_pca_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/results/pca_ablation/meta-llama_Llama-3.2-1B-Instruct/Deception-Roleplaying \
-  --eval_split id_val=/content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-1B-Instruct/Deception-Roleplaying/validation \
-  --eval_split ood_test=/content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-1B-Instruct/Deception-InsiderTrading/test \
-  --probes_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/probes/meta-llama_Llama-3.2-1B-Instruct/Deception-Roleplaying \
   --matrix_preset locked_v1 \
-  --progress_every 100 \
-  --job_splits ood_test \
   --experiments exp1_combined,exp3_per_pc \
+  --progress_every 25 \
   --output_root artifacts
 ```
+
+What gets built:
+- Exp1: 12 combined vectors (pooling x layer x k).
+- Exp3: 80 individual PC vectors (pooling x layer x pc index).
 
 ## Step 2: Run activation oracle inference
 
 ```bash
 python -u scripts/activation_oracle/run_activation_oracle.py \
-  --jobs_jsonl artifacts/runs/activation_oracle_pca/meta-llama_llama-3.2-1b-instruct/deception-roleplaying/roleplaying_probes/locked_v1/<run_id>/results/jobs/exp1_combined_jobs.jsonl \
+  --jobs_jsonl artifacts/runs/activation_oracle_pca_global/meta-llama_llama-3.2-1b-instruct/deception-roleplaying/roleplaying_probes/locked_v1/<run_id>/results/jobs/exp1_combined_jobs.jsonl \
   --ao_model_id adamkarvonen/checkpoints_cls_latentqa_past_lens_Llama-3_2-1B-Instruct \
   --placeholder_text " ?" \
   --hook_layer_index 1 \
@@ -55,9 +55,9 @@ python -u scripts/activation_oracle/run_activation_oracle.py \
   --output_root artifacts
 ```
 
-Both scripts now emit live `tqdm` progress bars and periodic log lines to stdout.
-
 Repeat for per-PC jobs by swapping `exp1_combined_jobs.jsonl` with `exp3_per_pc_jobs.jsonl`.
+
+Both scripts emit live `tqdm` progress bars and periodic log lines to stdout.
 
 ## Artifact layout
 
@@ -72,27 +72,18 @@ Key files:
 - `results/results.json`
 - `logs/run.log`
 
-Prepared-vector run also writes:
-- `results/vectors/<split>/<pooling>/layer_<L>/k_<k>/bundle.npz`
-- `results/vectors/<split>/<pooling>/layer_<L>/k_<k>/bundle_meta.json`
-- `results/tables/predictions_by_sample.parquet` (or csv fallback)
+Prepared-vector run writes:
+- `results/vectors/exp1_combined/<pooling>/layer_<L>/k_<k>/vector.npz`
+- `results/vectors/exp1_combined/<pooling>/layer_<L>/k_<k>/vector_meta.json`
+- `results/vectors/exp3_per_pc/<pooling>/layer_<L>/pc_<idx>/vector.npz`
+- `results/vectors/exp3_per_pc/<pooling>/layer_<L>/pc_<idx>/vector_meta.json`
+- `results/vectors/vectors_index.csv`
 - `results/jobs/exp1_combined_jobs.jsonl`
 - `results/jobs/exp3_per_pc_jobs.jsonl`
-- `results/jobs/payloads/<job_id>.npz`
 
 AO run writes:
 - `results/responses.jsonl`
 - `results/results.json`
-
-## bundle.npz schema
-
-- `sample_ids` `(N,)`
-- `labels` `(N,)`
-- `orig` `(N,D)`
-- `removed_sum` `(N,D)`
-- `clean` `(N,D)`
-- `coeff_topk` `(N,k)`
-- `pc_indices` `(k,)`
 
 ## Injection rule
 
@@ -102,10 +93,3 @@ At each placeholder token position:
 - update: `x <- x + (||x|| / ||v||) * v`
 
 where `x` is AO hidden state at placeholder position and `v` is injected vector.
-
-## Notes on Experiment 2 (deferred)
-
-`predictions_by_sample` plus persisted `orig/clean/removed_sum/coeff_topk` are sufficient to later:
-- select wrong-to-right OOD flips,
-- build AO prompts for original vs cleaned and differences,
-- run with same AO engine.
