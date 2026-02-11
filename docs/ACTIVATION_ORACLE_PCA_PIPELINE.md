@@ -5,9 +5,7 @@ This pipeline uses **existing PCA artifacts** to create global activation-vector
 Implemented now:
 - Experiment 1: combined PC interpretation (global, raw PC sum).
 - Experiment 3: per-PC attribution (global, raw PC direction).
-
-Deferred:
-- Experiment 2 (wrong-to-right flips with orig vs clean comparisons). Not part of this pipeline.
+- Experiment 2: probe flip mining (orig vs clean comparisons, OOD only).
 
 ## Inputs
 
@@ -23,6 +21,7 @@ Locked matrix config:
 
 Question config:
 - `configs/activation_oracle/questions_default_v1.json`
+- `configs/activation_oracle/questions_exp2_v1.json`
 
 ## Step 1: Prepare global vectors + jobs
 
@@ -58,6 +57,27 @@ python -u scripts/activation_oracle/run_activation_oracle.py \
 Repeat for per-PC jobs by swapping `exp1_combined_jobs.jsonl` with `exp3_per_pc_jobs.jsonl`.
 
 Both scripts emit live `tqdm` progress bars and periodic log lines to stdout.
+
+## Exp2: Prepare flip-mined jobs (orig vs clean)
+
+```bash
+python -u scripts/activation_oracle/prepare_oracle_vectors_exp2.py \
+  --model_name meta-llama/Llama-3.2-1B-Instruct \
+  --saved_pca_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/results/pca_ablation/meta-llama_Llama-3.2-1B-Instruct/Deception-Roleplaying \
+  --activations_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-1B-Instruct/Deception-InsiderTrading/test \
+  --probes_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/probes/meta-llama_Llama-3.2-1B-Instruct/Deception-Roleplaying \
+  --matrix_preset locked_v1 \
+  --questions_config configs/activation_oracle/questions_exp2_v1.json \
+  --top_n 5 \
+  --progress_every 100 \
+  --output_root artifacts
+```
+
+This creates:
+- `results/tables/exp2_top_flips.csv`
+- `results/jobs/exp2_compare_jobs.jsonl`
+
+Run AO inference on exp2 jobs with the same `run_activation_oracle.py` command, swapping `--jobs_jsonl`.
 
 ## Artifact layout
 
