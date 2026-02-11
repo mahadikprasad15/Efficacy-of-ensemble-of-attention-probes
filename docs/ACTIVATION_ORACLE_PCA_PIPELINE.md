@@ -27,13 +27,14 @@ Question config:
 ## Step 1: Prepare persisted vectors + jobs
 
 ```bash
-python scripts/activation_oracle/prepare_oracle_vectors_from_saved_pca.py \
+python -u scripts/activation_oracle/prepare_oracle_vectors_from_saved_pca.py \
   --model_name meta-llama/Llama-3.2-1B-Instruct \
   --saved_pca_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/results/pca_ablation/meta-llama_Llama-3.2-1B-Instruct/Deception-Roleplaying \
   --eval_split id_val=/content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-1B-Instruct/Deception-Roleplaying/validation \
   --eval_split ood_test=/content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-1B-Instruct/Deception-InsiderTrading/test \
   --probes_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/probes/meta-llama_Llama-3.2-1B-Instruct/Deception-Roleplaying \
   --matrix_preset locked_v1 \
+  --progress_every 100 \
   --job_splits ood_test \
   --experiments exp1_combined,exp3_per_pc \
   --output_root artifacts
@@ -42,16 +43,19 @@ python scripts/activation_oracle/prepare_oracle_vectors_from_saved_pca.py \
 ## Step 2: Run activation oracle inference
 
 ```bash
-python scripts/activation_oracle/run_activation_oracle.py \
+python -u scripts/activation_oracle/run_activation_oracle.py \
   --jobs_jsonl artifacts/runs/activation_oracle_pca/meta-llama_llama-3.2-1b-instruct/deception-roleplaying/roleplaying_probes/locked_v1/<run_id>/results/jobs/exp1_combined_jobs.jsonl \
   --ao_model_id adamkarvonen/checkpoints_cls_latentqa_past_lens_Llama-3_2-1B-Instruct \
   --placeholder_text " ?" \
   --hook_layer_index 1 \
   --norm_policy hidden_state_match \
+  --progress_every 25 \
   --max_new_tokens 96 \
   --do_sample false \
   --output_root artifacts
 ```
+
+Both scripts now emit live `tqdm` progress bars and periodic log lines to stdout.
 
 Repeat for per-PC jobs by swapping `exp1_combined_jobs.jsonl` with `exp3_per_pc_jobs.jsonl`.
 
