@@ -134,6 +134,9 @@ def run(args: argparse.Namespace) -> int:
             "script": "scripts/activation_oracle/run_activation_oracle.py",
             "jobs_jsonl": str(jobs_path),
             "ao_model_id": args.ao_model_id,
+            "base_model_id": args.base_model_id,
+            "peft_adapter_id": args.peft_adapter_id,
+            "use_fast_tokenizer": bool(args.use_fast_tokenizer),
             "placeholder_text": args.placeholder_text,
             "hook_layer_index": int(args.hook_layer_index),
             "norm_policy": args.norm_policy,
@@ -157,12 +160,30 @@ def run(args: argparse.Namespace) -> int:
 
         write_json(inputs_dir / "job_source.json", {"jobs_jsonl": str(jobs_path), "num_jobs": len(jobs)})
 
-        tokenizer = AutoTokenizer.from_pretrained(args.ao_model_id, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            args.ao_model_id,
-            torch_dtype=getattr(torch, args.torch_dtype),
-            device_map=args.device_map,
-        )
+        tokenizer_id = args.ao_model_id
+        if args.peft_adapter_id:
+            if not args.base_model_id:
+                raise ValueError("--base_model_id is required when using --peft_adapter_id")
+            tokenizer_id = args.base_model_id
+            try:
+                from peft import PeftModel
+            except Exception as exc:  # pragma: no cover
+                raise ImportError("peft is required for adapter loading. Install with `pip install peft`.") from exc
+
+            base_model = AutoModelForCausalLM.from_pretrained(
+                args.base_model_id,
+                torch_dtype=getattr(torch, args.torch_dtype),
+                device_map=args.device_map,
+            )
+            model = PeftModel.from_pretrained(base_model, args.peft_adapter_id)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.ao_model_id,
+                torch_dtype=getattr(torch, args.torch_dtype),
+                device_map=args.device_map,
+            )
+
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, use_fast=bool(args.use_fast_tokenizer))
         model.eval()
 
         placeholder_ids = tokenizer.encode(args.placeholder_text, add_special_tokens=False)
@@ -375,6 +396,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run activation-oracle jobs")
     p.add_argument("--jobs_jsonl", type=str, required=True)
     p.add_argument("--ao_model_id", type=str, required=True)
+    p.add_argument("--base_model_id", type=str, default=None)
+    p.add_argument("--peft_adapter_id", type=str, default=None)
+    p.add_argument("--use_fast_tokenizer", type=parse_bool, default=True)
     p.add_argument("--placeholder_text", type=str, default=" ?")
     p.add_argument("--hook_layer_index", type=int, default=1)
     p.add_argument("--norm_policy", type=str, default="hidden_state_match", choices=["hidden_state_match", "fixed_alpha"])
