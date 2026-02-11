@@ -12,6 +12,7 @@ from typing import Iterable, List, Optional
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
 
 from common import (
     append_jsonl,
@@ -89,6 +90,7 @@ def run(args: argparse.Namespace) -> int:
     jobs_path = Path(args.jobs_jsonl).resolve()
     if not jobs_path.exists():
         raise FileNotFoundError(f"Jobs file not found: {jobs_path}")
+    progress_every = max(1, int(args.progress_every))
 
     jobs_name = jobs_path.stem
     run_id = args.run_id or make_run_id()
@@ -141,6 +143,7 @@ def run(args: argparse.Namespace) -> int:
             "temperature": float(args.temperature),
             "top_p": float(args.top_p),
             "max_jobs": int(args.max_jobs),
+            "progress_every": int(args.progress_every),
             "force_rebuild": bool(args.force_rebuild),
         },
     )
@@ -200,17 +203,27 @@ def run(args: argparse.Namespace) -> int:
         model_device = next(model.parameters()).device
         jobs_parent = jobs_path.parent
 
+        runnable_jobs = []
         for job in jobs:
-            if max_jobs > 0 and processed >= max_jobs:
-                break
-
             job_id = str(job.get("job_id", ""))
             if not job_id:
                 continue
-
             if (job_id in done_jobs) or (job_id in existing_response_ids):
                 continue
+            runnable_jobs.append(job)
+        if max_jobs > 0:
+            runnable_jobs = runnable_jobs[:max_jobs]
 
+        logger.info(
+            "AO run jobs: total=%d runnable=%d skipped_existing=%d",
+            len(jobs),
+            len(runnable_jobs),
+            len(jobs) - len(runnable_jobs),
+        )
+
+        jobs_bar = tqdm(runnable_jobs, desc="AO inference jobs", unit="job", leave=True)
+        for job in jobs_bar:
+            job_id = str(job.get("job_id", ""))
             processed += 1
             row = {
                 "job_id": job_id,
@@ -318,8 +331,13 @@ def run(args: argparse.Namespace) -> int:
             append_jsonl(responses_path, [row])
             existing_response_ids.add(job_id)
             done_jobs.add(job_id)
+            jobs_bar.set_postfix({"ok": success, "err": failed})
+            if processed % progress_every == 0:
+                logger.info("AO progress: processed=%d ok=%d err=%d", processed, success, failed)
             save_completed_set(progress, "job_units", done_jobs)
             save_progress(progress_path, progress)
+
+        jobs_bar.close()
 
         mark_step_completed(progress, STEP_RUN)
         save_progress(progress_path, progress)
@@ -366,6 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_p", type=float, default=1.0)
     p.add_argument("--max_jobs", type=int, default=0)
+    p.add_argument("--progress_every", type=int, default=25, help="Emit log progress every N jobs")
     p.add_argument("--torch_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     p.add_argument("--device_map", type=str, default="auto")
     p.add_argument("--output_root", type=str, default="artifacts")
