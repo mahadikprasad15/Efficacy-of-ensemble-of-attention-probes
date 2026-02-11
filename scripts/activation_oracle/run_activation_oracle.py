@@ -75,8 +75,18 @@ def load_existing_response_ids(path: Path) -> set:
 
 
 def get_transformer_blocks(model):
+    # Unwrap PEFT models if present.
+    if hasattr(model, "base_model"):
+        base = model.base_model
+        if hasattr(base, "model"):
+            model = base.model
+        else:
+            model = base
+
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model.layers
+    if hasattr(model, "layers"):
+        return model.layers
     if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
         return model.transformer.h
     raise ValueError("Unsupported model architecture for hook insertion")
