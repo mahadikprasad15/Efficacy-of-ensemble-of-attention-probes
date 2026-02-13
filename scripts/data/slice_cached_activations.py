@@ -120,6 +120,16 @@ def main() -> int:
     if not by_shard:
         raise ValueError("No shard info found in manifest entries")
 
+    # Build shard index -> path map (handles zero-padded shard filenames)
+    shard_paths = {}
+    for path in glob.glob(os.path.join(args.raw_activations_dir, "shard_*.safetensors")):
+        base = os.path.basename(path)
+        try:
+            shard_num = int(base.replace("shard_", "").replace(".safetensors", ""))
+        except ValueError:
+            continue
+        shard_paths[shard_num] = path
+
     os.makedirs(args.output_dir, exist_ok=True)
     out_manifest_path = os.path.join(args.output_dir, "manifest.jsonl")
     out_manifest = open(out_manifest_path, "w")
@@ -137,9 +147,9 @@ def main() -> int:
     count = 0
 
     for shard_idx in sorted(by_shard.keys()):
-        shard_path = os.path.join(args.raw_activations_dir, f"shard_{shard_idx}.safetensors")
-        if not os.path.exists(shard_path):
-            raise FileNotFoundError(f"Missing shard: {shard_path}")
+        shard_path = shard_paths.get(shard_idx)
+        if not shard_path or not os.path.exists(shard_path):
+            raise FileNotFoundError(f"Missing shard index {shard_idx} in {args.raw_activations_dir}")
         shard_data = load_file(shard_path)
 
         for entry in by_shard[shard_idx]:
