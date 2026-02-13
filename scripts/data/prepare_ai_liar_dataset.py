@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Prepare paired AILiar dataset from Apollo rollouts.
+Prepare AILiar dataset from Apollo rollouts.
+
+Modes:
+1) paired: one honest + one deceptive output per rollout (first of each).
+2) all_labeled: include every output labeled honest/deceptive.
 
 Creates two outputs:
-1) paired_rollouts.jsonl: one row per rollout with one honest + one deceptive output
-2) paired_examples.jsonl: two rows per rollout (honest + deceptive), ready for caching
+- paired_rollouts.jsonl: one row per rollout (mode-dependent payload)
+- paired_examples.jsonl: one row per example (prompt + completion + label)
 
-Pairing rule: first honest + first deceptive (deterministic).
 Splits are rollout-level: 60/20/20 train/validation/test.
 """
 
@@ -160,6 +163,99 @@ def pair_rollouts(raw: dict, max_pairs: int, seed: int) -> Tuple[List[dict], Lis
     return paired, examples
 
 
+def all_labeled_rollouts(raw: dict, max_rollouts: int, seed: int) -> Tuple[List[dict], List[dict]]:
+    rollouts = raw.get("rollouts", [])
+    grouped = []
+
+    for idx, rollout in enumerate(rollouts):
+        graded = rollout.get("graded_deception", [])
+        if not graded:
+            continue
+
+        texts = extract_texts(rollout)
+        if not texts:
+            continue
+
+        input_messages = rollout.get("input_messages", [])
+        system_msg = next((m.get("content", "") for m in input_messages if m.get("role") == "system"), "")
+        user_msgs = [m.get("content", "") for m in input_messages if m.get("role") == "user"]
+
+        labeled_outputs = []
+        for i, lbl in enumerate(graded):
+            if i >= len(texts):
+                break
+            label = str(lbl).strip().lower()
+            if label not in ("honest", "deceptive"):
+                continue
+            labeled_outputs.append(
+                {
+                    "output_index": i,
+                    "label_str": label,
+                    "output": texts[i],
+                }
+            )
+
+        if not labeled_outputs:
+            continue
+
+        grouped.append(
+            {
+                "rollout_id": f"ai_liar_{idx}",
+                "system": system_msg,
+                "users": user_msgs,
+                "input_messages": input_messages,
+                "labeled_outputs": labeled_outputs,
+                "deception_percentage": rollout.get("deception_percentage"),
+                "graded_deception": graded,
+            }
+        )
+
+    random.seed(seed)
+    random.shuffle(grouped)
+    grouped = grouped[:max_rollouts]
+
+    # Rollout-level split
+    n = len(grouped)
+    train_end = int(0.6 * n)
+    val_end = int(0.8 * n)
+    for i, row in enumerate(grouped):
+        if i < train_end:
+            row["split"] = "train"
+        elif i < val_end:
+            row["split"] = "validation"
+        else:
+            row["split"] = "test"
+
+    examples = []
+    for row in grouped:
+        prompt = build_prompt_from_input_messages(row["input_messages"])
+        rid = row["rollout_id"]
+        split = row["split"]
+        base_meta = {
+            "dataset": "Deception-AILiar",
+            "rollout_id": rid,
+            "split": split,
+            "input_messages": row["input_messages"],
+            "graded_deception": row["graded_deception"],
+            "deception_percentage": row["deception_percentage"],
+            "has_pregenerated_response": True,
+        }
+
+        for lo in row["labeled_outputs"]:
+            gold = 0 if lo["label_str"] == "honest" else 1
+            examples.append(
+                {
+                    "prompt": prompt,
+                    "completion": lo["output"],
+                    "gold_label": gold,
+                    "metadata": {**base_meta, "id": f"{rid}_{lo['label_str']}_{lo['output_index']}", "output_index": lo["output_index"]},
+                    "split": split,
+                }
+            )
+
+    return grouped, examples
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare paired AILiar dataset from Apollo rollouts")
     parser.add_argument(
@@ -174,12 +270,41 @@ def main() -> None:
         required=True,
         help="Directory to write paired_rollouts.jsonl and paired_examples.jsonl",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="paired",
+        choices=["paired", "all_labeled"],
+        help="Dataset mode: paired (one honest+deceptive per rollout) or all_labeled (all outputs with labels)",
+    )
     parser.add_argument("--max_pairs", type=int, default=200, help="Number of paired rollouts to keep")
+    parser.add_argument(
+        "--max_examples",
+        type=int,
+        default=None,
+        help="Optional cap on total examples AFTER expansion (per split: 60/20/20).",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed for splits")
     args = parser.parse_args()
 
     raw = read_json(args.input_json)
-    paired, examples = pair_rollouts(raw, max_pairs=int(args.max_pairs), seed=int(args.seed))
+    if args.mode == "paired":
+        paired, examples = pair_rollouts(raw, max_pairs=int(args.max_pairs), seed=int(args.seed))
+    else:
+        paired, examples = all_labeled_rollouts(raw, max_rollouts=int(args.max_pairs), seed=int(args.seed))
+
+    if args.max_examples is not None:
+        random.seed(args.seed)
+        train_cap = int(0.6 * args.max_examples)
+        val_cap = int(0.2 * args.max_examples)
+        test_cap = args.max_examples - train_cap - val_cap
+        by_split = {"train": [], "validation": [], "test": []}
+        for ex in examples:
+            by_split[ex.get("split", "train")].append(ex)
+        for split, cap in [("train", train_cap), ("validation", val_cap), ("test", test_cap)]:
+            random.shuffle(by_split[split])
+            by_split[split] = by_split[split][:cap]
+        examples = by_split["train"] + by_split["validation"] + by_split["test"]
 
     paired_path = os.path.join(args.output_dir, "paired_rollouts.jsonl")
     examples_path = os.path.join(args.output_dir, "paired_examples.jsonl")

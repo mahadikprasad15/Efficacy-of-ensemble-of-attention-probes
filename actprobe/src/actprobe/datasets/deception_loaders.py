@@ -593,3 +593,7 @@ class DeceptionAILiarDataset(BaseDataset):
             )
 
         return examples
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Return a single example"""
+        return self.data[idx]
