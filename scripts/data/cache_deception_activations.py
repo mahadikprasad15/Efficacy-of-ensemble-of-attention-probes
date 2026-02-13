@@ -50,7 +50,11 @@ from safetensors.torch import save_file
 # Add src to path
 sys.path.append(os.path.join(os.getcwd(), 'actprobe', 'src'))
 
-from actprobe.datasets.deception_loaders import DeceptionRoleplayingDataset, DeceptionInsiderTradingDataset
+from actprobe.datasets.deception_loaders import (
+    DeceptionRoleplayingDataset,
+    DeceptionInsiderTradingDataset,
+    DeceptionAILiarDataset,
+)
 from actprobe.llm.activations import ActivationRunner
 from actprobe.features.resample import resample_activations
 from actprobe.llm.generate import CerebrasGenerator
@@ -231,6 +235,7 @@ class DeceptionLabeler:
 DATASET_MAP = {
     "Deception-Roleplaying": DeceptionRoleplayingDataset,
     "Deception-InsiderTrading": DeceptionInsiderTradingDataset,
+    "Deception-AILiar": DeceptionAILiarDataset,
 }
 
 # ============================================================================
@@ -371,6 +376,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.dataset == "Deception-AILiar" and not args.include_prompt_tokens:
+        logger.info("Deception-AILiar: forcing --include_prompt_tokens to store full prompt+completion activations.")
+        args.include_prompt_tokens = True
 
     logger.info(f"{'='*70}")
     logger.info(f"Deception Detection - Activation Caching Pipeline")
@@ -628,6 +637,7 @@ def main():
                     # Use pre-generated completions and labels from dataset
                     completions = []
                     labels_from_dataset = []
+                    boundary_meta = []
                     
                     for bi in batch_items:
                         # Get pre-generated completion
@@ -640,21 +650,77 @@ def main():
                         # Get pre-assigned label
                         label = bi.get('gold_label', -1)
                         labels_from_dataset.append(label)
+                        boundary_meta.append({
+                            "input_messages": bi.get("metadata", {}).get("input_messages"),
+                        })
                     
                     # Extract activations for the pre-generated completions
-                    # We need to encode the full text (prompt + completion) and extract
-                    full_texts = [p + c for p, c in zip(batch_prompts, completions)]
-                    
-                    # Calculate prompt end indices for slicing
+                    # Use chat template if input_messages are available; else fall back to prompt+completion
+                    full_texts = []
+                    system_end_idxs = []
+                    user_end_idxs = []
+                    completion_end_idxs = []
                     prompt_end_indices = []
-                    for prompt in batch_prompts:
-                        prompt_tokens = runner.tokenizer(prompt, return_tensors="pt").input_ids
-                        prompt_end_indices.append(prompt_tokens.shape[1])
+
+                    for p, c, meta in zip(batch_prompts, completions, boundary_meta):
+                        input_messages = meta.get("input_messages")
+                        if input_messages:
+                            system_msg = None
+                            user_msgs = []
+                            for msg in input_messages:
+                                role = msg.get("role")
+                                content = msg.get("content", "")
+                                if role == "system" and system_msg is None:
+                                    system_msg = content
+                                elif role == "user":
+                                    user_msgs.append(content)
+
+                            sys_messages = []
+                            if system_msg:
+                                sys_messages.append({"role": "system", "content": system_msg})
+
+                            su_messages = list(sys_messages)
+                            for um in user_msgs:
+                                su_messages.append({"role": "user", "content": um})
+
+                            full_messages = list(su_messages)
+                            full_messages.append({"role": "assistant", "content": c})
+
+                            sys_text = runner.tokenizer.apply_chat_template(
+                                sys_messages, tokenize=False, add_generation_prompt=False
+                            ) if sys_messages else ""
+                            su_text = runner.tokenizer.apply_chat_template(
+                                su_messages, tokenize=False, add_generation_prompt=True
+                            )
+                            full_text = runner.tokenizer.apply_chat_template(
+                                full_messages, tokenize=False, add_generation_prompt=False
+                            )
+
+                            system_end = len(runner.tokenizer(sys_text, add_special_tokens=False).input_ids) if sys_text else 0
+                            user_end = len(runner.tokenizer(su_text, add_special_tokens=False).input_ids)
+                            completion_end = len(runner.tokenizer(full_text, add_special_tokens=False).input_ids)
+
+                            full_texts.append(full_text)
+                            system_end_idxs.append(system_end)
+                            user_end_idxs.append(user_end)
+                            completion_end_idxs.append(completion_end)
+                            prompt_end_indices.append(user_end)
+                        else:
+                            full_texts.append(p + c)
+                            system_end_idxs.append(None)
+                            user_end_idxs.append(None)
+                            completion_end_idxs.append(None)
+                            prompt_end_indices.append(None)
                     
                     if args.include_prompt_tokens:
                         raw_activations = runner.get_activations(full_texts)
                     else:
                         # Get activations, slicing to only completion tokens
+                        if any(idx is None for idx in prompt_end_indices):
+                            prompt_end_indices = []
+                            for prompt in batch_prompts:
+                                prompt_tokens = runner.tokenizer(prompt, return_tensors="pt").input_ids
+                                prompt_end_indices.append(prompt_tokens.shape[1])
                         raw_activations = runner.get_activations(full_texts, prompt_end_indices=prompt_end_indices)
                     
                     # Create labeled items (no Cerebras needed)
@@ -663,7 +729,10 @@ def main():
                         labeled_items.append({
                             'completion': completion,
                             'label': label,
-                            'metadata': batch_items[j]['metadata']
+                            'metadata': batch_items[j]['metadata'],
+                            'system_end_idx': system_end_idxs[j] if j < len(system_end_idxs) else None,
+                            'user_end_idx': user_end_idxs[j] if j < len(user_end_idxs) else None,
+                            'completion_end_idx': completion_end_idxs[j] if j < len(completion_end_idxs) else None,
                         })
 
                 # ============================================================
@@ -745,6 +814,11 @@ def main():
                         buffer_tensors_raw[eid] = raw_tensor
 
                     # Write to manifests
+                    scenario_val = batch_items[j].get("metadata", {}).get("scenario")
+                    scenario_snip = None
+                    if isinstance(scenario_val, str):
+                        scenario_snip = (scenario_val[:150] + "...") if len(scenario_val) > 150 else scenario_val
+
                     if manifest_file:
                         meta = {
                             "id": eid,
@@ -752,8 +826,10 @@ def main():
                             "label": label,  # 0=honest, 1=deceptive
                             "generation_length": original_gen_length,
                             "shard": shard_idx_resampled,
-                            # Store truncated scenario for reference
-                            "scenario": batch_items[j]['metadata']['scenario'][:150] + "..."
+                            "scenario": scenario_snip,
+                            "system_end_idx": item.get("system_end_idx"),
+                            "user_end_idx": item.get("user_end_idx"),
+                            "completion_end_idx": item.get("completion_end_idx"),
                         }
                         manifest_file.write(json.dumps(meta) + "\n")
                         manifest_file.flush()  # Ensure immediate write (important for Colab)
@@ -765,7 +841,10 @@ def main():
                             "label": label,  # 0=honest, 1=deceptive
                             "generation_length": original_gen_length,
                             "shard": shard_idx_raw,
-                            "scenario": batch_items[j]['metadata']['scenario'][:150] + "..."
+                            "scenario": scenario_snip,
+                            "system_end_idx": item.get("system_end_idx"),
+                            "user_end_idx": item.get("user_end_idx"),
+                            "completion_end_idx": item.get("completion_end_idx"),
                         }
                         raw_manifest_file.write(json.dumps(meta_raw) + "\n")
                         raw_manifest_file.flush()

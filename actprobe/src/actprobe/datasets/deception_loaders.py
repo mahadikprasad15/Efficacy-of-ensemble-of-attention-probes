@@ -428,3 +428,168 @@ class DeceptionInsiderTradingDataset(BaseDataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Return a single example"""
         return self.data[idx]
+
+
+class DeceptionAILiarDataset(BaseDataset):
+    """
+    Apollo Research AILiar Dataset (pre-generated rollouts).
+
+    This loader expects paired honest + deceptive outputs per rollout.
+    If paired_examples.jsonl exists, it loads from that directly.
+    Otherwise, it builds pairs on the fly from the raw rollouts JSON.
+
+    Labels:
+    - honest => 0
+    - deceptive => 1
+    """
+
+    def __init__(
+        self,
+        split: str = "train",
+        limit: Optional[int] = None,
+        data_file: str = "data/apollo_raw/ai_liar/ai_liar__original_without_answers__llama-70b.json",
+        paired_examples_file: str = "data/apollo_raw/ai_liar/paired_examples.jsonl",
+        random_seed: int = 42,
+        max_pairs: int = 200,
+    ):
+        super().__init__(split=split, limit=limit)
+        self.data_file = data_file
+        self.paired_examples_file = paired_examples_file
+        self.random_seed = random_seed
+        self.max_pairs = max_pairs
+
+        if not os.path.exists(self.data_file) and not os.path.exists(self.paired_examples_file):
+            raise FileNotFoundError(
+                f"AILiar data not found. Expected:\n"
+                f"  - {self.data_file}\n"
+                f"  - {self.paired_examples_file}\n"
+            )
+
+    def load_data(self):
+        if os.path.exists(self.paired_examples_file):
+            self.data = self._load_from_paired_examples()
+        else:
+            self.data = self._load_and_pair_raw()
+
+        # Apply limit
+        self.apply_limit()
+
+    def _load_from_paired_examples(self) -> List[Dict[str, Any]]:
+        rows = []
+        with open(self.paired_examples_file, "r") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("split") != self.split:
+                    continue
+                meta = row.get("metadata")
+                if isinstance(meta, dict):
+                    meta.setdefault("has_pregenerated_response", True)
+                    if "input_messages" not in meta and "input_messages" in row:
+                        meta["input_messages"] = row.get("input_messages")
+                rows.append(row)
+        return rows
+
+    def _load_and_pair_raw(self) -> List[Dict[str, Any]]:
+        with open(self.data_file, "r") as f:
+            raw = json.load(f)
+
+        rollouts = raw.get("rollouts", [])
+        paired = []
+        for idx, rollout in enumerate(rollouts):
+            deception_pct = rollout.get("deception_percentage")
+            if deception_pct is None:
+                continue
+            if not (0 < float(deception_pct) <= 0.8):
+                continue
+
+            graded = rollout.get("graded_deception", [])
+            if not graded:
+                continue
+
+            honest_idx = next((i for i, g in enumerate(graded) if str(g).lower() == "honest"), None)
+            deceptive_idx = next((i for i, g in enumerate(graded) if str(g).lower() == "deceptive"), None)
+            if honest_idx is None or deceptive_idx is None:
+                continue
+
+            outputs = rollout.get("output_strs")
+            if not outputs:
+                outputs = [m.get("content", "") for m in rollout.get("output_messages", [])]
+
+            if honest_idx >= len(outputs) or deceptive_idx >= len(outputs):
+                continue
+
+            input_messages = rollout.get("input_messages", [])
+            system_msg = next((m.get("content", "") for m in input_messages if m.get("role") == "system"), "")
+            user_msgs = [m.get("content", "") for m in input_messages if m.get("role") == "user"]
+
+            prompt_parts = []
+            if system_msg:
+                prompt_parts.append(system_msg.strip())
+            if user_msgs:
+                prompt_parts.append("\n\n".join(u.strip() for u in user_msgs if u.strip()))
+            prompt = "\n\n".join(p for p in prompt_parts if p)
+
+            paired.append(
+                {
+                    "rollout_id": f"ai_liar_{idx}",
+                    "prompt": prompt,
+                    "input_messages": input_messages,
+                    "honest_output": outputs[honest_idx],
+                    "deceptive_output": outputs[deceptive_idx],
+                    "honest_idx": honest_idx,
+                    "deceptive_idx": deceptive_idx,
+                    "graded_deception": graded,
+                    "deception_percentage": deception_pct,
+                }
+            )
+
+        random.seed(self.random_seed)
+        random.shuffle(paired)
+        paired = paired[: self.max_pairs]
+
+        # Rollout-level split
+        n = len(paired)
+        train_end = int(0.6 * n)
+        val_end = int(0.8 * n)
+
+        examples = []
+        for i, row in enumerate(paired):
+            if i < train_end:
+                split = "train"
+            elif i < val_end:
+                split = "validation"
+            else:
+                split = "test"
+            if split != self.split:
+                continue
+
+            base_meta = {
+                "dataset": "Deception-AILiar",
+                "rollout_id": row["rollout_id"],
+                "split": split,
+                "input_messages": row["input_messages"],
+                "graded_deception": row["graded_deception"],
+                "deception_percentage": row["deception_percentage"],
+                "has_pregenerated_response": True,
+            }
+
+            examples.append(
+                {
+                    "prompt": row["prompt"],
+                    "completion": row["honest_output"],
+                    "gold_label": 0,
+                    "metadata": {**base_meta, "id": f"{row['rollout_id']}_honest", "output_index": row["honest_idx"]},
+                }
+            )
+            examples.append(
+                {
+                    "prompt": row["prompt"],
+                    "completion": row["deceptive_output"],
+                    "gold_label": 1,
+                    "metadata": {**base_meta, "id": f"{row['rollout_id']}_deceptive", "output_index": row["deceptive_idx"]},
+                }
+            )
+
+        return examples
