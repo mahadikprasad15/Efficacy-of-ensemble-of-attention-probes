@@ -903,6 +903,33 @@ def main():
     if raw_manifest_file:
         raw_manifest_file.close()
 
+    # Safety: flush any remaining tensors (if any) after loop
+    if write_resampled and len(buffer_tensors_resampled) > 0:
+        shard_name = f"shard_{shard_idx_resampled:03d}.safetensors"
+        shard_path = os.path.join(save_dir, shard_name)
+        try:
+            save_file(buffer_tensors_resampled, shard_path)
+            logger.info(
+                f"✓ Saved {shard_name} with {len(buffer_tensors_resampled)} tensors (final flush)"
+            )
+        except Exception as e:
+            logger.error(f"Failed to save final resampled shard: {e}")
+        buffer_tensors_resampled = {}
+        shard_idx_resampled += 1
+
+    if write_raw and len(buffer_tensors_raw) > 0:
+        shard_name = f"shard_{shard_idx_raw:03d}.safetensors"
+        shard_path = os.path.join(raw_save_dir, shard_name)
+        try:
+            save_file(buffer_tensors_raw, shard_path)
+            logger.info(
+                f"✓ Saved RAW {shard_name} with {len(buffer_tensors_raw)} tensors (final flush)"
+            )
+        except Exception as e:
+            logger.error(f"Failed to save final raw shard: {e}")
+        buffer_tensors_raw = {}
+        shard_idx_raw += 1
+
     # ========================================================================
     # 6. Summary
     # ========================================================================
