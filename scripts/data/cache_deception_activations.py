@@ -441,10 +441,29 @@ def main():
 
             honest = meta.get('honest_reference', '')
             deceptive = meta.get('deceptive_reference', '')
+            answer_prefix = (meta.get('answer_prefix') or "").strip()
+
+            # Build assistant completion with answer_prefix included
+            def _with_prefix(text: str) -> str:
+                if not answer_prefix:
+                    return text
+                return f"{answer_prefix} {text}".strip()
+
+            honest = _with_prefix(honest)
+            deceptive = _with_prefix(deceptive)
+
+            # Provide input_messages for boundary indexing (system=scenario, user=question)
+            scenario = meta.get("scenario", "")
+            question = meta.get("question", "")
+            input_messages = [
+                {"role": "system", "content": scenario},
+                {"role": "user", "content": question},
+            ]
 
             # Honest sample
             meta_h = copy.deepcopy(meta)
             meta_h['id'] = f"{base_id}_honest"
+            meta_h['input_messages'] = input_messages
             expanded_items.append({
                 'prompt': prompt,
                 'completion': honest,
@@ -455,6 +474,7 @@ def main():
             # Deceptive sample
             meta_d = copy.deepcopy(meta)
             meta_d['id'] = f"{base_id}_deceptive"
+            meta_d['input_messages'] = input_messages
             expanded_items.append({
                 'prompt': prompt,
                 'completion': deceptive,
@@ -600,40 +620,7 @@ def main():
                 # ============================================================
                 # MODE A: Pre-generated responses (Apollo Insider Trading)
                 # ============================================================
-                if args.use_gold_completions:
-                    # Use gold completions from Roleplaying YAML
-                    completions = []
-                    labels_from_dataset = []
-
-                    for bi in batch_items:
-                        completion = bi.get('completion', '')
-                        label = bi.get('gold_label', -1)
-                        completions.append(completion)
-                        labels_from_dataset.append(label)
-
-                    full_texts = [p + c for p, c in zip(batch_prompts, completions)]
-
-                    if args.include_prompt_tokens:
-                        raw_activations = runner.get_activations(full_texts)
-                    else:
-                        prompt_end_indices = []
-                        for prompt in batch_prompts:
-                            prompt_tokens = runner.tokenizer(prompt, return_tensors="pt").input_ids
-                            prompt_end_indices.append(prompt_tokens.shape[1])
-                        raw_activations = runner.get_activations(full_texts, prompt_end_indices=prompt_end_indices)
-
-                    labeled_items = []
-                    for j, (completion, label) in enumerate(zip(completions, labels_from_dataset)):
-                        labeled_items.append({
-                            'completion': completion,
-                            'label': label,
-                            'metadata': batch_items[j]['metadata']
-                        })
-
-                # ============================================================
-                # MODE A: Pre-generated responses (Apollo Insider Trading)
-                # ============================================================
-                elif args.use_pregenerated:
+                if args.use_pregenerated or args.use_gold_completions:
                     # Use pre-generated completions and labels from dataset
                     completions = []
                     labels_from_dataset = []
