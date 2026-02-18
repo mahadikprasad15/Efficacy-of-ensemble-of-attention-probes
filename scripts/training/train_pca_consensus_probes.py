@@ -337,7 +337,7 @@ def main() -> int:
 
     rng = np.random.default_rng(args.seed)
 
-    for layer in layers:
+    for layer in tqdm(layers, desc="Layers", unit="layer"):
         # Load PCA artifact for this layer
         pca_path = os.path.join(args.pca_artifacts_dir, f"layer_{layer}.npz")
         if not os.path.exists(pca_path):
@@ -348,7 +348,7 @@ def main() -> int:
         mean = pca_art["mean"]
         k_max = components.shape[0]
 
-        for K in k_values:
+        for K in tqdm(k_values, desc=f"Layer {layer} K sweep", unit="K", leave=False):
             if K > k_max:
                 logger.warning(f"K={K} exceeds saved PCA components ({k_max}) for layer {layer}. Skipping.")
                 continue
@@ -383,7 +383,7 @@ def main() -> int:
             completed_probes = set(progress.get("completed_probes", []))
             completed_thresholds = set(progress.get("completed_thresholds", []))
 
-            for r in range(args.num_probes):
+            for r in tqdm(range(args.num_probes), desc=f"L{layer} K{K} probes", unit="probe", leave=False):
                 boot_idx = bootstrap_indices(len(y_train), args.bootstrap_frac, rng)
                 Xb = X_train_proj[boot_idx]
                 yb = y_train[boot_idx]
