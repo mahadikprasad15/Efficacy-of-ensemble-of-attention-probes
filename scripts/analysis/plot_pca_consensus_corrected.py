@@ -121,6 +121,7 @@ def load_run_data(
     npc_min: int = 10,
     baseline_auc: float = 0.5,
     drop_redundant_thresholds: bool = True,
+    use_label_flip: bool = False,
 ) -> RunData:
     consensus_path = os.path.join(run_dir, "consensus_summary.csv")
     if not os.path.exists(consensus_path):
@@ -183,6 +184,8 @@ def load_run_data(
         & consensus["has_retrain"]
         & ((consensus["ood_test_auc"] - baseline_auc) * (consensus["retrain_ood_test_auc"] - baseline_auc) < 0)
     )
+    if not use_label_flip:
+        consensus["label_flip"] = False
     consensus["reliable"] = consensus["has_consensus"] & (~consensus["small_npc"]) & (~consensus["label_flip"])
 
     layers = sorted(int(x) for x in consensus["layer"].unique())
@@ -232,6 +235,7 @@ def _annotate_matrix_cells(
     border_mask_col: str = "small_npc",
     flip_mask_col: str = "label_flip",
     show_npc: bool = True,
+    npc_mode: str = "small",
 ):
     idx = {(int(r["layer"]), int(r["K"])): r for _, r in df.iterrows()}
     for i, layer in enumerate(layers):
@@ -264,7 +268,10 @@ def _annotate_matrix_cells(
 
             txt_color = "black" if val > 0.42 else "white"
             ax.text(j, i, f"{val:.3f}", ha="center", va="center", fontsize=8.5, color=txt_color, weight="bold")
-            if show_npc:
+            show_npc_here = show_npc and (
+                (npc_mode == "all") or (npc_mode == "small" and is_small)
+            )
+            if show_npc_here:
                 ax.text(j, i + 0.20, f"npc={npc}", ha="center", va="center", fontsize=6.5, color="#ff9f1c")
 
             if is_small:
@@ -280,7 +287,15 @@ def plot_ood_auc_heatmaps(data: RunData, out_path: str, vmin: float = 0.25, vmax
     if len(thresholds) == 1:
         thresholds = [thresholds[0], thresholds[0]]
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig = plt.figure(figsize=(16, 10.5), constrained_layout=True)
+    gs = fig.add_gridspec(2, 3, width_ratios=[1.0, 1.0, 0.035])
+    axes = np.array(
+        [
+            [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])],
+            [fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])],
+        ]
+    )
+    cax = fig.add_subplot(gs[:, 2])
     cmap = plt.get_cmap("RdYlGn")
 
     for col, thr in enumerate(thresholds):
@@ -305,6 +320,7 @@ def plot_ood_auc_heatmaps(data: RunData, out_path: str, vmin: float = 0.25, vmax
             "retrain_ood_test_auc",
             npc_col="retrain_num_consensus_pcs",
             show_npc=True,
+            npc_mode="small",
         )
         axes[1, col].set_title(f"threshold={thr:.1f}  ·  Retrained Probe", fontsize=11, weight="bold")
         axes[1, col].set_xticks(range(len(data.k_values)))
@@ -313,7 +329,7 @@ def plot_ood_auc_heatmaps(data: RunData, out_path: str, vmin: float = 0.25, vmax
         axes[1, col].set_yticklabels([f"L{l}" for l in data.layers], fontsize=9)
         axes[1, col].grid(color="white", lw=1.2, alpha=0.8)
 
-    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.78)
+    cbar = fig.colorbar(im, cax=cax)
     cbar.set_label("OOD AUC")
 
     dropped = (
@@ -325,11 +341,10 @@ def plot_ood_auc_heatmaps(data: RunData, out_path: str, vmin: float = 0.25, vmax
         "OOD AUC Heatmap (Layer × K)  ·  CORRECTED"
         + dropped
         + "\n"
-        + f"pooling={data.meta.get('pooling')} · dataset={data.meta.get('dataset')} · npc<10 orange border · x=label flip",
+        + f"pooling={data.meta.get('pooling')} · dataset={data.meta.get('dataset')} · npc<10 orange border",
         fontsize=12,
         weight="bold",
     )
-    plt.tight_layout(rect=[0, 0.02, 1, 0.92])
     plt.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -348,50 +363,65 @@ def _layer_color(layer: int) -> str:
 def plot_top10_ranking(data: RunData, out_path: str, top_n: int = 10, baseline_auc: float = 0.5) -> None:
     df = data.consensus.copy()
     candidates = df.sort_values("ood_test_auc", ascending=False).reset_index(drop=True)
-    reliable = candidates[candidates["reliable"]].copy().head(top_n)
-    excluded = candidates[(~candidates["reliable"])].head(10)
+    reliable_desc = candidates[candidates["reliable"]].copy().head(top_n)
+    reliable_desc["rank"] = np.arange(1, len(reliable_desc) + 1)
+    reliable = reliable_desc.sort_values("ood_test_auc", ascending=True).reset_index(drop=True)
+    excluded = candidates[(~candidates["reliable"])].head(12)
 
-    fig, ax = plt.subplots(1, 1, figsize=(16, 8))
+    fig, (ax, ax_right) = plt.subplots(
+        1, 2, figsize=(18, 8), gridspec_kw={"width_ratios": [3.6, 1.4]}, constrained_layout=True
+    )
     if reliable.empty:
         ax.text(0.5, 0.5, "No reliable configs after filters", ha="center", va="center", fontsize=13)
         ax.axis("off")
+        ax_right.axis("off")
         plt.savefig(out_path, dpi=180, bbox_inches="tight")
         plt.close(fig)
         return
 
-    x = np.arange(len(reliable))
+    reliable = reliable.sort_values("ood_test_auc", ascending=True).reset_index(drop=True)
+    y = np.arange(len(reliable))
     colors = [_layer_color(int(l)) for l in reliable["layer"]]
-    bars = ax.bar(x, reliable["ood_test_auc"], color=colors, alpha=0.88, width=0.70)
+    bars = ax.barh(y, reliable["ood_test_auc"], color=colors, alpha=0.90, height=0.68, label="Original")
 
-    # Overlay retrain (outline bar)
     has_rt = reliable["retrain_ood_test_auc"].notna().to_numpy()
     if has_rt.any():
-        ax.bar(
-            x[has_rt],
+        ax.scatter(
             reliable.loc[has_rt, "retrain_ood_test_auc"],
-            width=0.70,
-            facecolor="none",
-            edgecolor="#bdbdbd",
-            linewidth=2.0,
-            label="Retrained (outline)",
+            y[has_rt],
+            marker="s",
+            s=58,
+            facecolors="none",
+            edgecolors="#616161",
+            linewidths=1.8,
+            label="Retrained",
+            zorder=5,
         )
 
-    for i, (b, (_, r)) in enumerate(zip(bars, reliable.iterrows())):
-        ax.text(i, b.get_height() + 0.008, f"{r['ood_test_auc']:.3f}", ha="center", va="bottom", fontsize=11, weight="bold")
-        note = f"Ratio:{100.0*float(r['consensus_ratio']):.1f}%\nAvg sel:{int(round(float(r['avg_selected_per_probe'])))}"
-        ax.text(i, 0.14, note, ha="center", va="bottom", fontsize=8.5, color="#424242", bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"))
+    for yi, b, (_, r) in zip(y, bars, reliable.iterrows()):
+        ax.text(float(r["ood_test_auc"]) + 0.006, yi, f"{float(r['ood_test_auc']):.3f}", va="center", ha="left", fontsize=10, weight="bold")
+        ax.text(
+            max(0.11, float(r["ood_test_auc"]) - 0.09),
+            yi,
+            f"ratio={100.0*float(r['consensus_ratio']):.1f}%  avg={int(round(float(r['avg_selected_per_probe'])))}",
+            va="center",
+            ha="left",
+            fontsize=8.2,
+            color="#37474f",
+            bbox=dict(facecolor="white", alpha=0.65, edgecolor="none", boxstyle="round,pad=0.12"),
+        )
 
-    labels = [
-        f"#{i+1}  L{int(r.layer)} K={int(r.K)}\nthr={float(r.threshold):.1f} npc={int(r.num_consensus_pcs)}"
-        for i, r in enumerate(reliable.itertuples(index=False))
+    ylabels = [
+        f"#{int(r.rank)} L{int(r.layer)} K={int(r.K)} t={float(r.threshold):.1f} npc={int(r.num_consensus_pcs)}"
+        for r in reliable.itertuples(index=False)
     ]
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=9)
-    ax.axhline(baseline_auc, ls="--", lw=1.6, color="#555555")
-    ax.set_ylabel("OOD AUC (Insider Trading test set)", fontsize=14)
-    ax.set_xlabel("Rank · Configuration", fontsize=14)
-    ax.set_ylim(0.10, max(0.75, float(np.nanmax(reliable["ood_test_auc"]) + 0.06)))
-    ax.grid(axis="y", alpha=0.22)
+    ax.set_yticks(y)
+    ax.set_yticklabels(ylabels, fontsize=9)
+    ax.axvline(baseline_auc, ls="--", lw=1.6, color="#555555")
+    ax.set_ylabel("Ranked configuration", fontsize=12)
+    ax.set_xlabel("OOD AUC", fontsize=13)
+    ax.set_xlim(0.10, max(0.75, float(np.nanmax(reliable["ood_test_auc"]) + 0.09)))
+    ax.grid(axis="x", alpha=0.22)
     ax.set_title(
         f"Top-{top_n} Configurations by OOD AUC  ·  CORRECTED",
         fontsize=16,
@@ -407,8 +437,10 @@ def plot_top10_ranking(data: RunData, out_path: str, top_n: int = 10, baseline_a
         mpl.patches.Patch(facecolor="#9e9e9e", edgecolor="#9e9e9e", label="Original (solid bar)"),
         mpl.patches.Patch(facecolor="none", edgecolor="#9e9e9e", linewidth=2, label="Retrained (outline bar)"),
     ]
-    ax.legend(handles=legend_elems, fontsize=10, loc="upper left", ncol=2, framealpha=0.95)
+    ax.legend(handles=legend_elems, fontsize=9, loc="lower right", ncol=2, framealpha=0.95)
 
+    ax_right.axis("off")
+    ax_right.set_title("Excluded From Ranking", fontsize=12, weight="bold")
     if not excluded.empty:
         lines = []
         for r in excluded.itertuples(index=False):
@@ -421,18 +453,17 @@ def plot_top10_ranking(data: RunData, out_path: str, top_n: int = 10, baseline_a
             lines.append(
                 f"✗ L{int(r.layer)} K={int(r.K)} thr={float(r.threshold):.1f} OOD={float(r.ood_test_auc):.3f} [{reason}]"
             )
-        ax.text(
-            0.99,
-            0.99,
-            "EXCLUDED from Top-10:\n" + "\n".join(lines[:8]),
-            transform=ax.transAxes,
+        ax_right.text(
+            0.0,
+            1.0,
+            "\n".join(lines[:12]),
+            transform=ax_right.transAxes,
             va="top",
-            ha="right",
-            fontsize=9.2,
-            bbox=dict(facecolor="#fff8e1", edgecolor="#ff7f0e", boxstyle="round,pad=0.4"),
+            ha="left",
+            fontsize=9,
+            bbox=dict(facecolor="#fff8e1", edgecolor="#ff7f0e", boxstyle="round,pad=0.45"),
         )
 
-    plt.tight_layout()
     plt.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -475,10 +506,25 @@ def plot_sparsity_analysis(data: RunData, out_path: str) -> None:
     def _mat(df: pd.DataFrame, col: str):
         return _pivot_matrix(df, data.layers, data.k_values, col)
 
-    fig, axes = plt.subplots(3, 3, figsize=(15, 15))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 16), constrained_layout=True)
+
+    def _add_small_npc_border(ax: plt.Axes, sub_df: pd.DataFrame):
+        row_map = {l: i for i, l in enumerate(data.layers)}
+        col_map = {k: j for j, k in enumerate(data.k_values)}
+        for _, rr in sub_df[sub_df["small_npc"]].iterrows():
+            i = row_map[int(rr["layer"])]
+            j = col_map[int(rr["K"])]
+            ax.add_patch(mpl.patches.Rectangle((j - 0.5, i - 0.5), 1, 1, fill=False, ec="#ff7f0e", lw=2.0))
+
     im = _heatmap_panel(axes[0, 0], _mat(d0, "num_consensus_pcs"), f"thr={t0:.1f} · # Consensus PCs", data.layers, data.k_values)
-    _heatmap_panel(axes[0, 1], 100.0 * _mat(d0, "consensus_ratio"), f"thr={t0:.1f} · Consensus Ratio (%)", data.layers, data.k_values, pct=True)
-    _heatmap_panel(
+    fig.colorbar(im, ax=axes[0, 0], fraction=0.046, pad=0.04)
+    _add_small_npc_border(axes[0, 0], d0)
+
+    im = _heatmap_panel(axes[0, 1], 100.0 * _mat(d0, "consensus_ratio"), f"thr={t0:.1f} · Consensus Ratio (%)", data.layers, data.k_values, pct=True)
+    fig.colorbar(im, ax=axes[0, 1], fraction=0.046, pad=0.04)
+    _add_small_npc_border(axes[0, 1], d0)
+
+    im = _heatmap_panel(
         axes[0, 2],
         100.0 * (_mat(d0, "avg_selected_per_probe") / np.asarray(data.k_values)[None, :]),
         f"thr={t0:.1f} · Probe Sel. Density (avg/K)",
@@ -487,10 +533,18 @@ def plot_sparsity_analysis(data: RunData, out_path: str) -> None:
         cmap="Purples",
         pct=True,
     )
+    fig.colorbar(im, ax=axes[0, 2], fraction=0.046, pad=0.04)
+    _add_small_npc_border(axes[0, 2], d0)
 
-    _heatmap_panel(axes[1, 0], _mat(d1, "num_consensus_pcs"), f"thr={t1:.1f} · # Consensus PCs", data.layers, data.k_values)
-    _heatmap_panel(axes[1, 1], 100.0 * _mat(d1, "consensus_ratio"), f"thr={t1:.1f} · Consensus Ratio (%)", data.layers, data.k_values, pct=True)
-    _heatmap_panel(
+    im = _heatmap_panel(axes[1, 0], _mat(d1, "num_consensus_pcs"), f"thr={t1:.1f} · # Consensus PCs", data.layers, data.k_values)
+    fig.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
+    _add_small_npc_border(axes[1, 0], d1)
+
+    im = _heatmap_panel(axes[1, 1], 100.0 * _mat(d1, "consensus_ratio"), f"thr={t1:.1f} · Consensus Ratio (%)", data.layers, data.k_values, pct=True)
+    fig.colorbar(im, ax=axes[1, 1], fraction=0.046, pad=0.04)
+    _add_small_npc_border(axes[1, 1], d1)
+
+    im = _heatmap_panel(
         axes[1, 2],
         100.0 * (_mat(d1, "avg_selected_per_probe") / np.asarray(data.k_values)[None, :]),
         f"thr={t1:.1f} · Probe Sel. Density (avg/K)",
@@ -499,10 +553,13 @@ def plot_sparsity_analysis(data: RunData, out_path: str) -> None:
         cmap="Purples",
         pct=True,
     )
+    fig.colorbar(im, ax=axes[1, 2], fraction=0.046, pad=0.04)
+    _add_small_npc_border(axes[1, 2], d1)
 
     # Shared stats on bottom row.
     avg_sel_mat = _mat(d0, "avg_selected_per_probe")
-    _heatmap_panel(axes[2, 0], avg_sel_mat, f"Avg PCs/Probe (thr={t0:.1f}, shared)", data.layers, data.k_values, cmap="Blues")
+    im = _heatmap_panel(axes[2, 0], avg_sel_mat, f"Avg PCs/Probe (thr={t0:.1f}, shared)", data.layers, data.k_values, cmap="Blues")
+    fig.colorbar(im, ax=axes[2, 0], fraction=0.046, pad=0.04)
 
     count_thresh = np.zeros((len(data.layers), len(data.k_values)))
     reliable_count = np.zeros((len(data.layers), len(data.k_values)))
@@ -511,17 +568,16 @@ def plot_sparsity_analysis(data: RunData, out_path: str) -> None:
             sub = data.consensus[(data.consensus["layer"] == l) & (data.consensus["K"] == k)]
             count_thresh[i, j] = float((sub["num_consensus_pcs"] > 0).sum())
             reliable_count[i, j] = float(sub["reliable"].sum())
-    _heatmap_panel(axes[2, 1], count_thresh, "# Thresholds Yielding Consensus", data.layers, data.k_values, cmap="YlGn")
-    _heatmap_panel(axes[2, 2], reliable_count, "# Reliable Configs (npc>=10)", data.layers, data.k_values, cmap="BuGn")
+    im = _heatmap_panel(axes[2, 1], count_thresh, "# Thresholds Yielding Consensus", data.layers, data.k_values, cmap="YlGn")
+    fig.colorbar(im, ax=axes[2, 1], fraction=0.046, pad=0.04)
+    im = _heatmap_panel(axes[2, 2], reliable_count, "# Reliable Configs (npc>=10)", data.layers, data.k_values, cmap="BuGn")
+    fig.colorbar(im, ax=axes[2, 2], fraction=0.046, pad=0.04)
 
-    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.75)
-    cbar.set_label("Count")
     fig.suptitle(
         "Sparsity Analysis  ·  CORRECTED\nGold=valid consensus · Orange border=npc<10 (unreliable)",
         fontsize=12,
         weight="bold",
     )
-    plt.tight_layout(rect=[0, 0.01, 1, 0.95])
     plt.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -688,8 +744,10 @@ def plot_deltas_contributions(data: RunData, out_path: str, baseline_auc: float 
         sub = df[df["layer"] == layer]
         ax.scatter(np.full(len(sub), i), sub["ood_test_auc"], color=_layer_color(layer), alpha=0.55)
         if len(sub) > 0:
-            med = float(np.nanmedian(sub["ood_test_auc"]))
-            ax.plot([i - 0.25, i + 0.25], [med, med], color=_layer_color(layer), lw=2.4)
+            vals = sub["ood_test_auc"].dropna().to_numpy()
+            if len(vals) > 0:
+                med = float(np.median(vals))
+                ax.plot([i - 0.25, i + 0.25], [med, med], color=_layer_color(layer), lw=2.4)
     ax.axhline(baseline_auc, color="#555555", ls="--", lw=1.2)
     ax.set_xticks(x0)
     ax.set_xticklabels([f"Layer {l}" for l in data.layers])
@@ -797,7 +855,7 @@ def plot_summary_dashboard(data: RunData, out_path: str, baseline_auc: float = 0
     d0 = df[np.isclose(df["threshold"], t0)].copy()
     d1 = df[np.isclose(df["threshold"], t1)].copy()
 
-    fig = plt.figure(figsize=(18, 14))
+    fig = plt.figure(figsize=(18, 14), constrained_layout=True)
     gs = fig.add_gridspec(4, 6, height_ratios=[1.1, 1.1, 1.1, 1.4], hspace=0.5, wspace=0.45)
 
     # Mini heatmaps
@@ -896,7 +954,6 @@ def plot_summary_dashboard(data: RunData, out_path: str, baseline_auc: float = 0
         else ""
     )
     fig.suptitle("PCA Consensus Probe · OOD Summary · CORRECTED" + dropped, fontsize=14, weight="bold")
-    plt.tight_layout(rect=[0, 0.01, 1, 0.96])
     plt.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -907,9 +964,16 @@ def generate_all_figures(
     npc_min: int = 10,
     baseline_auc: float = 0.5,
     top_n: int = 10,
+    use_label_flip: bool = False,
 ) -> Dict[str, str]:
     _ensure_dir(out_dir)
-    data = load_run_data(run_dir, npc_min=npc_min, baseline_auc=baseline_auc, drop_redundant_thresholds=True)
+    data = load_run_data(
+        run_dir,
+        npc_min=npc_min,
+        baseline_auc=baseline_auc,
+        drop_redundant_thresholds=True,
+        use_label_flip=use_label_flip,
+    )
 
     outputs = {
         "01_ood_auc_heatmaps_corrected.png": os.path.join(out_dir, "01_ood_auc_heatmaps_corrected.png"),
@@ -942,6 +1006,7 @@ def generate_all_figures(
         "npc_min": int(npc_min),
         "baseline_auc": float(baseline_auc),
         "top_n_ranking": int(top_n),
+        "use_label_flip": bool(use_label_flip),
         "outputs": outputs,
     }
     manifest_path = os.path.join(out_dir, "viz_manifest_corrected.json")
@@ -958,6 +1023,11 @@ def main() -> int:
     p.add_argument("--npc_min", type=int, default=10, help="Minimum #consensus PCs to be considered reliable")
     p.add_argument("--baseline_auc", type=float, default=0.5, help="Random baseline AUC")
     p.add_argument("--top_n", type=int, default=10, help="Top-N for ranking chart")
+    p.add_argument(
+        "--use_label_flip",
+        action="store_true",
+        help="Enable label-flip filtering/marking (disabled by default).",
+    )
     args = p.parse_args()
 
     outputs = generate_all_figures(
@@ -966,6 +1036,7 @@ def main() -> int:
         npc_min=args.npc_min,
         baseline_auc=args.baseline_auc,
         top_n=args.top_n,
+        use_label_flip=args.use_label_flip,
     )
     print("Generated files:")
     for _, v in outputs.items():
