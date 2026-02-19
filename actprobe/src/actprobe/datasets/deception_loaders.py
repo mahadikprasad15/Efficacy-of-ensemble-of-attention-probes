@@ -430,6 +430,112 @@ class DeceptionInsiderTradingDataset(BaseDataset):
         return self.data[idx]
 
 
+class DeceptionInsiderTradingSallyConcatDataset(BaseDataset):
+    """
+    Insider Trading dataset loader for Sally-only concatenated prompts.
+
+    Expects JSONL rows produced by:
+        scripts/data/prepare_insider_trading_sally_dataset.py
+
+    Row format:
+        {
+            "prompt": "...",
+            "completion": "...",
+            "gold_label": 0|1,
+            "split": "train|validation|test",
+            "metadata": {...}
+        }
+    """
+
+    def __init__(
+        self,
+        split: str = "train",
+        limit: Optional[int] = None,
+        data_file: str = "data/apollo_raw/insider_trading/sally_concat_examples.jsonl",
+    ):
+        super().__init__(split=split, limit=limit)
+        self.data_file = data_file
+
+        if not os.path.exists(self.data_file):
+            raise FileNotFoundError(
+                f"Sally-concat dataset not found: {self.data_file}\n"
+                "Create it first with:\n"
+                "  python scripts/data/prepare_insider_trading_sally_dataset.py "
+                "--input_jsonl <path/to/Insider_trading_final.jsonl>"
+            )
+
+    def load_data(self):
+        rows: List[Dict[str, Any]] = []
+        skipped = {"bad_json": 0, "missing_fields": 0, "bad_label": 0}
+
+        with open(self.data_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    skipped["bad_json"] += 1
+                    continue
+
+                if self.split in {"train", "validation", "test"}:
+                    if row.get("split") != self.split:
+                        continue
+
+                prompt = row.get("prompt")
+                completion = row.get("completion")
+                if not isinstance(prompt, str) or not isinstance(completion, str):
+                    skipped["missing_fields"] += 1
+                    continue
+
+                try:
+                    gold_label = int(row.get("gold_label"))
+                except (TypeError, ValueError):
+                    skipped["bad_label"] += 1
+                    continue
+
+                if gold_label not in {0, 1}:
+                    skipped["bad_label"] += 1
+                    continue
+
+                metadata = row.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata.setdefault("dataset", "Deception-InsiderTrading-SallyConcat")
+                metadata.setdefault("split", row.get("split", self.split))
+                metadata.setdefault("id", f"insider_sally_{len(rows)}")
+
+                rows.append(
+                    {
+                        "prompt": prompt,
+                        "completion": completion,
+                        "gold_label": gold_label,
+                        "metadata": metadata,
+                    }
+                )
+
+        self.data = rows
+        self.apply_limit()
+
+        n_honest = sum(1 for r in self.data if r.get("gold_label") == 0)
+        n_deceptive = sum(1 for r in self.data if r.get("gold_label") == 1)
+        print(
+            f"Loaded {len(self.data)} Sally-concat insider examples for split '{self.split}' "
+            f"({n_honest} non-deceptive, {n_deceptive} deceptive)"
+        )
+        if any(v > 0 for v in skipped.values()):
+            print(
+                "  Skipped rows -> "
+                f"bad_json: {skipped['bad_json']}, "
+                f"missing_fields: {skipped['missing_fields']}, "
+                f"bad_label: {skipped['bad_label']}"
+            )
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return self.data[idx]
+
+
 class DeceptionAILiarDataset(BaseDataset):
     """
     Apollo Research AILiar Dataset (pre-generated rollouts).
