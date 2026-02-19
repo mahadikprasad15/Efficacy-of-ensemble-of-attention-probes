@@ -53,6 +53,7 @@ sys.path.append(os.path.join(os.getcwd(), 'actprobe', 'src'))
 from actprobe.datasets.deception_loaders import (
     DeceptionRoleplayingDataset,
     DeceptionInsiderTradingDataset,
+    DeceptionInsiderTradingSallyConcatDataset,
     DeceptionAILiarDataset,
 )
 from actprobe.llm.activations import ActivationRunner
@@ -235,6 +236,7 @@ class DeceptionLabeler:
 DATASET_MAP = {
     "Deception-Roleplaying": DeceptionRoleplayingDataset,
     "Deception-InsiderTrading": DeceptionInsiderTradingDataset,
+    "Deception-InsiderTrading-SallyConcat": DeceptionInsiderTradingSallyConcatDataset,
     "Deception-AILiar": DeceptionAILiarDataset,
 }
 
