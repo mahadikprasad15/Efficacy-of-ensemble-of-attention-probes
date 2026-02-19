@@ -8,6 +8,7 @@ Workflow (per pooling/layer/K):
 3) Define selected PCs per probe as |w| > eps.
 4) Build consensus masks by agreement thresholds.
 5) Score consensus by masking each probe and averaging logits.
+6) Optional: retrain a fresh probe on features selected by a specific consensus threshold.
 
 Outputs:
 - results/pca_consensus/<model>/<dataset>/<pooling>/consensus_summary.jsonl
@@ -15,15 +16,23 @@ Outputs:
 - results/pca_consensus/<model>/<dataset>/<pooling>/best_by_k.csv
 - results/pca_consensus/<model>/<dataset>/<pooling>/best_by_threshold.csv
 - data/probes_pca_consensus/<model>/<dataset>/<pooling>/K_<k>/layer_<L>/probes/*.npz
+- data/probes_pca_consensus/<model>/<dataset>/<pooling>/K_<k>/layer_<L>/masks/threshold_*.json
+
+Optional retrain outputs:
+- .../consensus_retrain_summary.jsonl
+- .../consensus_retrain_summary.csv
+- .../best_by_k_retrain.csv
+- data/probes_pca_consensus_retrain/<model>/<dataset>/<pooling>/K_<k>/layer_<L>/probe_threshold_*.npz
 """
 
 import argparse
 import csv
+import datetime as dt
 import json
 import logging
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -65,6 +74,11 @@ def parse_thresholds(raw: str) -> List[float]:
         if v <= 0 or v > 1:
             raise ValueError(f"Consensus thresholds must be in (0,1], got {v}")
     return vals
+
+
+def threshold_tag(threshold: float) -> str:
+    s = f"{threshold:.6f}".rstrip("0").rstrip(".")
+    return s.replace(".", "p")
 
 
 def set_seeds(seed: int) -> None:
@@ -139,13 +153,11 @@ def train_l1_probe(
             optimizer.zero_grad()
             logits = probe(xb).squeeze(-1)
             loss = criterion(logits, yb)
-            # L1 on classifier weights only
             l1 = probe.classifier.weight.abs().sum()
             loss = loss + l1_lambda * l1
             loss.backward()
             optimizer.step()
 
-        # Validation
         probe.eval()
         with torch.no_grad():
             val_logits = []
@@ -177,6 +189,18 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def write_json(path: str, payload: dict) -> None:
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def write_jsonl(path: str, rows: List[dict]) -> None:
+    with open(path, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
 def maybe_symlink_ood(output_root: str) -> None:
     """Create symlink results/ood_evaluation/pca_consensus -> output_root if possible."""
     base = os.path.abspath(output_root)
@@ -188,17 +212,14 @@ def maybe_symlink_ood(output_root: str) -> None:
     try:
         ensure_dir(link_parent)
         if os.path.islink(link_path):
-            # If correct, keep; else replace
             target = os.readlink(link_path)
             if os.path.abspath(os.path.join(link_parent, target)) == base:
                 return
             os.unlink(link_path)
         elif os.path.exists(link_path):
-            # Don't overwrite real dir
             return
         os.symlink(base, link_path)
     except Exception:
-        # Best-effort only
         return
 
 
@@ -233,22 +254,48 @@ def find_pca_layers(pca_dir: str) -> List[int]:
 
 def load_progress(path: str) -> dict:
     if not os.path.exists(path):
-        return {"completed_probes": [], "completed_thresholds": []}
+        return {
+            "completed_probes": [],
+            "completed_thresholds": [],
+            "completed_retrain_thresholds": [],
+        }
     try:
         with open(path, "r") as f:
             payload = json.load(f)
     except Exception:
-        return {"completed_probes": [], "completed_thresholds": []}
+        return {
+            "completed_probes": [],
+            "completed_thresholds": [],
+            "completed_retrain_thresholds": [],
+        }
     payload.setdefault("completed_probes", [])
     payload.setdefault("completed_thresholds", [])
+    payload.setdefault("completed_retrain_thresholds", [])
     return payload
 
 
 def save_progress(path: str, payload: dict) -> None:
     payload.setdefault("completed_probes", [])
     payload.setdefault("completed_thresholds", [])
+    payload.setdefault("completed_retrain_thresholds", [])
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
+
+
+def make_run_manifest(args: argparse.Namespace, results_dir: str, probes_dir: str, retrain_results_dir: Optional[str], retrain_probes_dir: Optional[str]) -> dict:
+    return {
+        "script": "scripts/training/train_pca_consensus_probes.py",
+        "created_at_utc": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "config": {
+            k: v for k, v in vars(args).items()
+        },
+        "resolved_paths": {
+            "results_dir": os.path.abspath(results_dir),
+            "probes_dir": os.path.abspath(probes_dir),
+            "retrain_results_dir": os.path.abspath(retrain_results_dir) if retrain_results_dir else None,
+            "retrain_probes_dir": os.path.abspath(retrain_probes_dir) if retrain_probes_dir else None,
+        },
+    }
 
 
 def main() -> int:
@@ -269,6 +316,13 @@ def main() -> int:
     parser.add_argument("--consensus_thresholds", type=str, default="0.6,0.7,0.8")
     parser.add_argument("--output_root", type=str, default="results/pca_consensus")
     parser.add_argument("--probes_output_root", type=str, default="data/probes_pca_consensus")
+
+    parser.add_argument("--enable_consensus_retrain", action="store_true")
+    parser.add_argument("--retrain_threshold", type=float, default=0.7)
+    parser.add_argument("--retrain_l1_lambda", type=float, default=0.0)
+    parser.add_argument("--retrain_output_root", type=str, default=None)
+    parser.add_argument("--retrain_probes_output_root", type=str, default="data/probes_pca_consensus_retrain")
+
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=50)
@@ -278,6 +332,9 @@ def main() -> int:
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+
+    if args.retrain_threshold <= 0 or args.retrain_threshold > 1:
+        raise ValueError(f"--retrain_threshold must be in (0,1], got {args.retrain_threshold}")
 
     set_seeds(args.seed)
     device = torch.device(args.device)
@@ -298,7 +355,6 @@ def main() -> int:
     if not layers:
         raise ValueError(f"No valid layers selected. Available: {available_layers}")
 
-    # Load pooled activations for all layers
     x_train, y_train, _ = load_pooled_split(
         args.train_activations_dir, layers, args.pooling, desc="train"
     )
@@ -316,16 +372,38 @@ def main() -> int:
     ensure_dir(results_dir)
     ensure_dir(probes_dir)
 
+    retrain_results_dir: Optional[str] = None
+    retrain_probes_dir: Optional[str] = None
+    if args.enable_consensus_retrain:
+        retrain_root = args.retrain_output_root if args.retrain_output_root else args.output_root
+        retrain_results_dir = os.path.join(retrain_root, model_dir, args.dataset, args.pooling)
+        retrain_probes_dir = os.path.join(args.retrain_probes_output_root, model_dir, args.dataset, args.pooling)
+        ensure_dir(retrain_results_dir)
+        ensure_dir(retrain_probes_dir)
+
+    manifest = make_run_manifest(args, results_dir, probes_dir, retrain_results_dir, retrain_probes_dir)
+    write_json(os.path.join(results_dir, "run_manifest.json"), manifest)
+    if retrain_results_dir and retrain_results_dir != results_dir:
+        write_json(os.path.join(retrain_results_dir, "run_manifest.json"), manifest)
+
     summary_path = os.path.join(results_dir, "consensus_summary.jsonl")
     existing_rows = load_existing_rows(summary_path)
-
-    # Track completed (layer, K, threshold) to support resume
-    completed = set()
+    completed: Set[Tuple[int, int, float]] = set()
     for r in existing_rows:
-        key = (r.get("layer"), r.get("K"), r.get("threshold"))
+        key = (int(r.get("layer")), int(r.get("K")), float(r.get("threshold")))
         completed.add(key)
-
     all_rows = list(existing_rows)
+
+    retrain_summary_path: Optional[str] = None
+    all_retrain_rows: List[dict] = []
+    completed_retrain: Set[Tuple[int, int, float]] = set()
+    if args.enable_consensus_retrain and retrain_results_dir:
+        retrain_summary_path = os.path.join(retrain_results_dir, "consensus_retrain_summary.jsonl")
+        existing_retrain_rows = load_existing_rows(retrain_summary_path)
+        all_retrain_rows = list(existing_retrain_rows)
+        for r in existing_retrain_rows:
+            key = (int(r.get("layer")), int(r.get("K")), float(r.get("source_threshold")))
+            completed_retrain.add(key)
 
     logger.info("CONSENSUS PCA PROBES")
     logger.info(f"Model: {args.model} | Dataset: {args.dataset} | Pooling: {args.pooling}")
@@ -334,11 +412,14 @@ def main() -> int:
     logger.info(f"Probes per K: {args.num_probes} | Bootstrap frac: {args.bootstrap_frac}")
     logger.info(f"L1 lambda: {args.l1_lambda} | eps: {args.eps}")
     logger.info(f"Thresholds: {thresholds}")
+    if args.enable_consensus_retrain:
+        logger.info(
+            f"Consensus retrain: threshold={args.retrain_threshold}, retrain_l1_lambda={args.retrain_l1_lambda}"
+        )
 
     rng = np.random.default_rng(args.seed)
 
     for layer in tqdm(layers, desc="Layers", unit="layer"):
-        # Load PCA artifact for this layer
         pca_path = os.path.join(args.pca_artifacts_dir, f"layer_{layer}.npz")
         if not os.path.exists(pca_path):
             logger.warning(f"Missing PCA artifact: {pca_path}. Skipping layer {layer}.")
@@ -353,10 +434,12 @@ def main() -> int:
                 logger.warning(f"K={K} exceeds saved PCA components ({k_max}) for layer {layer}. Skipping.")
                 continue
 
-            # If all thresholds already done, skip
             if args.skip_existing:
-                done = all((layer, K, t) in completed for t in thresholds)
-                if done:
+                done_consensus = all((layer, K, t) in completed for t in thresholds)
+                done_retrain = True
+                if args.enable_consensus_retrain:
+                    done_retrain = (layer, K, float(args.retrain_threshold)) in completed_retrain
+                if done_consensus and done_retrain:
                     logger.info(f"Skipping layer {layer} K={K} (already done)")
                     continue
 
@@ -367,7 +450,6 @@ def main() -> int:
             if x_ood is not None:
                 X_ood_proj = project_activations(x_ood[layer], mean, V)
 
-            # Train R probes
             probe_weights = []
             probe_biases = []
             selected_masks = []
@@ -375,13 +457,16 @@ def main() -> int:
             layer_root = os.path.join(probes_dir, f"K_{K}", f"layer_{layer}")
             probe_dir = os.path.join(layer_root, "probes")
             sel_dir = os.path.join(layer_root, "selections")
+            mask_dir = os.path.join(layer_root, "masks")
             progress_path = os.path.join(layer_root, "progress.json")
             ensure_dir(probe_dir)
             ensure_dir(sel_dir)
+            ensure_dir(mask_dir)
 
             progress = load_progress(progress_path)
-            completed_probes = set(progress.get("completed_probes", []))
-            completed_thresholds = set(progress.get("completed_thresholds", []))
+            completed_probes = set(int(x) for x in progress.get("completed_probes", []))
+            completed_thresholds = set(float(x) for x in progress.get("completed_thresholds", []))
+            completed_retrain_thresholds = set(float(x) for x in progress.get("completed_retrain_thresholds", []))
 
             for r in tqdm(range(args.num_probes), desc=f"L{layer} K{K} probes", unit="probe", leave=False):
                 boot_idx = bootstrap_indices(len(y_train), args.bootstrap_frac, rng)
@@ -420,7 +505,6 @@ def main() -> int:
                         val_epoch=np.asarray([best_epoch], dtype=np.int64),
                     )
 
-                    # Update completed probes
                     completed_probes.add(r)
                     progress["completed_probes"] = sorted(completed_probes)
                     save_progress(progress_path, progress)
@@ -434,20 +518,56 @@ def main() -> int:
                 if not os.path.exists(sel_path):
                     np.save(sel_path, np.where(sel > 0)[0].astype(np.int32))
 
-            selected_masks = np.stack(selected_masks, axis=0)  # (R, K)
-            freq = selected_masks.mean(axis=0)  # (K,)
+            selected_masks = np.stack(selected_masks, axis=0)
+            freq = selected_masks.mean(axis=0)
             avg_selected = float(np.mean(selected_counts)) if selected_counts else 0.0
 
-            # Evaluate consensus thresholds
+            thresholds_for_masks = set(thresholds)
+            if args.enable_consensus_retrain:
+                thresholds_for_masks.add(float(args.retrain_threshold))
+
+            mask_cache: Dict[float, Dict[str, object]] = {}
+            for t in sorted(thresholds_for_masks):
+                consensus_mask_bool = freq >= t
+                consensus_idx = np.flatnonzero(consensus_mask_bool).astype(np.int32)
+                dropped_idx = np.flatnonzero(~consensus_mask_bool).astype(np.int32)
+                consensus_mask = consensus_mask_bool.astype(np.float32)
+
+                mask_payload = {
+                    "model": args.model,
+                    "dataset": args.dataset,
+                    "pooling": args.pooling,
+                    "layer": int(layer),
+                    "K": int(K),
+                    "threshold": float(t),
+                    "num_probes": int(args.num_probes),
+                    "bootstrap_frac": float(args.bootstrap_frac),
+                    "l1_lambda": float(args.l1_lambda),
+                    "eps": float(args.eps),
+                    "num_consensus_pcs": int(consensus_idx.size),
+                    "consensus_ratio": float(consensus_idx.size / float(K)) if K > 0 else 0.0,
+                    "consensus_pc_indices": consensus_idx.tolist(),
+                    "dropped_pc_indices": dropped_idx.tolist(),
+                }
+                mask_path = os.path.join(mask_dir, f"threshold_{threshold_tag(t)}.json")
+                write_json(mask_path, mask_payload)
+
+                mask_cache[float(t)] = {
+                    "mask": consensus_mask,
+                    "payload": mask_payload,
+                }
+
             for t in thresholds:
-                key = (layer, K, t)
+                key = (layer, K, float(t))
                 if args.skip_existing and key in completed:
                     continue
-                if t in completed_thresholds:
+                if float(t) in completed_thresholds:
                     continue
 
-                consensus_mask = (freq >= t).astype(np.float32)
-                num_consensus = int(consensus_mask.sum())
+                mask_info = mask_cache[float(t)]
+                consensus_mask = mask_info["mask"]
+                mask_payload = mask_info["payload"]
+                num_consensus = int(mask_payload["num_consensus_pcs"])
 
                 row = {
                     "model": args.model,
@@ -461,8 +581,10 @@ def main() -> int:
                     "l1_lambda": float(args.l1_lambda),
                     "eps": float(args.eps),
                     "num_consensus_pcs": num_consensus,
+                    "consensus_ratio": float(mask_payload["consensus_ratio"]),
                     "avg_selected_per_probe": avg_selected,
-                    "consensus_pc_indices": np.where(consensus_mask > 0)[0].tolist(),
+                    "consensus_pc_indices": mask_payload["consensus_pc_indices"],
+                    "dropped_pc_indices": mask_payload["dropped_pc_indices"],
                 }
 
                 if num_consensus == 0:
@@ -473,7 +595,6 @@ def main() -> int:
                         "ood_test_acc": None,
                     })
                 else:
-                    # Mask each probe and average logits
                     val_logits_all = []
                     ood_logits_all = [] if X_ood_proj is not None else None
                     for w, b in zip(probe_weights, probe_biases):
@@ -498,14 +619,107 @@ def main() -> int:
 
                 all_rows.append(row)
                 completed.add(key)
-                completed_thresholds.add(t)
-                progress["completed_thresholds"] = sorted(float(x) for x in completed_thresholds)
+                completed_thresholds.add(float(t))
+                progress["completed_thresholds"] = sorted(completed_thresholds)
                 save_progress(progress_path, progress)
 
-    # Write JSONL + CSV summaries (rewrite for now)
-    with open(summary_path, "w") as f:
-        for r in all_rows:
-            f.write(json.dumps(r) + "\n")
+            if args.enable_consensus_retrain and retrain_probes_dir and retrain_summary_path:
+                rt = float(args.retrain_threshold)
+                retrain_key = (layer, K, rt)
+                if (not args.skip_existing or retrain_key not in completed_retrain) and rt not in completed_retrain_thresholds:
+                    mask_info = mask_cache[rt]
+                    retrain_mask = mask_info["mask"]
+                    mask_payload = mask_info["payload"]
+                    num_consensus = int(mask_payload["num_consensus_pcs"])
+                    retrain_layer_root = os.path.join(retrain_probes_dir, f"K_{K}", f"layer_{layer}")
+                    ensure_dir(retrain_layer_root)
+                    retrain_probe_path = os.path.join(
+                        retrain_layer_root,
+                        f"probe_threshold_{threshold_tag(rt)}.npz",
+                    )
+
+                    retrain_row = {
+                        "model": args.model,
+                        "dataset": args.dataset,
+                        "pooling": args.pooling,
+                        "layer": int(layer),
+                        "K": int(K),
+                        "source_threshold": rt,
+                        "num_probes": int(args.num_probes),
+                        "bootstrap_frac": float(args.bootstrap_frac),
+                        "l1_lambda": float(args.l1_lambda),
+                        "retrain_l1_lambda": float(args.retrain_l1_lambda),
+                        "eps": float(args.eps),
+                        "num_consensus_pcs": num_consensus,
+                        "consensus_ratio": float(mask_payload["consensus_ratio"]),
+                        "consensus_pc_indices": mask_payload["consensus_pc_indices"],
+                        "dropped_pc_indices": mask_payload["dropped_pc_indices"],
+                        "probe_path": retrain_probe_path,
+                    }
+
+                    if num_consensus == 0:
+                        retrain_row.update(
+                            {
+                                "id_val_auc": None,
+                                "id_val_acc": None,
+                                "ood_test_auc": None,
+                                "ood_test_acc": None,
+                                "best_epoch": None,
+                            }
+                        )
+                    else:
+                        X_train_masked = X_train_proj * retrain_mask[np.newaxis, :]
+                        X_val_masked = X_val_proj * retrain_mask[np.newaxis, :]
+                        X_ood_masked = None if X_ood_proj is None else (X_ood_proj * retrain_mask[np.newaxis, :])
+
+                        w_retrain, b_retrain, best_auc, best_acc, best_epoch = train_l1_probe(
+                            X_train=X_train_masked,
+                            y_train=y_train,
+                            X_val=X_val_masked,
+                            y_val=y_val,
+                            device=device,
+                            lr=args.lr,
+                            weight_decay=args.weight_decay,
+                            epochs=args.epochs,
+                            patience=args.patience,
+                            batch_size=args.batch_size,
+                            l1_lambda=args.retrain_l1_lambda,
+                            seed=args.seed + layer * 1000 + K * 10000 + 700000,
+                        )
+
+                        np.savez_compressed(
+                            retrain_probe_path,
+                            w=w_retrain,
+                            b=np.asarray([b_retrain], dtype=np.float32),
+                            val_auc=np.asarray([best_auc], dtype=np.float32),
+                            val_acc=np.asarray([best_acc], dtype=np.float32),
+                            val_epoch=np.asarray([best_epoch], dtype=np.int64),
+                            threshold=np.asarray([rt], dtype=np.float32),
+                            num_consensus=np.asarray([num_consensus], dtype=np.int64),
+                        )
+
+                        val_logits = X_val_masked @ w_retrain + b_retrain
+                        id_auc, id_acc = compute_metrics(y_val, val_logits)
+                        retrain_row["id_val_auc"] = float(id_auc)
+                        retrain_row["id_val_acc"] = float(id_acc)
+                        retrain_row["best_epoch"] = int(best_epoch)
+
+                        if X_ood_masked is not None:
+                            ood_logits = X_ood_masked @ w_retrain + b_retrain
+                            ood_auc, ood_acc = compute_metrics(y_ood, ood_logits)
+                            retrain_row["ood_test_auc"] = float(ood_auc)
+                            retrain_row["ood_test_acc"] = float(ood_acc)
+                        else:
+                            retrain_row["ood_test_auc"] = None
+                            retrain_row["ood_test_acc"] = None
+
+                    all_retrain_rows.append(retrain_row)
+                    completed_retrain.add(retrain_key)
+                    completed_retrain_thresholds.add(rt)
+                    progress["completed_retrain_thresholds"] = sorted(completed_retrain_thresholds)
+                    save_progress(progress_path, progress)
+
+    write_jsonl(summary_path, all_rows)
 
     csv_path = os.path.join(results_dir, "consensus_summary.csv")
     if all_rows:
@@ -515,31 +729,58 @@ def main() -> int:
             writer.writeheader()
             writer.writerows(all_rows)
 
-    # Best-by-K and best-by-threshold
     if all_rows:
         import pandas as pd
+
         df = pd.DataFrame(all_rows)
-        # best by K (max id_val_auc)
         best_by_k = (
             df.dropna(subset=["id_val_auc"])
-              .sort_values(["K", "id_val_auc"], ascending=[True, False])
-              .drop_duplicates(["K"], keep="first")
+            .sort_values(["K", "id_val_auc"], ascending=[True, False])
+            .drop_duplicates(["K"], keep="first")
         )
         best_by_k.to_csv(os.path.join(results_dir, "best_by_k.csv"), index=False)
 
-        # best by threshold
         best_by_t = (
             df.dropna(subset=["id_val_auc"])
-              .sort_values(["threshold", "id_val_auc"], ascending=[True, False])
-              .drop_duplicates(["threshold"], keep="first")
+            .sort_values(["threshold", "id_val_auc"], ascending=[True, False])
+            .drop_duplicates(["threshold"], keep="first")
         )
         best_by_t.to_csv(os.path.join(results_dir, "best_by_threshold.csv"), index=False)
 
+    if args.enable_consensus_retrain and retrain_summary_path and retrain_results_dir:
+        write_jsonl(retrain_summary_path, all_retrain_rows)
+        retrain_csv_path = os.path.join(retrain_results_dir, "consensus_retrain_summary.csv")
+        if all_retrain_rows:
+            fieldnames = list(all_retrain_rows[0].keys())
+            with open(retrain_csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(all_retrain_rows)
+
+            import pandas as pd
+
+            df_r = pd.DataFrame(all_retrain_rows)
+            rank_metric = "ood_test_auc" if df_r["ood_test_auc"].notna().any() else "id_val_auc"
+            best_by_k_retrain = (
+                df_r.dropna(subset=[rank_metric])
+                .sort_values(["K", rank_metric], ascending=[True, False])
+                .drop_duplicates(["K"], keep="first")
+            )
+            best_by_k_retrain.to_csv(
+                os.path.join(retrain_results_dir, "best_by_k_retrain.csv"),
+                index=False,
+            )
+
     maybe_symlink_ood(args.output_root)
+    if args.retrain_output_root and args.retrain_output_root != args.output_root:
+        maybe_symlink_ood(args.retrain_output_root)
 
     logger.info("Done.")
     logger.info(f"Results: {results_dir}")
     logger.info(f"Probes:  {probes_dir}")
+    if args.enable_consensus_retrain and retrain_results_dir and retrain_probes_dir:
+        logger.info(f"Retrain results: {retrain_results_dir}")
+        logger.info(f"Retrain probes:  {retrain_probes_dir}")
     return 0
 
 
