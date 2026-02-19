@@ -285,7 +285,7 @@ def save_progress(path: str, payload: dict) -> None:
 def make_run_manifest(args: argparse.Namespace, results_dir: str, probes_dir: str, retrain_results_dir: Optional[str], retrain_probes_dir: Optional[str]) -> dict:
     return {
         "script": "scripts/training/train_pca_consensus_probes.py",
-        "created_at_utc": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "config": {
             k: v for k, v in vars(args).items()
         },
