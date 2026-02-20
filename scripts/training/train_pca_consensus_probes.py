@@ -8,7 +8,12 @@ Workflow (per pooling/layer/K):
 3) Define selected PCs per probe as |w| > eps.
 4) Build consensus masks by agreement thresholds.
 5) Score consensus by masking each probe and averaging logits.
-6) Optional: retrain a fresh probe on features selected by a specific consensus threshold.
+6) Optional: retrain a fresh probe for each *unique* integer cutoff derived from
+   the consensus thresholds and num_probes.
+   A threshold τ maps to integer cutoff ceil(τ * R).  Multiple thresholds that
+   share the same cutoff share the same consensus mask, so only one retrain is
+   needed per distinct cutoff.  The canonical threshold used for that cutoff is
+   the first (smallest) threshold that produces it.
 
 Outputs:
 - results/pca_consensus/<model>/<dataset>/<pooling>/consensus_summary.jsonl
@@ -18,7 +23,7 @@ Outputs:
 - data/probes_pca_consensus/<model>/<dataset>/<pooling>/K_<k>/layer_<L>/probes/*.npz
 - data/probes_pca_consensus/<model>/<dataset>/<pooling>/K_<k>/layer_<L>/masks/threshold_*.json
 
-Optional retrain outputs:
+Optional retrain outputs (one probe per unique integer cutoff):
 - .../consensus_retrain_summary.jsonl
 - .../consensus_retrain_summary.csv
 - .../best_by_k_retrain.csv
@@ -74,6 +79,29 @@ def parse_thresholds(raw: str) -> List[float]:
         if v <= 0 or v > 1:
             raise ValueError(f"Consensus thresholds must be in (0,1], got {v}")
     return vals
+
+
+def unique_retrain_thresholds(thresholds: List[float], num_probes: int) -> List[float]:
+    """Return the subset of thresholds that produce distinct integer cutoffs.
+
+    With R probes, threshold τ requires ceil(τ * R) probes to agree.  Multiple
+    thresholds may map to the same integer cutoff (e.g. τ=0.7 and τ=0.8 both
+    need ceil(0.7*5)=4 probes when R=5).  We keep only the first (smallest)
+    threshold per unique cutoff so that retrain runs exactly once per distinct
+    consensus mask.
+
+    Returns the canonical thresholds sorted ascending, paired with their cutoffs
+    as a list of (threshold, min_probes) tuples.
+    """
+    import math
+    seen_cutoffs: dict = {}
+    for t in sorted(thresholds):
+        cutoff = math.ceil(t * num_probes)
+        if cutoff not in seen_cutoffs:
+            seen_cutoffs[cutoff] = t
+    # Return sorted by threshold, paired with cutoff for logging
+    result = sorted(seen_cutoffs.items())  # (cutoff, canonical_threshold)
+    return [(t, c) for c, t in result]  # (canonical_threshold, cutoff)
 
 
 def threshold_tag(threshold: float) -> str:
@@ -318,7 +346,12 @@ def main() -> int:
     parser.add_argument("--probes_output_root", type=str, default="data/probes_pca_consensus")
 
     parser.add_argument("--enable_consensus_retrain", action="store_true")
-    parser.add_argument("--retrain_threshold", type=float, default=0.7)
+    # retrain_threshold is kept for backward-compat but ignored when
+    # enable_consensus_retrain is set; retrain now runs for every unique
+    # integer cutoff derived from --consensus_thresholds and --num_probes.
+    parser.add_argument("--retrain_threshold", type=float, default=None,
+                        help="Deprecated: retrain now runs at all unique cutoffs. "
+                             "Kept for backward compatibility but ignored.")
     parser.add_argument("--retrain_l1_lambda", type=float, default=0.0)
     parser.add_argument("--retrain_output_root", type=str, default=None)
     parser.add_argument("--retrain_probes_output_root", type=str, default="data/probes_pca_consensus_retrain")
@@ -333,14 +366,19 @@ def main() -> int:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    if args.retrain_threshold <= 0 or args.retrain_threshold > 1:
-        raise ValueError(f"--retrain_threshold must be in (0,1], got {args.retrain_threshold}")
-
     set_seeds(args.seed)
     device = torch.device(args.device)
 
     k_values = parse_k_values(args.k_values)
     thresholds = parse_thresholds(args.consensus_thresholds)
+
+    # Compute unique retrain thresholds (one per distinct integer cutoff)
+    retrain_canonical = unique_retrain_thresholds(thresholds, args.num_probes)
+    if retrain_canonical:
+        logger_lines = ", ".join(
+            f"τ={t} (≥{c}/{args.num_probes} probes)" for t, c in retrain_canonical
+        )
+        logger.info(f"Unique retrain thresholds: [{logger_lines}]")
 
     model_dir = args.model.replace("/", "_")
 
@@ -402,6 +440,7 @@ def main() -> int:
         existing_retrain_rows = load_existing_rows(retrain_summary_path)
         all_retrain_rows = list(existing_retrain_rows)
         for r in existing_retrain_rows:
+            # key uses canonical_threshold (source_threshold field)
             key = (int(r.get("layer")), int(r.get("K")), float(r.get("source_threshold")))
             completed_retrain.add(key)
 
@@ -414,7 +453,8 @@ def main() -> int:
     logger.info(f"Thresholds: {thresholds}")
     if args.enable_consensus_retrain:
         logger.info(
-            f"Consensus retrain: threshold={args.retrain_threshold}, retrain_l1_lambda={args.retrain_l1_lambda}"
+            f"Consensus retrain: unique cutoffs={[(t, c) for t, c in retrain_canonical]}, "
+            f"retrain_l1_lambda={args.retrain_l1_lambda}"
         )
 
     rng = np.random.default_rng(args.seed)
@@ -438,7 +478,10 @@ def main() -> int:
                 done_consensus = all((layer, K, t) in completed for t in thresholds)
                 done_retrain = True
                 if args.enable_consensus_retrain:
-                    done_retrain = (layer, K, float(args.retrain_threshold)) in completed_retrain
+                    done_retrain = all(
+                        (layer, K, rt) in completed_retrain
+                        for rt, _ in retrain_canonical
+                    )
                 if done_consensus and done_retrain:
                     logger.info(f"Skipping layer {layer} K={K} (already done)")
                     continue
@@ -524,7 +567,9 @@ def main() -> int:
 
             thresholds_for_masks = set(thresholds)
             if args.enable_consensus_retrain:
-                thresholds_for_masks.add(float(args.retrain_threshold))
+                # Add all canonical retrain thresholds (one per unique integer cutoff)
+                for rt, _ in retrain_canonical:
+                    thresholds_for_masks.add(rt)
 
             mask_cache: Dict[float, Dict[str, object]] = {}
             for t in sorted(thresholds_for_masks):
@@ -624,9 +669,12 @@ def main() -> int:
                 save_progress(progress_path, progress)
 
             if args.enable_consensus_retrain and retrain_probes_dir and retrain_summary_path:
-                rt = float(args.retrain_threshold)
-                retrain_key = (layer, K, rt)
-                if (not args.skip_existing or retrain_key not in completed_retrain) and rt not in completed_retrain_thresholds:
+                # Loop over each unique retrain threshold (one per distinct integer cutoff)
+                for rt, min_probes in retrain_canonical:
+                    retrain_key = (layer, K, rt)
+                    if (args.skip_existing and retrain_key in completed_retrain) or rt in completed_retrain_thresholds:
+                        continue
+
                     mask_info = mask_cache[rt]
                     retrain_mask = mask_info["mask"]
                     mask_payload = mask_info["payload"]
@@ -645,6 +693,7 @@ def main() -> int:
                         "layer": int(layer),
                         "K": int(K),
                         "source_threshold": rt,
+                        "min_probes_needed": int(min_probes),
                         "num_probes": int(args.num_probes),
                         "bootstrap_frac": float(args.bootstrap_frac),
                         "l1_lambda": float(args.l1_lambda),
@@ -672,6 +721,8 @@ def main() -> int:
                         X_val_masked = X_val_proj * retrain_mask[np.newaxis, :]
                         X_ood_masked = None if X_ood_proj is None else (X_ood_proj * retrain_mask[np.newaxis, :])
 
+                        # Seed offset per cutoff so retrains for different cutoffs don't share seeds
+                        retrain_seed = args.seed + layer * 1000 + K * 10000 + min_probes * 100000
                         w_retrain, b_retrain, best_auc, best_acc, best_epoch = train_l1_probe(
                             X_train=X_train_masked,
                             y_train=y_train,
@@ -684,7 +735,7 @@ def main() -> int:
                             patience=args.patience,
                             batch_size=args.batch_size,
                             l1_lambda=args.retrain_l1_lambda,
-                            seed=args.seed + layer * 1000 + K * 10000 + 700000,
+                            seed=retrain_seed,
                         )
 
                         np.savez_compressed(
@@ -695,6 +746,7 @@ def main() -> int:
                             val_acc=np.asarray([best_acc], dtype=np.float32),
                             val_epoch=np.asarray([best_epoch], dtype=np.int64),
                             threshold=np.asarray([rt], dtype=np.float32),
+                            min_probes_needed=np.asarray([min_probes], dtype=np.int64),
                             num_consensus=np.asarray([num_consensus], dtype=np.int64),
                         )
 
