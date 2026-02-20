@@ -264,6 +264,12 @@ def main():
         help="Which deception dataset to process"
     )
     parser.add_argument(
+        "--dataset_output_name",
+        type=str,
+        default=None,
+        help="Optional override for dataset name in output directories"
+    )
+    parser.add_argument(
         "--split",
         type=str,
         default="train",
@@ -525,10 +531,11 @@ def main():
     # 4. Prepare Output Directory
     # ========================================================================
 
+    dataset_out = args.dataset_output_name or args.dataset
     save_dir = os.path.join(
         args.output_dir,
         args.model.replace("/", "_"),
-        args.dataset,
+        dataset_out,
         args.split
     )
     os.makedirs(save_dir, exist_ok=True)
@@ -546,7 +553,7 @@ def main():
         raw_save_dir = os.path.join(
             args.raw_output_dir,
             args.model.replace("/", "_"),
-            args.dataset,
+            dataset_out,
             args.split
         )
         os.makedirs(raw_save_dir, exist_ok=True)
@@ -607,7 +614,7 @@ def main():
     # Progress bar
     pbar = tqdm(
         total=len(items),
-        desc=f"Processing {args.dataset}",
+        desc=f"Processing {dataset_out}",
         unit="sample",
         ncols=100
     )

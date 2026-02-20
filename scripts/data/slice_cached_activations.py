@@ -88,7 +88,11 @@ def main() -> int:
                         help="Output directory for resampled sliced activations")
     parser.add_argument("--slice_type", type=str, default="completion",
                         choices=["full", "completion", "prompt", "system", "user"],
-                        help="Which token span to keep")
+                        help="Which token span to keep (single-slice mode)")
+    parser.add_argument("--slice_types", type=str, default=None,
+                        help="Comma-separated list of slice types to run in one pass. "
+                             "If set, outputs are written to --output_dir plus suffix "
+                             "(e.g., '-completion', '-system'). 'full' uses --output_dir as-is.")
     parser.add_argument("--L_prime", type=int, default=28,
                         help="Target number of layers for resampling")
     parser.add_argument("--T_prime", type=int, default=64,
@@ -130,92 +134,119 @@ def main() -> int:
             continue
         shard_paths[shard_num] = path
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    out_manifest_path = os.path.join(args.output_dir, "manifest.jsonl")
-    out_manifest = open(out_manifest_path, "w")
+    slice_types = [args.slice_type]
+    if args.slice_types:
+        slice_types = [s.strip() for s in args.slice_types.split(",") if s.strip()]
 
-    raw_out_dir = None
-    raw_manifest = None
-    if args.save_raw:
-        raw_out_dir = args.raw_output_dir or (args.output_dir + "_raw")
-        os.makedirs(raw_out_dir, exist_ok=True)
-        raw_manifest = open(os.path.join(raw_out_dir, "manifest.jsonl"), "w")
+    def resolve_output_dirs(slice_type: str) -> tuple[str, str | None]:
+        if args.slice_types:
+            if slice_type == "full":
+                out_dir = args.output_dir
+            else:
+                out_dir = f"{args.output_dir}-{slice_type}"
+        else:
+            out_dir = args.output_dir
 
-    buffer_resampled = {}
-    buffer_raw = {}
-    out_shard_idx = 0
-    count = 0
-
-    for shard_idx in sorted(by_shard.keys()):
-        shard_path = shard_paths.get(shard_idx)
-        if not shard_path or not os.path.exists(shard_path):
-            raise FileNotFoundError(f"Missing shard index {shard_idx} in {args.raw_activations_dir}")
-        shard_data = load_file(shard_path)
-
-        for entry in by_shard[shard_idx]:
-            eid = entry.get("id")
-            if eid not in shard_data:
-                continue
-            tensor = shard_data[eid]
-            # tensor shape: (L, T, D)
-            T = tensor.shape[1]
-            sl = slice_indices(entry, args.slice_type, T)
-            if sl is None:
-                continue
-            start, end = sl
-            sliced = tensor[:, start:end, :]
-
-            # Resample to fixed shape
-            resampled = resample_activations(sliced, target_L=args.L_prime, target_T=args.T_prime)
-            if resampled is None:
-                continue
-
-            buffer_resampled[eid] = resampled
-            if args.save_raw:
-                buffer_raw[eid] = sliced
-
-            # Write manifest entry
-            meta = {
-                "id": eid,
-                "label": entry.get("label"),
-                "generation_length": sliced.shape[1],
-                "shard": out_shard_idx,
-                "slice_type": args.slice_type,
-                "slice_start": start,
-                "slice_end": end,
-                "source_shard": shard_idx,
-            }
-            out_manifest.write(json.dumps(meta) + "\n")
-
-            if raw_manifest is not None:
-                raw_manifest.write(json.dumps(meta) + "\n")
-
-            count += 1
-            if count % args.shard_size == 0:
-                out_path = os.path.join(args.output_dir, f"shard_{out_shard_idx}.safetensors")
-                save_file(buffer_resampled, out_path)
-                buffer_resampled = {}
-                if args.save_raw:
-                    raw_path = os.path.join(raw_out_dir, f"shard_{out_shard_idx}.safetensors")
-                    save_file(buffer_raw, raw_path)
-                    buffer_raw = {}
-                out_shard_idx += 1
-
-    # Flush leftovers
-    if buffer_resampled:
-        out_path = os.path.join(args.output_dir, f"shard_{out_shard_idx}.safetensors")
-        save_file(buffer_resampled, out_path)
+        raw_dir = None
         if args.save_raw:
-            raw_path = os.path.join(raw_out_dir, f"shard_{out_shard_idx}.safetensors")
-            save_file(buffer_raw, raw_path)
+            base_raw = args.raw_output_dir or (args.output_dir + "_raw")
+            if args.slice_types:
+                raw_dir = base_raw if slice_type == "full" else f"{base_raw}-{slice_type}"
+            else:
+                raw_dir = base_raw
+        return out_dir, raw_dir
 
-    out_manifest.close()
-    if raw_manifest is not None:
-        raw_manifest.close()
+    def process_slice(slice_type: str) -> None:
+        out_dir, raw_dir = resolve_output_dirs(slice_type)
 
-    print(f"Wrote {count} sliced examples to {args.output_dir}")
-    if args.save_raw:
-        print(f"Wrote sliced raw activations to {raw_out_dir}")
+        os.makedirs(out_dir, exist_ok=True)
+        out_manifest_path = os.path.join(out_dir, "manifest.jsonl")
+        out_manifest = open(out_manifest_path, "w")
+
+        raw_manifest = None
+        if args.save_raw and raw_dir:
+            os.makedirs(raw_dir, exist_ok=True)
+            raw_manifest = open(os.path.join(raw_dir, "manifest.jsonl"), "w")
+
+        buffer_resampled = {}
+        buffer_raw = {}
+        out_shard_idx = 0
+        count = 0
+
+        for shard_idx in sorted(by_shard.keys()):
+            shard_path = shard_paths.get(shard_idx)
+            if not shard_path or not os.path.exists(shard_path):
+                raise FileNotFoundError(f"Missing shard index {shard_idx} in {args.raw_activations_dir}")
+            shard_data = load_file(shard_path)
+
+            for entry in by_shard[shard_idx]:
+                eid = entry.get("id")
+                if eid not in shard_data:
+                    continue
+                tensor = shard_data[eid]
+                # tensor shape: (L, T, D)
+                T = tensor.shape[1]
+                sl = slice_indices(entry, slice_type, T)
+                if sl is None:
+                    continue
+                start, end = sl
+                sliced = tensor[:, start:end, :]
+
+                # Resample to fixed shape
+                resampled = resample_activations(sliced, target_L=args.L_prime, target_T=args.T_prime)
+                if resampled is None:
+                    continue
+
+                buffer_resampled[eid] = resampled
+                if args.save_raw:
+                    buffer_raw[eid] = sliced
+
+                # Write manifest entry
+                meta = {
+                    "id": eid,
+                    "label": entry.get("label"),
+                    "generation_length": sliced.shape[1],
+                    "shard": out_shard_idx,
+                    "slice_type": slice_type,
+                    "slice_start": start,
+                    "slice_end": end,
+                    "source_shard": shard_idx,
+                }
+                out_manifest.write(json.dumps(meta) + "\n")
+
+                if raw_manifest is not None:
+                    raw_manifest.write(json.dumps(meta) + "\n")
+
+                count += 1
+                if count % args.shard_size == 0:
+                    out_path = os.path.join(out_dir, f"shard_{out_shard_idx}.safetensors")
+                    save_file(buffer_resampled, out_path)
+                    buffer_resampled = {}
+                    if args.save_raw and raw_dir:
+                        raw_path = os.path.join(raw_dir, f"shard_{out_shard_idx}.safetensors")
+                        save_file(buffer_raw, raw_path)
+                        buffer_raw = {}
+                    out_shard_idx += 1
+
+        # Flush leftovers
+        if buffer_resampled:
+            out_path = os.path.join(out_dir, f"shard_{out_shard_idx}.safetensors")
+            save_file(buffer_resampled, out_path)
+            if args.save_raw and raw_dir:
+                raw_path = os.path.join(raw_dir, f"shard_{out_shard_idx}.safetensors")
+                save_file(buffer_raw, raw_path)
+
+        out_manifest.close()
+        if raw_manifest is not None:
+            raw_manifest.close()
+
+        print(f"Wrote {count} sliced examples to {out_dir}")
+        if args.save_raw and raw_dir:
+            print(f"Wrote sliced raw activations to {raw_dir}")
+
+    for st in slice_types:
+        print(f"==> Slicing: {st}")
+        process_slice(st)
 
     return 0
 
