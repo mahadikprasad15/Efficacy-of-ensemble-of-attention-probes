@@ -264,6 +264,12 @@ def main():
         help="Which deception dataset to process"
     )
     parser.add_argument(
+        "--dataset_file",
+        type=str,
+        default=None,
+        help="Optional override for dataset file (e.g., Sally concat examples JSONL)"
+    )
+    parser.add_argument(
         "--dataset_output_name",
         type=str,
         default=None,
@@ -410,7 +416,13 @@ def main():
 
     logger.info(f"[1/6] Loading {args.dataset} ({args.split})...")
     DSClass = DATASET_MAP[args.dataset]
-    ds = DSClass(split=args.split, limit=args.limit)
+    if args.dataset_file:
+        try:
+            ds = DSClass(split=args.split, limit=args.limit, data_file=args.dataset_file)
+        except TypeError:
+            ds = DSClass(split=args.split, limit=args.limit)
+    else:
+        ds = DSClass(split=args.split, limit=args.limit)
     ds.load_data()
 
     # Validate gold completion usage
