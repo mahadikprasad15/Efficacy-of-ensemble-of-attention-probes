@@ -117,15 +117,19 @@ def denoise_on_manifold(
     device = x.device
     dtype = x.dtype
 
+    # GLP's packaged sampler currently assumes effective sequence length S=1
+    # in timestep shaping. Flatten (B,S,D) -> (B*S,1,D), denoise, then restore.
+    bsz, seqlen, dim = x.shape
     x_norm = artifacts.model.normalizer.normalize(x, layer_idx=layer_idx)
+    x_norm_flat = x_norm.reshape(bsz * seqlen, 1, dim)
 
     if seed is None:
-        noise = torch.randn_like(x_norm)
+        noise = torch.randn_like(x_norm_flat)
     else:
         gen = torch.Generator(device=device)
         gen.manual_seed(int(seed))
-        noise = torch.randn(x_norm.shape, device=device, dtype=x_norm.dtype, generator=gen)
-    x_noisy = x_norm + float(noise_scale) * noise
+        noise = torch.randn(x_norm_flat.shape, device=device, dtype=x_norm_flat.dtype, generator=gen)
+    x_noisy_flat = x_norm_flat + float(noise_scale) * noise
 
     start_timestep_value = resolve_start_timestep_value(
         model=artifacts.model,
@@ -135,11 +139,12 @@ def denoise_on_manifold(
 
     x_denoised_norm = artifacts.sample_on_manifold_fn(
         artifacts.model,
-        latents=x_noisy,
+        latents=x_noisy_flat,
         num_timesteps=int(num_timesteps),
         start_timestep=start_timestep_value,
         layer_idx=layer_idx,
     )
     x_denoised = artifacts.model.normalizer.denormalize(x_denoised_norm, layer_idx=layer_idx)
+    x_denoised = x_denoised.reshape(bsz, seqlen, dim)
     x_denoised = x_denoised.to(device=device, dtype=dtype)
     return x_denoised, start_timestep_value
