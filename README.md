@@ -89,6 +89,24 @@ python scripts/evaluate_ood_all_pooling.py \
 
 ---
 
+### Top-5 Normalized Probes Evaluation
+
+Train and evaluate the Top-5 source→target pairs from a CSV using **train-split normalization stats** (stored under each activation split). This runs normalized training on the source, then evaluates on the target split with the same stats.
+
+```bash
+python scripts/pipelines/run_normalized_top5_eval.py \
+    --top5_csv /content/drive/MyDrive/.../top5.csv \
+    --model meta-llama/Llama-3.2-1B-Instruct \
+    --activations_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations_fullprompt \
+    --results_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/results/ood_evaluation \
+    --target_split validation
+```
+
+**Outputs**:  
+`results/ood_evaluation/<model_dir>/normalized_probes_evaluation/from-<source>_to-<target>/metrics.json` and `metrics.csv`, plus `summary.json` and `summary.csv` at the root of `normalized_probes_evaluation/`.
+
+---
+
 ### Phase 4: Ensemble Training & Evaluation
 
 Combine multiple layers with different ensemble strategies.
