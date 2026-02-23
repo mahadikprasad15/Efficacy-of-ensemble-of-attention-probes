@@ -734,6 +734,18 @@ def main():
         help="Output directory for trained probes"
     )
     parser.add_argument(
+        "--output_subdir",
+        type=str,
+        default=None,
+        help="Optional subdirectory under model dir for outputs (e.g., Deception-AILiar_slices)."
+    )
+    parser.add_argument(
+        "--output_dataset_name",
+        type=str,
+        default=None,
+        help="Optional dataset name for output path (defaults to --dataset)."
+    )
+    parser.add_argument(
         "--split_train_for_test",
         action="store_true",
         help="If set, splits 20%% of training data for validation (if validation split missing)"
@@ -956,21 +968,14 @@ def main():
     logger.info(f"{'='*70}\n")
 
     # Prepare output directory
+    output_dataset = args.output_dataset_name or args.dataset
+    output_parts = [args.output_dir, model_dir]
+    if args.output_subdir:
+        output_parts.append(args.output_subdir)
     if args.suffix_condition:
-        output_dir = os.path.join(
-            args.output_dir,
-            model_dir,
-            args.suffix_condition,
-            args.dataset,
-            args.pooling
-        )
-    else:
-        output_dir = os.path.join(
-            args.output_dir,
-            model_dir,
-            args.dataset,
-            args.pooling
-        )
+        output_parts.append(args.suffix_condition)
+    output_parts.extend([output_dataset, args.pooling])
+    output_dir = os.path.join(*output_parts)
     os.makedirs(output_dir, exist_ok=True)
 
     # Attribution output directory
@@ -1305,6 +1310,8 @@ def main():
             'model_pooling_type': model_pooling_type,
             'model': args.model,
             'dataset': args.dataset,
+            'output_dataset': output_dataset,
+            'output_subdir': args.output_subdir,
             'suffix_condition': args.suffix_condition if hasattr(args, 'suffix_condition') else None,
             'input_dim': D
         }

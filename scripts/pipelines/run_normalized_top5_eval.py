@@ -111,6 +111,16 @@ def target_to_dataset_name(value: str) -> str:
     return base if segment == "full" else f"{base}-{segment}"
 
 
+def base_dataset_from_train_dataset(dataset: str) -> str:
+    if dataset.startswith("Deception-AILiar"):
+        return "Deception-AILiar"
+    if dataset.startswith("Deception-Roleplaying"):
+        return "Deception-Roleplaying"
+    if dataset.startswith("Deception-InsiderTrading"):
+        return "Deception-InsiderTrading"
+    return dataset.split("-", 1)[0]
+
+
 def split_dir(activations_dir: Path, model_dir: str, dataset: str, split: str) -> Path:
     return activations_dir / model_dir / dataset / split
 
@@ -299,6 +309,8 @@ def run_training_if_needed(
     pooling: str,
     layer: int,
     output_dir: Path,
+    output_subdir: str,
+    output_dataset_name: str,
     batch_size: int,
     epochs: int,
     lr: float,
@@ -307,7 +319,7 @@ def run_training_if_needed(
     force_retrain: bool,
 ) -> None:
     model_dir = model_to_dir(model)
-    probe_path = output_dir / model_dir / dataset / pooling / f"probe_layer_{layer}.pt"
+    probe_path = output_dir / model_dir / output_subdir / output_dataset_name / pooling / f"probe_layer_{layer}.pt"
     if probe_path.exists() and not force_retrain:
         return
 
@@ -320,6 +332,8 @@ def run_training_if_needed(
         "--pooling", pooling,
         "--layer", str(layer),
         "--output_dir", str(output_dir),
+        "--output_subdir", output_subdir,
+        "--output_dataset_name", output_dataset_name,
         "--batch_size", str(batch_size),
         "--epochs", str(epochs),
         "--lr", str(lr),
@@ -357,6 +371,7 @@ def main() -> int:
     parser.add_argument("--model", type=str, required=True, help="Model name")
     parser.add_argument("--activations_dir", type=str, required=True, help="Base activations dir")
     parser.add_argument("--results_root", type=str, required=True, help="Base results root")
+    parser.add_argument("--probes_root", type=str, default="data/probes", help="Base probes root")
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--target_split", type=str, default="validation")
     parser.add_argument("--batch_size", type=int, default=32)
@@ -372,10 +387,10 @@ def main() -> int:
     top5_csv = Path(args.top5_csv)
     activations_dir = Path(args.activations_dir)
     results_root = Path(args.results_root)
+    probes_root = Path(args.probes_root)
 
     model_dir = model_to_dir(args.model)
     run_root = results_root / model_dir / "normalized_probes_evaluation"
-    probes_root = run_root / "probes"
     run_root.mkdir(parents=True, exist_ok=True)
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -403,6 +418,8 @@ def main() -> int:
         target_split_dir = split_dir(activations_dir, model_dir, target_dataset, args.target_split)
 
         stats_dir = train_split_dir / "norm_stats" / pooling
+        output_subdir = f"{base_dataset_from_train_dataset(train_dataset)}_slices"
+        output_dataset_name = f"{train_dataset}-normalized"
 
         if not train_split_dir.exists():
             raise FileNotFoundError(f"Train split dir not found: {train_split_dir}")
@@ -417,6 +434,8 @@ def main() -> int:
             pooling=pooling,
             layer=layer,
             output_dir=probes_root,
+            output_subdir=output_subdir,
+            output_dataset_name=output_dataset_name,
             batch_size=args.batch_size,
             epochs=args.epochs,
             lr=args.lr,
@@ -427,7 +446,7 @@ def main() -> int:
 
         compute_stats_if_missing(train_split_dir, stats_dir, pooling, args.norm_eps)
 
-        probe_path = probes_root / model_dir / train_dataset / pooling / f"probe_layer_{layer}.pt"
+        probe_path = probes_root / model_dir / output_subdir / output_dataset_name / pooling / f"probe_layer_{layer}.pt"
         if not probe_path.exists():
             raise FileNotFoundError(f"Probe not found: {probe_path}")
 
@@ -464,6 +483,8 @@ def main() -> int:
             "model": args.model,
             "source_probe": source_probe,
             "train_dataset": train_dataset,
+            "output_dataset": output_dataset_name,
+            "output_subdir": output_subdir,
             "target_dataset": target_dataset,
             "target_label": target_label,
             "pooling": pooling,

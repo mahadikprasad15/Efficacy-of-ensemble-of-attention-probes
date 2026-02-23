@@ -99,6 +99,7 @@ python scripts/pipelines/run_normalized_top5_eval.py \
     --model meta-llama/Llama-3.2-1B-Instruct \
     --activations_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations_fullprompt \
     --results_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/results/ood_evaluation \
+    --probes_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/probes \
     --target_split validation
 ```
 
