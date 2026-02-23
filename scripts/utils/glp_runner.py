@@ -34,6 +34,36 @@ class GLPArtifacts:
     device: str
 
 
+def resolve_layer_idx_arg(model: object, requested_layer_idx: int) -> Optional[int]:
+    """
+    Determine whether GLP expects a layer_idx argument.
+
+    Some single-layer checkpoints expose `multi_layer_n_layers=None` and require
+    layer_idx to be None. Multi-layer checkpoints require an explicit layer_idx.
+    """
+    candidates = []
+    denoiser = getattr(model, "denoiser", None)
+    if denoiser is not None:
+        candidates.append(getattr(denoiser, "multi_layer_n_layers", None))
+        inner = getattr(denoiser, "model", None)
+        if inner is not None:
+            candidates.append(getattr(inner, "multi_layer_n_layers", None))
+    candidates.append(getattr(model, "multi_layer_n_layers", None))
+
+    has_explicit_none = False
+    for value in candidates:
+        if isinstance(value, int):
+            return int(requested_layer_idx)
+        if value is None:
+            has_explicit_none = True
+
+    # If metadata exists but indicates single-layer, do not pass layer_idx.
+    if has_explicit_none:
+        return None
+    # Unknown model shape: preserve requested layer index.
+    return int(requested_layer_idx)
+
+
 def load_glp_artifacts(
     model_id: str,
     device: str = "cuda:0",
@@ -116,11 +146,12 @@ def denoise_on_manifold(
     x = ensure_bsd(latents_bsd)
     device = x.device
     dtype = x.dtype
+    layer_idx_arg = resolve_layer_idx_arg(artifacts.model, requested_layer_idx=layer_idx)
 
     # GLP's packaged sampler currently assumes effective sequence length S=1
     # in timestep shaping. Flatten (B,S,D) -> (B*S,1,D), denoise, then restore.
     bsz, seqlen, dim = x.shape
-    x_norm = artifacts.model.normalizer.normalize(x, layer_idx=layer_idx)
+    x_norm = artifacts.model.normalizer.normalize(x, layer_idx=layer_idx_arg)
     x_norm_flat = x_norm.reshape(bsz * seqlen, 1, dim)
 
     if seed is None:
@@ -142,9 +173,9 @@ def denoise_on_manifold(
         latents=x_noisy_flat,
         num_timesteps=int(num_timesteps),
         start_timestep=start_timestep_value,
-        layer_idx=layer_idx,
+        layer_idx=layer_idx_arg,
     )
-    x_denoised = artifacts.model.normalizer.denormalize(x_denoised_norm, layer_idx=layer_idx)
+    x_denoised = artifacts.model.normalizer.denormalize(x_denoised_norm, layer_idx=layer_idx_arg)
     x_denoised = x_denoised.reshape(bsz, seqlen, dim)
     x_denoised = x_denoised.to(device=device, dtype=dtype)
     return x_denoised, start_timestep_value
