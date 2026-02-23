@@ -44,11 +44,20 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import logging
+from typing import Optional
 
 # Add src to path
 sys.path.append(os.path.join(os.getcwd(), 'actprobe', 'src'))
 
 from actprobe.probes.models import LayerProbe
+from actprobe.utils.norm_stats import (
+    init_running_stats,
+    update_running_stats,
+    finalize_running_stats,
+    save_layer_stats,
+    load_layer_stats,
+    stats_complete,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,7 +80,17 @@ class CachedDeceptionDataset(Dataset):
             └── manifest.jsonl
     """
 
-    def __init__(self, activations_dir: str, pool_before_batch: bool = False, pooling_type: str = "mean", return_ids: bool = False):
+    def __init__(
+        self,
+        activations_dir: str,
+        pool_before_batch: bool = False,
+        pooling_type: str = "mean",
+        return_ids: bool = False,
+        compute_stats: bool = False,
+        stats_out_dir: Optional[str] = None,
+        stats_pooling: str = "mean",
+        stats_eps: float = 1e-8,
+    ):
         """
         Args:
             activations_dir: Path to directory with shards and manifest
@@ -83,6 +102,10 @@ class CachedDeceptionDataset(Dataset):
         self.pool_before_batch = pool_before_batch
         self.pooling_type = pooling_type
         self.return_ids = return_ids
+        self.compute_stats = compute_stats
+        self.stats_out_dir = stats_out_dir
+        self.stats_pooling = stats_pooling
+        self.stats_eps = stats_eps
 
         # Find all shard files
         shard_pattern = os.path.join(activations_dir, "shard_*.safetensors")
@@ -110,6 +133,7 @@ class CachedDeceptionDataset(Dataset):
         logger.info(f"Loaded manifest with {len(manifest)} entries")
 
         # Load tensors from shards
+        running_stats = None
         for shard_path in tqdm(shards, desc="Loading shards"):
             try:
                 tensors = load_file(shard_path)
@@ -125,6 +149,17 @@ class CachedDeceptionDataset(Dataset):
                     # Skip unknown labels
                     if label == -1:
                         continue
+
+                    if self.compute_stats:
+                        if running_stats is None:
+                            if tensor.dim() == 3:
+                                num_layers, _, dim = tensor.shape
+                            elif tensor.dim() == 2:
+                                num_layers, dim = tensor.shape
+                            else:
+                                raise ValueError(f"Unexpected tensor shape for stats: {tensor.shape}")
+                            running_stats = init_running_stats(num_layers, dim)
+                        running_stats = update_running_stats(running_stats, tensor)
 
                     if self.pool_before_batch and len(tensor.shape) == 3:
                         if self.pooling_type == "mean":
@@ -158,6 +193,8 @@ class CachedDeceptionDataset(Dataset):
                 logger.info(f"  • Input format: pooled (L={sample_shape[0]}, T={sample_shape[1]}, D={sample_shape[2]})")
             else:
                 raise ValueError(f"Unexpected tensor shape: {sample_shape}")
+            self.num_layers = sample_shape[0]
+            self.hidden_dim = sample_shape[-1]
 
         # Log label distribution
         labels = [item['label'] for item in self.items]
@@ -165,6 +202,21 @@ class CachedDeceptionDataset(Dataset):
         deceptive_count = sum(1 for l in labels if l == 1)
         logger.info(f"  • Honest: {honest_count} ({100*honest_count/len(labels):.1f}%)")
         logger.info(f"  • Deceptive: {deceptive_count} ({100*deceptive_count/len(labels):.1f}%)")
+
+        if self.compute_stats:
+            if running_stats is None:
+                logger.warning("Stats requested but no samples loaded; skipping stats save.")
+            else:
+                if not self.stats_out_dir:
+                    raise ValueError("stats_out_dir is required when compute_stats=True")
+                finalized = finalize_running_stats(running_stats, eps=self.stats_eps)
+                save_layer_stats(
+                    finalized,
+                    self.stats_out_dir,
+                    pooling=self.stats_pooling,
+                    source_dir=activations_dir,
+                )
+                logger.info(f"✓ Saved normalization stats to {self.stats_out_dir}")
 
     def __len__(self):
         return len(self.items)
@@ -176,11 +228,37 @@ class CachedDeceptionDataset(Dataset):
             return item['tensor'].float(), torch.tensor(item['label'], dtype=torch.float32), item['id']
         return item['tensor'].float(), torch.tensor(item['label'], dtype=torch.float32)
 
+
+class LayerDataset(Dataset):
+    def __init__(self, base_dataset, layer_idx):
+        self.base = base_dataset
+        self.layer_idx = layer_idx
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        item = self.base[idx]
+        if len(item) == 3:
+            x, y, eid = item
+            x = x[self.layer_idx]
+            return x, y, eid
+        x, y = item
+        x = x[self.layer_idx]
+        return x, y
+
 # ============================================================================
 # Evaluation
 # ============================================================================
 
-def evaluate(model, dataloader, device):
+def _apply_batch_norm(x: torch.Tensor, norm):
+    if norm is None:
+        return x
+    mean, std = norm
+    return (x - mean) / std
+
+
+def evaluate(model, dataloader, device, norm=None):
     """
     Evaluate model on dataloader.
 
@@ -201,6 +279,7 @@ def evaluate(model, dataloader, device):
             else:
                 x, y = batch
             x = x.to(device)
+            x = _apply_batch_norm(x, norm)
             logits = model(x)
             probs = torch.sigmoid(logits).cpu().numpy()
             preds.extend(probs.flatten())
@@ -223,7 +302,16 @@ def evaluate(model, dataloader, device):
 # Training
 # ============================================================================
 
-def train_probe(model, train_loader, val_loader, device, args, checkpoint_dir=None, checkpoint_every=1):
+def train_probe(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    args,
+    checkpoint_dir=None,
+    checkpoint_every=1,
+    norm=None,
+):
     """
     Train a single probe with early stopping.
 
@@ -264,6 +352,7 @@ def train_probe(model, train_loader, val_loader, device, args, checkpoint_dir=No
                 x, y = batch
             x = x.to(device)
             y = y.to(device)
+            x = _apply_batch_norm(x, norm)
 
             optimizer.zero_grad()
             logits = model(x)
@@ -284,7 +373,7 @@ def train_probe(model, train_loader, val_loader, device, args, checkpoint_dir=No
             train_auc = 0.5
 
         # Validation
-        val_auc, val_acc, _, _ = evaluate(model, val_loader, device)
+        val_auc, val_acc, _, _ = evaluate(model, val_loader, device, norm=norm)
 
         # Logging
         logger.info(
@@ -418,12 +507,12 @@ def run_attribution_for_layer(
         training_dynamics.append([epoch, cos_to_final, w_norm])
 
         # Checkpoint evaluation (ID + OOD)
-        id_auc, id_acc, _, _ = evaluate(model, val_loader, device)
+        id_auc, id_acc, _, _ = evaluate(model, val_loader, device, norm=norm)
         best_id_auc = max(best_id_auc, id_auc)
         checkpoint_metrics.append([epoch, "id", id_auc, id_acc, 1 if id_auc >= best_id_auc else 0])
 
         if ood_loader is not None:
-            ood_auc, ood_acc, _, _ = evaluate(model, ood_loader, device)
+            ood_auc, ood_acc, _, _ = evaluate(model, ood_loader, device, norm=norm)
             best_ood_auc = max(best_ood_auc, ood_auc)
             checkpoint_metrics.append([epoch, "ood", ood_auc, ood_acc, 1 if ood_auc >= best_ood_auc else 0])
 
@@ -587,6 +676,28 @@ def main():
         action="store_true",
         help="Pool (L,T,D) -> (L,D) before batching (for raw variable-length activations)."
     )
+    parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="Apply train-split normalization stats before pooling."
+    )
+    parser.add_argument(
+        "--norm_recompute",
+        action="store_true",
+        help="Recompute normalization stats even if they already exist."
+    )
+    parser.add_argument(
+        "--norm_subdir",
+        type=str,
+        default="norm_stats",
+        help="Subdirectory under split dir to store normalization stats."
+    )
+    parser.add_argument(
+        "--norm_eps",
+        type=float,
+        default=1e-8,
+        help="Epsilon added to std for normalization."
+    )
     # Attribution / checkpointing
     parser.add_argument("--attr_enable", action="store_true", help="Enable attribution logging")
     parser.add_argument("--attr_every_n", type=int, default=50, help="Batch interval for attribution aggregation")
@@ -668,16 +779,38 @@ def main():
         logger.error(f"Training data not found! Run cache_deception_activations.py first.")
         return 1
 
+    if args.normalize and args.pool_before_batch:
+        logger.error("--normalize is incompatible with --pool_before_batch (requires token dimension).")
+        return 1
+
     if args.pool_before_batch and args.pooling == "attn":
         logger.error("--pool_before_batch does not support pooling 'attn' (requires token dimension).")
         return 1
+
+    stats_dir = None
+    compute_stats_during_load = False
+    if args.normalize:
+        stats_dir = os.path.join(train_dir, args.norm_subdir, args.pooling)
+        stats_files = []
+        if os.path.isdir(stats_dir) and not args.norm_recompute:
+            stats_files = glob.glob(os.path.join(stats_dir, "layer_*.json"))
+        compute_stats_during_load = args.norm_recompute or not stats_files
+        logger.info(f"Normalization stats dir: {stats_dir}")
+        if compute_stats_during_load:
+            logger.info("Normalization stats missing or recompute requested; will compute during train load.")
+        else:
+            logger.info("Found existing normalization stats; will reuse.")
 
     # Load datasets
     train_dataset = CachedDeceptionDataset(
         train_dir,
         pool_before_batch=args.pool_before_batch,
         pooling_type=args.pooling,
-        return_ids=args.attr_enable
+        return_ids=args.attr_enable,
+        compute_stats=compute_stats_during_load,
+        stats_out_dir=stats_dir,
+        stats_pooling=args.pooling,
+        stats_eps=args.norm_eps
     )
 
     if splits_exist['validation']:
@@ -788,6 +921,24 @@ def main():
         model_pooling_type = 'none'
         logger.info("Pooling before batch: dataset returns pre-pooled (L, D); using IdentityPooling in model.")
 
+    if args.normalize:
+        if not stats_dir:
+            logger.error("Normalization enabled but stats_dir could not be resolved.")
+            return 1
+        if not stats_complete(stats_dir, train_dataset.num_layers):
+            logger.warning("Normalization stats incomplete; computing from in-memory training tensors.")
+            running_stats = init_running_stats(train_dataset.num_layers, train_dataset.hidden_dim)
+            for item in tqdm(train_dataset.items, desc="Computing normalization stats"):
+                running_stats = update_running_stats(running_stats, item["tensor"])
+            finalized = finalize_running_stats(running_stats, eps=args.norm_eps)
+            save_layer_stats(
+                finalized,
+                stats_dir,
+                pooling=args.pooling,
+                source_dir=train_dir
+            )
+            logger.info(f"✓ Saved normalization stats to {stats_dir}")
+
     # ========================================================================
     # Training
     # ========================================================================
@@ -796,6 +947,7 @@ def main():
     logger.info(f"Training Configuration")
     logger.info(f"{'='*70}")
     logger.info(f"Pooling: {args.pooling}")
+    logger.info(f"Normalization: {'on' if args.normalize else 'off'}")
     logger.info(f"Learning rate: {args.lr}")
     logger.info(f"Weight decay: {args.weight_decay}")
     logger.info(f"Batch size: {args.batch_size}")
@@ -860,6 +1012,12 @@ def main():
         except Exception:
             existing_results_map = {}
 
+    def _get_layer_norm(layer_idx: int):
+        if not args.normalize:
+            return None
+        mean, std, _ = load_layer_stats(stats_dir, layer_idx, device=device)
+        return mean, std
+
     if args.layer is not None:
         # Train single layer
         logger.info(f"Training probe for layer {args.layer}...")
@@ -868,23 +1026,7 @@ def main():
         attr_checkpoint_dir = None
         if args.attr_enable:
             attr_checkpoint_dir = os.path.join(attr_out_dir, "checkpoints", f"layer_{args.layer}")
-
-        class LayerDataset(Dataset):
-            def __init__(self, base_dataset, layer_idx):
-                self.base = base_dataset
-                self.layer_idx = layer_idx
-
-            def __len__(self):
-                return len(self.base)
-
-            def __getitem__(self, idx):
-                item = self.base[idx]
-                if len(item) == 3:
-                    x, y, eid = item
-                    return x[self.layer_idx], y, eid
-                x, y = item
-                return x[self.layer_idx], y
-
+        layer_norm = _get_layer_norm(args.layer)
         layer_train_dataset = LayerDataset(train_dataset, args.layer)
         layer_val_dataset = LayerDataset(val_dataset, args.layer)
 
@@ -913,7 +1055,8 @@ def main():
             device,
             args,
             checkpoint_dir=attr_checkpoint_dir if args.attr_enable else None,
-            checkpoint_every=args.attr_checkpoint_every
+            checkpoint_every=args.attr_checkpoint_every,
+            norm=layer_norm,
         )
 
         # Test
@@ -926,7 +1069,7 @@ def main():
                 shuffle=False,
                 num_workers=0
             )
-            test_auc, test_acc, _, _ = evaluate(model, layer_test_loader, device)
+            test_auc, test_acc, _, _ = evaluate(model, layer_test_loader, device, norm=layer_norm)
             logger.info(f"Test AUC: {test_auc:.4f} | Test Acc: {test_acc:.4f}")
 
         # Attribution + checkpoint eval
@@ -990,24 +1133,7 @@ def main():
                 pooling_type=model_pooling_type
             ).to(device)
 
-            # Create dataloaders that select specific layer
-            # This is a bit hacky but works
-            class LayerDataset(Dataset):
-                def __init__(self, base_dataset, layer_idx):
-                    self.base = base_dataset
-                    self.layer_idx = layer_idx
-
-                def __len__(self):
-                    return len(self.base)
-
-                def __getitem__(self, idx):
-                    item = self.base[idx]
-                    if len(item) == 3:
-                        x, y, eid = item
-                        return x[self.layer_idx], y, eid
-                    x, y = item
-                    return x[self.layer_idx], y  # Select layer
-
+            layer_norm = _get_layer_norm(layer_idx)
             layer_train_dataset = LayerDataset(train_dataset, layer_idx)
             layer_val_dataset = LayerDataset(val_dataset, layer_idx)
 
@@ -1029,7 +1155,7 @@ def main():
                 logger.info(f"Resume mode: found existing probe for layer {layer_idx}, skipping retraining.")
                 model.load_state_dict(torch.load(args.output_model_path, map_location=device))
 
-                best_val_auc, best_val_acc, _, _ = evaluate(model, layer_val_loader, device)
+                best_val_auc, best_val_acc, _, _ = evaluate(model, layer_val_loader, device, norm=layer_norm)
                 best_epoch = existing_results_map.get(layer_idx, {}).get('epoch', 0)
 
                 if args.attr_enable:
@@ -1095,12 +1221,13 @@ def main():
                 device,
                 args,
                 checkpoint_dir=attr_checkpoint_dir if args.attr_enable else None,
-                checkpoint_every=args.attr_checkpoint_every
+                checkpoint_every=args.attr_checkpoint_every,
+                norm=layer_norm,
             )
 
             # Load best model and get final validation accuracy
             model.load_state_dict(torch.load(args.output_model_path))
-            _, best_val_acc, _, _ = evaluate(model, layer_val_loader, device)
+            _, best_val_acc, _, _ = evaluate(model, layer_val_loader, device, norm=layer_norm)
 
             results.append({
                 'layer': layer_idx,
