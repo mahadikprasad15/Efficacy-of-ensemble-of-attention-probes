@@ -499,6 +499,10 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
         cov_trace_x_neg = class_cov_trace(pooled_x[neg])
         cov_trace_p_pos = class_cov_trace(pooled_prime_mean[pos])
         cov_trace_p_neg = class_cov_trace(pooled_prime_mean[neg])
+        pooled_cov_x = 0.5 * (cov_trace_x_pos + cov_trace_x_neg)
+        pooled_cov_p = 0.5 * (cov_trace_p_pos + cov_trace_p_neg)
+        sep_norm_x = float(sep_x / (np.sqrt(pooled_cov_x) + 1e-8))
+        sep_norm_p = float(sep_x_prime / (np.sqrt(pooled_cov_p) + 1e-8))
 
         timestep_key = f"t{t}"
         results_by_timestep[timestep_key] = {
@@ -513,6 +517,8 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
             "auc_xprime_seed_mean": float(auc_prime_seed_mean),
             "separation_l2_x": sep_x,
             "separation_l2_xprime": sep_x_prime,
+            "separation_norm_x": sep_norm_x,
+            "separation_norm_xprime": sep_norm_p,
             "cov_trace_x_pos": cov_trace_x_pos,
             "cov_trace_x_neg": cov_trace_x_neg,
             "cov_trace_xprime_pos": cov_trace_p_pos,
@@ -534,6 +540,8 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
                 "auc_xprime_seed_mean": float(auc_prime_seed_mean),
                 "separation_l2_x": sep_x,
                 "separation_l2_xprime": sep_x_prime,
+                "separation_norm_x": sep_norm_x,
+                "separation_norm_xprime": sep_norm_p,
                 "cov_trace_x_pos": cov_trace_x_pos,
                 "cov_trace_x_neg": cov_trace_x_neg,
                 "cov_trace_xprime_pos": cov_trace_p_pos,
