@@ -29,6 +29,7 @@ import numpy as np
 import torch
 from safetensors.torch import load_file
 from sklearn.metrics import roc_auc_score
+from tqdm import tqdm
 
 sys.path.append(os.path.join(os.getcwd(), "scripts", "utils"))
 from glp_runner import denoise_on_manifold, ensure_bsd, load_glp_artifacts  # noqa: E402
@@ -389,6 +390,8 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
 
     set_status(meta_dir, run_id, "running", "denoise_and_metrics")
     completed = set(progress.get("completed_units", []))
+    total_units = len(timesteps) * num_seeds
+    overall_pbar = tqdm(total=total_units, desc="GLP units", unit="unit")
     for t in timesteps:
         pooled_prime_by_seed = np.zeros((num_seeds, n, d_model), dtype=np.float32)
         delta_norm_by_seed = np.zeros((num_seeds, n), dtype=np.float32)
@@ -407,6 +410,7 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
                 logits_prime_by_seed[seed] = blob["logits_x_prime"].astype(np.float32)
                 start_timestep_values[seed] = float(blob["start_timestep"].item()) if "start_timestep" in blob else None
                 logger.info("Resumed unit %s from checkpoint.", unit_key)
+                overall_pbar.update(1)
                 continue
 
             logger.info("Running unit %s ...", unit_key)
@@ -416,6 +420,7 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
             logits_chunks: List[np.ndarray] = []
             start_timestep_value: Optional[float] = None
 
+            unit_pbar = tqdm(total=n, desc=f"{unit_key} samples", unit="sample", leave=False)
             for b0 in range(0, n, batch_size):
                 b1 = min(n, b0 + batch_size)
                 xb = x_bsd[b0:b1].to(args.device)
@@ -439,6 +444,8 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
                 logits_prime = pooled_prime @ probe_w + probe_b
                 delta_parallel_chunks.append(d_parallel.astype(np.float32))
                 logits_chunks.append(logits_prime.astype(np.float32))
+                unit_pbar.update(b1 - b0)
+            unit_pbar.close()
 
             pooled_prime_arr = np.concatenate(pooled_out_chunks, axis=0)
             delta_norm_arr = np.concatenate(delta_norm_chunks, axis=0)
@@ -463,6 +470,7 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
             progress["completed_units"] = sorted(completed)
             progress["updated_at_utc"] = utc_now_iso()
             write_json(progress_path, progress)
+            overall_pbar.update(1)
 
         logits_prime_mean = logits_prime_by_seed.mean(axis=0)
         pooled_prime_mean = pooled_prime_by_seed.mean(axis=0)
@@ -514,7 +522,6 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
             "drift_norm_all": describe(drift_norm),
             "var_trace_all": describe(var_trace),
         }
-
         by_timestep_rows.append(
             {
                 "num_timesteps": int(t),
@@ -580,6 +587,8 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
                     "probe_logit_xprime_mean": float(logits_prime_mean[i]),
                 }
             )
+
+    overall_pbar.close()
 
     set_status(meta_dir, run_id, "running", "write_results")
     write_jsonl(results_dir / "per_sample.jsonl", all_per_sample_rows)
