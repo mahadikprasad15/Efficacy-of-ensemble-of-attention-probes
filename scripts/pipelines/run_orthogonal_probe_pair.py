@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Train orthogonal probes on source dataset A and evaluate transfer on target B.
+Run orthogonal probe decomposition for an explicit source/target pair.
 
-Pilot scope:
-  - Select one row from top5 CSV (default rank=1)
-  - Projection-only orthogonal decomposition (leakage-safe)
-  - Fixed K probes per selected layer(s)
-
-For generic non-CSV runs, use:
-  scripts/pipelines/run_orthogonal_probe_pair.py
+This script is intentionally CSV-independent:
+  - Provide train/val/target split directories directly.
+  - Projection-only orthogonal decomposition (leakage-safe).
+  - Fixed K probes per selected layer(s).
 """
 
 from __future__ import annotations
@@ -25,7 +22,7 @@ import string
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -103,7 +100,7 @@ def write_csv(path: Path, rows: Sequence[dict]) -> None:
 
 def init_logger(log_path: Path, verbose: bool) -> logging.Logger:
     ensure_dir(log_path.parent)
-    logger = logging.getLogger("orthogonal_probe_pilot")
+    logger = logging.getLogger("orthogonal_probe_pair")
     logger.handlers.clear()
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
 
@@ -159,9 +156,7 @@ def normalize_pooling(value: str) -> str:
     return mapping[v]
 
 
-def parse_layers(value: Optional[str]) -> List[int]:
-    if value is None or not str(value).strip():
-        return []
+def parse_layers(value: str) -> List[int]:
     out: List[int] = []
     for part in str(value).split(","):
         part = part.strip()
@@ -171,80 +166,6 @@ def parse_layers(value: Optional[str]) -> List[int]:
     if not out:
         raise ValueError("No valid layers provided.")
     return sorted(set(out))
-
-
-def parse_source_probe(source_probe: str) -> Tuple[str, str]:
-    s = source_probe.strip()
-    if s.startswith("Roleplaying "):
-        return "Deception-Roleplaying", s[len("Roleplaying ") :].strip().lower()
-    if s.startswith("AI Liar "):
-        return "Deception-AILiar", s[len("AI Liar ") :].strip().lower()
-    raise ValueError(f"Unrecognized Source Probe format: {source_probe}")
-
-
-def map_source_probe_to_train_dataset_name(source_probe: str) -> str:
-    base_dataset, segment = parse_source_probe(source_probe)
-    return base_dataset if segment == "full" else f"{base_dataset}-{segment}"
-
-
-def target_to_dataset_name(value: str) -> str:
-    v = str(value).strip().lower()
-    if "insidertrading" in v:
-        base = "Deception-InsiderTrading"
-    elif "roleplaying" in v:
-        base = "Deception-Roleplaying"
-    elif "ai liar" in v or "ailiar" in v:
-        base = "Deception-AILiar"
-    else:
-        raise ValueError(f"Unsupported target dataset value: {value}")
-
-    segment = "full"
-    if "completion" in v:
-        segment = "completion"
-    elif "system" in v:
-        segment = "system"
-    elif "user" in v:
-        segment = "user"
-    elif "prompt" in v:
-        segment = "prompt"
-    elif "full" in v:
-        segment = "full"
-
-    return base if segment == "full" else f"{base}-{segment}"
-
-
-def read_top_rows(path: Path) -> List[Dict[str, str]]:
-    with path.open("r", newline="") as f:
-        reader = csv.DictReader(f)
-        rows = [row for row in reader]
-    if not rows:
-        raise RuntimeError(f"No rows found in {path}")
-    return rows
-
-
-def select_row_by_rank(rows: Sequence[Dict[str, str]], rank: int) -> Dict[str, str]:
-    by_rank = []
-    for row in rows:
-        raw = str(row.get("rank", "")).strip()
-        if not raw:
-            continue
-        try:
-            r = int(float(raw))
-        except Exception:
-            continue
-        by_rank.append((r, row))
-    for r, row in by_rank:
-        if r == rank:
-            return row
-
-    idx = rank - 1
-    if idx < 0 or idx >= len(rows):
-        raise IndexError(f"Requested top rank {rank}, but CSV has only {len(rows)} rows")
-    return rows[idx]
-
-
-def split_dir(activations_root: Path, model_dir: str, dataset: str, split: str) -> Path:
-    return activations_root / model_dir / dataset / split
 
 
 def load_label_map(split_path: Path) -> Dict[str, int]:
@@ -290,14 +211,14 @@ def load_split_layer_tensors(
                     raise ValueError(
                         f"Layer {layer} out of range for sample {sid}; tensor has {int(tensor.shape[0])} layers."
                     )
-                x = tensor[layer, :, :].detach().cpu().float()  # (T,D)
+                x = tensor[layer, :, :].detach().cpu().float()
                 cur_type = "token"
             elif tensor.dim() == 2:
                 if layer >= int(tensor.shape[0]):
                     raise ValueError(
                         f"Layer {layer} out of range for sample {sid}; tensor has {int(tensor.shape[0])} layers."
                     )
-                x = tensor[layer, :].detach().cpu().float()  # (D,)
+                x = tensor[layer, :].detach().cpu().float()
                 cur_type = "final"
             else:
                 raise ValueError(f"Unexpected tensor shape {tuple(tensor.shape)} for sample {sid}")
@@ -386,7 +307,6 @@ def run_layer(
         args.k_probes,
     )
 
-    # Rebuild basis from saved probes in order, using only training-derived probe vectors.
     q_basis: Optional[torch.Tensor] = None
     prev_w: List[torch.Tensor] = []
     for k in sorted(completed_k):
@@ -501,18 +421,17 @@ def run_layer(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run orthogonal probe pilot (projection only)")
-    parser.add_argument("--top5_csv", type=str, required=True)
-    parser.add_argument("--top_rank", type=int, default=1)
+    parser = argparse.ArgumentParser(description="Run orthogonal probes for explicit source/target pair")
     parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--activations_root", type=str, required=True)
-    parser.add_argument("--layers", type=str, default=None, help="Comma-separated list; default uses row Best Layer")
+    parser.add_argument("--train_dir", type=str, required=True)
+    parser.add_argument("--val_dir", type=str, required=True)
+    parser.add_argument("--target_dir", type=str, required=True)
+    parser.add_argument("--source_name", type=str, default=None, help="Name used in output slug")
+    parser.add_argument("--target_name", type=str, default=None, help="Name used in output slug")
+    parser.add_argument("--layers", type=str, required=True, help="Comma-separated list")
     parser.add_argument("--k_probes", type=int, default=50)
-    parser.add_argument("--pooling", type=str, default=None, help="Override pooling; else from CSV row")
+    parser.add_argument("--pooling", type=str, required=True)
     parser.add_argument("--method", type=str, default="projection", choices=["projection"])
-    parser.add_argument("--train_split", type=str, default="train")
-    parser.add_argument("--val_split", type=str, default="validation")
-    parser.add_argument("--target_split", type=str, default="test")
     parser.add_argument("--output_root", type=str, default="results/orthogonal_probe_decomp")
     parser.add_argument("--run_id", type=str, default=None)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
@@ -535,29 +454,12 @@ def main() -> int:
     args.device = torch.device(args.device)
     args.run_id = args.run_id or make_run_id()
 
-    rows = read_top_rows(Path(args.top5_csv))
-    row = select_row_by_rank(rows, rank=args.top_rank)
-
-    source_probe = str(row.get("Source Probe", "")).strip()
-    train_dataset = str(row.get("train_dataset_name", "")).strip()
-    if not train_dataset:
-        train_dataset = map_source_probe_to_train_dataset_name(source_probe)
-    target_dataset = target_to_dataset_name(str(row.get("Target Dataset (Test)", "")))
-
-    pooling_row = str(row.get("train_pooling", "") or row.get("Best Pooling", "")).strip()
-    pooling = normalize_pooling(args.pooling if args.pooling else pooling_row)
-
+    pooling = normalize_pooling(args.pooling)
     layers = parse_layers(args.layers)
-    if not layers:
-        layers = [int(float(row.get("Best Layer", "0")))]
 
-    model_dir = model_to_dir(args.model)
-    activations_root = Path(args.activations_root).resolve()
-    output_root = Path(args.output_root).resolve()
-
-    train_dir = split_dir(activations_root, model_dir, train_dataset, args.train_split)
-    val_dir = split_dir(activations_root, model_dir, train_dataset, args.val_split)
-    target_dir = split_dir(activations_root, model_dir, target_dataset, args.target_split)
+    train_dir = Path(args.train_dir).resolve()
+    val_dir = Path(args.val_dir).resolve()
+    target_dir = Path(args.target_dir).resolve()
 
     if not train_dir.exists():
         raise FileNotFoundError(f"Train split dir not found: {train_dir}")
@@ -566,7 +468,11 @@ def main() -> int:
     if not target_dir.exists():
         raise FileNotFoundError(f"Target split dir not found: {target_dir}")
 
-    pair_slug = f"{train_dataset}__to__{target_dataset}"
+    source_name = args.source_name or train_dir.parent.name
+    target_name = args.target_name or target_dir.parent.name
+    pair_slug = f"{source_name}__to__{target_name}"
+    model_dir = model_to_dir(args.model)
+    output_root = Path(args.output_root).resolve()
 
     for layer in layers:
         run_dir = output_root / model_dir / pair_slug / pooling / f"layer_{layer}" / args.run_id
@@ -575,8 +481,8 @@ def main() -> int:
 
         logger.info("Run id: %s", args.run_id)
         logger.info("Method: projection")
-        logger.info("Source dataset: %s", train_dataset)
-        logger.info("Target dataset: %s", target_dataset)
+        logger.info("Source: %s", source_name)
+        logger.info("Target: %s", target_name)
         logger.info("Layer: %d", layer)
         logger.info("Pooling: %s", pooling)
         logger.info("Train dir: %s", train_dir)
@@ -605,12 +511,8 @@ def main() -> int:
                 "k_probes": int(args.k_probes),
                 "layer": int(layer),
                 "pooling": pooling,
-                "source_probe": source_probe,
-                "train_dataset": train_dataset,
-                "target_dataset": target_dataset,
-                "train_split": args.train_split,
-                "val_split": args.val_split,
-                "target_split": args.target_split,
+                "source_name": source_name,
+                "target_name": target_name,
                 "train_dir": str(train_dir),
                 "val_dir": str(val_dir),
                 "target_dir": str(target_dir),
