@@ -246,8 +246,8 @@ def extract_probe_vector_and_bias(model: LayerProbe) -> Tuple[torch.Tensor, floa
     return w, b
 
 
-def probe_path(run_dir: Path, k: int) -> Path:
-    return run_dir / "probes" / f"probe_k{k:03d}.pt"
+def probe_path(probes_dir: Path, k: int) -> Path:
+    return probes_dir / f"probe_k{k:03d}.pt"
 
 
 def run_layer(
@@ -255,6 +255,7 @@ def run_layer(
     args: argparse.Namespace,
     layer: int,
     run_dir: Path,
+    probes_dir: Path,
     logger: logging.Logger,
     x_train: torch.Tensor,
     y_train: torch.Tensor,
@@ -270,7 +271,7 @@ def run_layer(
     ensure_dir(meta_dir)
     ensure_dir(ckpt_dir)
     ensure_dir(results_dir)
-    ensure_dir(run_dir / "probes")
+    ensure_dir(probes_dir)
 
     progress_path = ckpt_dir / "progress.json"
     per_probe_jsonl = results_dir / "per_probe.jsonl"
@@ -310,7 +311,7 @@ def run_layer(
     q_basis: Optional[torch.Tensor] = None
     prev_w: List[torch.Tensor] = []
     for k in sorted(completed_k):
-        p = probe_path(run_dir, k)
+        p = probe_path(probes_dir, k)
         if not p.exists():
             raise FileNotFoundError(f"Progress says k={k} completed but probe missing: {p}")
         m = LayerProbe(input_dim=input_dim, pooling_type=model_pooling).to(args.device)
@@ -361,7 +362,7 @@ def run_layer(
         max_cos = max_cos_to_previous(w.detach().cpu(), prev_w)
         bias_over_norm = float(b / (w_norm + 1e-12))
 
-        p_path = probe_path(run_dir, k)
+        p_path = probe_path(probes_dir, k)
         torch.save(trained_model.state_dict(), p_path)
 
         row = {
@@ -433,6 +434,12 @@ def main() -> int:
     parser.add_argument("--pooling", type=str, required=True)
     parser.add_argument("--method", type=str, default="projection", choices=["projection"])
     parser.add_argument("--output_root", type=str, default="results/orthogonal_probe_decomp")
+    parser.add_argument(
+        "--probes_output_root",
+        type=str,
+        default=None,
+        help="Optional separate root for probe checkpoints. Defaults to --output_root.",
+    )
     parser.add_argument("--run_id", type=str, default=None)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -473,9 +480,11 @@ def main() -> int:
     pair_slug = f"{source_name}__to__{target_name}"
     model_dir = model_to_dir(args.model)
     output_root = Path(args.output_root).resolve()
+    probes_output_root = Path(args.probes_output_root).resolve() if args.probes_output_root else output_root
 
     for layer in layers:
         run_dir = output_root / model_dir / pair_slug / pooling / f"layer_{layer}" / args.run_id
+        probes_dir = probes_output_root / model_dir / pair_slug / pooling / f"layer_{layer}" / args.run_id
         logger = init_logger(run_dir / "logs" / "run.log", verbose=bool(args.verbose))
         set_status(run_dir / "meta", args.run_id, state="running", current_step="load_data")
 
@@ -488,6 +497,9 @@ def main() -> int:
         logger.info("Train dir: %s", train_dir)
         logger.info("Val dir: %s", val_dir)
         logger.info("Target dir: %s", target_dir)
+        logger.info("Results root: %s", output_root)
+        logger.info("Probes root: %s", probes_output_root)
+        logger.info("Probes dir: %s", probes_dir)
 
         x_train, y_train, ids_train, train_type = load_split_layer_tensors(train_dir, layer=layer)
         x_val, y_val, ids_val, val_type = load_split_layer_tensors(val_dir, layer=layer)
@@ -516,6 +528,9 @@ def main() -> int:
                 "train_dir": str(train_dir),
                 "val_dir": str(val_dir),
                 "target_dir": str(target_dir),
+                "output_root": str(output_root),
+                "probes_output_root": str(probes_output_root),
+                "probes_dir": str(probes_dir),
                 "counts": {
                     "train": int(y_train.numel()),
                     "val": int(y_val.numel()),
@@ -546,6 +561,7 @@ def main() -> int:
                 args=args,
                 layer=layer,
                 run_dir=run_dir,
+                probes_dir=probes_dir,
                 logger=logger,
                 x_train=x_train,
                 y_train=y_train,
