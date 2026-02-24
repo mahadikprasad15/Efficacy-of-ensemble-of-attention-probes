@@ -349,11 +349,17 @@ def run_layer(
             batch_size=args.batch_size,
         )
 
-        target_metrics = evaluate_probe_with_projection(
+        target_metrics_resid = evaluate_probe_with_projection(
             model=trained_model,
             loader=target_loader,
             device=args.device,
             q_basis=q_basis,
+        )
+        target_metrics_raw = evaluate_probe_with_projection(
+            model=trained_model,
+            loader=target_loader,
+            device=args.device,
+            q_basis=None,
         )
 
         w, b = extract_probe_vector_and_bias(trained_model)
@@ -375,8 +381,15 @@ def run_layer(
             "auc_A_val": float(val_metrics["auc"]),
             "acc_A_val": float(val_metrics["accuracy"]),
             "best_epoch": int(val_metrics["best_epoch"]),
-            "auc_B_target": float(target_metrics["auc"]),
-            "acc_B_target": float(target_metrics["accuracy"]),
+            # Backward-compatible keys (residual/projection-space metrics).
+            "auc_B_target": float(target_metrics_resid["auc"]),
+            "acc_B_target": float(target_metrics_resid["accuracy"]),
+            "auc_B_target_resid": float(target_metrics_resid["auc"]),
+            "acc_B_target_resid": float(target_metrics_resid["accuracy"]),
+            # Raw OOD metrics on original activations (no projection removal).
+            "auc_B_target_raw": float(target_metrics_raw["auc"]),
+            "acc_B_target_raw": float(target_metrics_raw["accuracy"]),
+            "delta_auc_target_raw_minus_resid": float(target_metrics_raw["auc"] - target_metrics_resid["auc"]),
             "w_norm": w_norm,
             "bias": float(b),
             "bias_over_w_norm": bias_over_norm,
@@ -401,19 +414,28 @@ def run_layer(
 
     if rows:
         auc_a = [float(r["auc_A_val"]) for r in rows]
-        auc_b = [float(r["auc_B_target"]) for r in rows]
+        auc_b_resid = [float(r.get("auc_B_target_resid", r.get("auc_B_target", 0.5))) for r in rows]
+        auc_b_raw = [float(r.get("auc_B_target_raw", r.get("auc_B_target", 0.5))) for r in rows]
         summary = {
             "run_id": args.run_id,
             "layer": int(layer),
             "method": "projection",
             "k_completed": len(rows),
             "auc_A_val_curve": auc_a,
-            "auc_B_target_curve": auc_b,
-            "transfer_gap_curve": [a - b for a, b in zip(auc_a, auc_b)],
+            # Backward-compatible key (residual/projection-space target AUC).
+            "auc_B_target_curve": auc_b_resid,
+            "auc_B_target_curve_resid": auc_b_resid,
+            "auc_B_target_curve_raw": auc_b_raw,
+            "transfer_gap_curve": [a - b for a, b in zip(auc_a, auc_b_resid)],
+            "transfer_gap_curve_raw": [a - b for a, b in zip(auc_a, auc_b_raw)],
             "best_A_idx": int(np.argmax(np.asarray(auc_a)) + 1),
-            "best_B_idx": int(np.argmax(np.asarray(auc_b)) + 1),
+            "best_B_idx": int(np.argmax(np.asarray(auc_b_resid)) + 1),
+            "best_B_idx_resid": int(np.argmax(np.asarray(auc_b_resid)) + 1),
+            "best_B_idx_raw": int(np.argmax(np.asarray(auc_b_raw)) + 1),
             "best_A_auc": float(np.max(np.asarray(auc_a))),
-            "best_B_auc": float(np.max(np.asarray(auc_b))),
+            "best_B_auc": float(np.max(np.asarray(auc_b_resid))),
+            "best_B_auc_resid": float(np.max(np.asarray(auc_b_resid))),
+            "best_B_auc_raw": float(np.max(np.asarray(auc_b_raw))),
             "updated_at_utc": utc_now_iso(),
         }
         write_json(results_dir / "summary.json", summary)
