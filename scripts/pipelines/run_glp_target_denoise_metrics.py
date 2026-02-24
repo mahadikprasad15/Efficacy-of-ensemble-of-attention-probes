@@ -161,6 +161,20 @@ def resolve_run_dir(output_root: Path, target_dir: Path, layer: int, run_id: str
     )
 
 
+def run_is_completed(meta_dir: Path, results_dir: Path) -> bool:
+    results_path = results_dir / "results.json"
+    if not results_path.exists():
+        return False
+    status_path = meta_dir / "status.json"
+    if not status_path.exists():
+        return True
+    try:
+        status = read_json(status_path)
+    except Exception:
+        return False
+    return status.get("state") == "completed"
+
+
 def load_manifest_labels(target_dir: Path) -> Dict[str, int]:
     manifest_path = target_dir / "manifest.jsonl"
     if not manifest_path.exists():
@@ -296,6 +310,10 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
     logs_dir = run_dir / "logs"
     for d in [meta_dir, checkpoints_dir, results_dir, logs_dir]:
         ensure_dir(d)
+
+    if args.resume and run_is_completed(meta_dir, results_dir):
+        logger.info("Run already completed, skipping target: %s", target_dir)
+        return
 
     set_status(meta_dir, run_id, "running", "init")
 
