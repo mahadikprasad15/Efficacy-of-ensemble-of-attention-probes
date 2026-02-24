@@ -298,6 +298,9 @@ def run_layer(
     completed_k = {int(v) for v in progress.get("completed_k", [])}
     existing_rows = read_jsonl(per_probe_jsonl)
     existing_by_k = {int(r["k"]): r for r in existing_rows if "k" in r}
+    if bool(args.eval_only):
+        # Recompute eval rows from saved probes; do not carry stale metrics.
+        existing_by_k = {}
 
     input_dim = int(x_train.shape[-1])
     model_pooling = pooling
@@ -317,16 +320,17 @@ def run_layer(
 
     q_basis: Optional[torch.Tensor] = None
     prev_w: List[torch.Tensor] = []
-    for k in sorted(completed_k):
-        p = probe_path(probes_dir, k)
-        if not p.exists():
-            raise FileNotFoundError(f"Progress says k={k} completed but probe missing: {p}")
-        m = LayerProbe(input_dim=input_dim, pooling_type=model_pooling).to(args.device)
-        m.load_state_dict(torch.load(p, map_location=args.device, weights_only=True))
-        w, _ = extract_probe_vector_and_bias(m)
-        w = w.to(args.device)
-        q_basis, _ = update_q_basis(q_basis, w)
-        prev_w.append(w.detach().cpu())
+    if not bool(args.eval_only):
+        for k in sorted(completed_k):
+            p = probe_path(probes_dir, k)
+            if not p.exists():
+                raise FileNotFoundError(f"Progress says k={k} completed but probe missing: {p}")
+            m = LayerProbe(input_dim=input_dim, pooling_type=model_pooling).to(args.device)
+            m.load_state_dict(torch.load(p, map_location=args.device, weights_only=True))
+            w, _ = extract_probe_vector_and_bias(m)
+            w = w.to(args.device)
+            q_basis, _ = update_q_basis(q_basis, w)
+            prev_w.append(w.detach().cpu())
 
     val_loader = DataLoader(TensorDataset(x_val, y_val), batch_size=args.batch_size, shuffle=False, num_workers=0)
     target_loader = DataLoader(
