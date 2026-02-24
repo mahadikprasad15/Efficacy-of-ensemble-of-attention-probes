@@ -27,11 +27,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
 sys.path.append(os.path.join(os.getcwd(), "scripts", "utils"))
+sys.path.append(os.path.join(os.getcwd(), "actprobe", "src"))
+from actprobe.probes.models import LayerProbe  # noqa: E402
 from glp_runner import denoise_on_manifold, ensure_bsd, load_glp_artifacts  # noqa: E402
 
 
@@ -262,7 +264,95 @@ def load_selected_layer_activations(
     return x_bsd, labels, ordered_ids
 
 
-def resolve_probe_weight(probe_dir: Path, probe_layer: int) -> Tuple[np.ndarray, float, str]:
+def resolve_denoised_unit_dir(
+    denoised_output_root: Path,
+    target_dir: Path,
+    layer: int,
+    run_id: str,
+    dataset_suffix: str,
+    timestep: int,
+    seed: int,
+) -> Path:
+    split = target_dir.name
+    dataset = target_dir.parent.name
+    model_dir = target_dir.parent.parent.name
+    return (
+        denoised_output_root
+        / model_dir
+        / f"{dataset}{dataset_suffix}"
+        / split
+        / f"layer_{layer}"
+        / run_id
+        / f"t{timestep}_s{seed}"
+    )
+
+
+def denoised_unit_has_artifacts(denoised_unit_dir: Path) -> bool:
+    if not (denoised_unit_dir / "manifest.jsonl").exists():
+        return False
+    return any(denoised_unit_dir.glob("shard_*.safetensors"))
+
+
+def write_denoised_unit_activations(
+    denoised_unit_dir: Path,
+    sample_ids: Sequence[str],
+    labels: np.ndarray,
+    xprime_bsd: torch.Tensor,
+    shard_size: int,
+    manifest_fields: Dict[str, object],
+) -> None:
+    if xprime_bsd.ndim != 3:
+        raise ValueError(f"Expected xprime_bsd shape (B,S,D), got {tuple(xprime_bsd.shape)}")
+    if xprime_bsd.shape[0] != len(sample_ids):
+        raise ValueError(
+            f"Sample mismatch while saving denoised activations: x' has {xprime_bsd.shape[0]} rows, sample_ids has {len(sample_ids)}"
+        )
+    if labels.shape[0] != len(sample_ids):
+        raise ValueError(
+            f"Label mismatch while saving denoised activations: labels has {labels.shape[0]}, sample_ids has {len(sample_ids)}"
+        )
+    if shard_size <= 0:
+        raise ValueError(f"shard_size must be > 0, got {shard_size}")
+
+    ensure_dir(denoised_unit_dir)
+    for existing in denoised_unit_dir.glob("shard_*.safetensors"):
+        existing.unlink()
+
+    manifest_rows: List[dict] = []
+    xprime_bsd = xprime_bsd.detach().cpu().float()
+    total = int(xprime_bsd.shape[0])
+    shard_idx = 0
+    for b0 in range(0, total, int(shard_size)):
+        b1 = min(total, b0 + int(shard_size))
+        shard_tensors: Dict[str, torch.Tensor] = {}
+        for i in range(b0, b1):
+            sid = str(sample_ids[i])
+            shard_tensors[sid] = xprime_bsd[i].unsqueeze(0).contiguous()  # (1,S,D)
+            manifest_rows.append(
+                {
+                    "id": sid,
+                    "label": int(labels[i]),
+                    **manifest_fields,
+                }
+            )
+
+        shard_path = denoised_unit_dir / f"shard_{shard_idx:03d}.safetensors"
+        save_file(shard_tensors, str(shard_path))
+        shard_idx += 1
+
+    manifest_path = denoised_unit_dir / "manifest.jsonl"
+    with manifest_path.open("w") as f:
+        for row in manifest_rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def resolve_probe_model(
+    probe_dir: Path,
+    probe_layer: int,
+    probe_pooling: str,
+    input_dim: int,
+    device: str,
+) -> Tuple[LayerProbe, str]:
     probe_path = probe_dir / f"probe_layer_{probe_layer}.pt"
     if not probe_path.exists():
         raise FileNotFoundError(f"Missing probe file: {probe_path}")
@@ -270,24 +360,49 @@ def resolve_probe_weight(probe_dir: Path, probe_layer: int) -> Tuple[np.ndarray,
     state = torch.load(probe_path, map_location="cpu")
     if not isinstance(state, dict):
         raise ValueError(f"Unexpected probe checkpoint type for {probe_path}")
+    if "model_state_dict" in state and isinstance(state["model_state_dict"], dict):
+        state = state["model_state_dict"]
 
-    if "classifier.weight" in state:
-        w = state["classifier.weight"].reshape(-1).detach().cpu().numpy().astype(np.float32)
-        b = float(state.get("classifier.bias", torch.tensor([0.0])).reshape(-1)[0].item())
-        return w, b, str(probe_path)
+    if any(str(k).startswith("module.") for k in state.keys()):
+        state = {str(k).replace("module.", "", 1): v for k, v in state.items()}
 
-    if "linear.weight" in state:
-        w = state["linear.weight"].reshape(-1).detach().cpu().numpy().astype(np.float32)
-        b = float(state.get("linear.bias", torch.tensor([0.0])).reshape(-1)[0].item())
-        return w, b, str(probe_path)
+    probe = LayerProbe(input_dim=input_dim, pooling_type=probe_pooling).to(device)
+    try:
+        probe.load_state_dict(state, strict=True)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Failed to load probe checkpoint {probe_path} with pooling '{probe_pooling}'. "
+            "Pass the pooling used at training time via --probe_pooling."
+        ) from e
+    probe.eval()
+    return probe, str(probe_path)
 
-    # Fallback: first 2D weight matrix in state dict.
-    for key, value in state.items():
-        if isinstance(value, torch.Tensor) and value.ndim == 2:
-            w = value.reshape(-1).detach().cpu().numpy().astype(np.float32)
-            return w, 0.0, str(probe_path)
 
-    raise ValueError(f"Could not extract probe direction from {probe_path}")
+def probe_outputs(
+    probe: LayerProbe,
+    x_bsd: torch.Tensor,
+    batch_size: int,
+    device: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    pooled_chunks: List[np.ndarray] = []
+    logits_chunks: List[np.ndarray] = []
+    n = int(x_bsd.shape[0])
+    with torch.no_grad():
+        for b0 in range(0, n, int(batch_size)):
+            b1 = min(n, b0 + int(batch_size))
+            xb = x_bsd[b0:b1].to(device)
+            pooled = probe.pooling(xb)
+            if pooled.ndim != 2:
+                raise ValueError(
+                    "Probe pooling produced non-2D features. "
+                    "If using --probe_pooling none, activations must have sequence length 1."
+                )
+            logits = probe.classifier(pooled).reshape(-1)
+            pooled_chunks.append(pooled.detach().cpu().numpy().astype(np.float32))
+            logits_chunks.append(logits.detach().cpu().numpy().astype(np.float32))
+    pooled_np = np.concatenate(pooled_chunks, axis=0) if pooled_chunks else np.zeros((0, 0), dtype=np.float32)
+    logits_np = np.concatenate(logits_chunks, axis=0) if logits_chunks else np.zeros((0,), dtype=np.float32)
+    return pooled_np, logits_np
 
 
 def class_cov_trace(x: np.ndarray) -> float:
@@ -348,8 +463,13 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
             "sample_seed": int(args.sample_seed),
             "batch_size": int(args.batch_size),
             "device": args.device,
+            "probe_pooling": args.probe_pooling,
+            "save_denoised_activations": bool(args.save_denoised_activations),
+            "denoised_output_root": str(Path(args.denoised_output_root).resolve()),
+            "denoised_dataset_suffix": args.denoised_dataset_suffix,
+            "denoised_shard_size": int(args.denoised_shard_size),
             "resume": bool(args.resume),
-            "note": "Metrics computed on token-mean pooled vectors for direction/separation; delta_norm from token-level tensors.",
+            "note": "Probe metrics/separation use probe pooling; delta_norm from token-level tensors.",
         },
     }
     write_json(meta_dir / "run_manifest.json", manifest)
@@ -373,18 +493,30 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
         layer=int(args.layer),
     )
     logger.info("Loaded activations shape: %s (B,S,D)", tuple(x_bsd.shape))
+    n = int(x_bsd.shape[0])
 
     set_status(meta_dir, run_id, "running", "load_probe")
-    probe_w, probe_b, probe_path = resolve_probe_weight(Path(args.probe_dir), int(args.probe_layer))
     d_model = int(x_bsd.shape[-1])
+    probe, probe_path = resolve_probe_model(
+        probe_dir=Path(args.probe_dir),
+        probe_layer=int(args.probe_layer),
+        probe_pooling=str(args.probe_pooling),
+        input_dim=d_model,
+        device=args.device,
+    )
+    probe_w = probe.classifier.weight.detach().cpu().numpy().reshape(-1).astype(np.float32)
     if probe_w.shape[0] != d_model:
         raise ValueError(
             f"Probe dim mismatch: probe weight dim {probe_w.shape[0]} vs activation dim {d_model}"
         )
     probe_w_hat = probe_w / (np.linalg.norm(probe_w) + 1e-8)
 
-    pooled_x = x_bsd.mean(dim=1).numpy()  # (B,D)
-    orig_logits = pooled_x @ probe_w + probe_b
+    pooled_x, orig_logits = probe_outputs(
+        probe=probe,
+        x_bsd=x_bsd,
+        batch_size=int(args.batch_size),
+        device=args.device,
+    )
     orig_auc = safe_auc(labels, orig_logits)
 
     set_status(meta_dir, run_id, "running", "load_glp")
@@ -398,7 +530,7 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
     timesteps = parse_timesteps(args.num_timesteps)
     num_seeds = int(args.num_seeds)
     batch_size = int(args.batch_size)
-    n = int(x_bsd.shape[0])
+    denoised_root = Path(args.denoised_output_root).resolve()
 
     all_per_sample_rows: List[dict] = []
     all_stability_rows: List[dict] = []
@@ -420,7 +552,21 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
         for seed in range(num_seeds):
             unit_key = f"t{t}_s{seed}"
             ckpt_npz = checkpoints_dir / f"{unit_key}.npz"
-            if unit_key in completed and ckpt_npz.exists() and args.resume:
+            unit_denoised_dir = resolve_denoised_unit_dir(
+                denoised_output_root=denoised_root,
+                target_dir=target_dir,
+                layer=int(args.layer),
+                run_id=run_id,
+                dataset_suffix=str(args.denoised_dataset_suffix),
+                timestep=int(t),
+                seed=int(seed),
+            )
+            can_resume_unit = unit_key in completed and ckpt_npz.exists() and args.resume
+            if can_resume_unit and bool(args.save_denoised_activations) and not denoised_unit_has_artifacts(unit_denoised_dir):
+                logger.info("Checkpoint exists but denoised artifacts missing for %s; rerunning unit.", unit_key)
+                can_resume_unit = False
+
+            if can_resume_unit:
                 blob = np.load(ckpt_npz, allow_pickle=False)
                 pooled_prime_by_seed[seed] = blob["pooled_x_prime"].astype(np.float32)
                 delta_norm_by_seed[seed] = blob["delta_norm"].astype(np.float32)
@@ -436,6 +582,7 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
             delta_norm_chunks: List[np.ndarray] = []
             delta_parallel_chunks: List[np.ndarray] = []
             logits_chunks: List[np.ndarray] = []
+            xprime_chunks: List[torch.Tensor] = []
             start_timestep_value: Optional[float] = None
 
             unit_pbar = tqdm(total=n, desc=f"{unit_key} samples", unit="sample", leave=False)
@@ -453,13 +600,23 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
                 )
                 delta = x_prime - xb
                 delta_norm = torch.linalg.vector_norm(delta.reshape(delta.shape[0], -1), dim=1).detach().cpu().numpy()
-                pooled_prime = x_prime.mean(dim=1).detach().cpu().numpy()
+                with torch.no_grad():
+                    pooled_prime_t = probe.pooling(x_prime)
+                    if pooled_prime_t.ndim != 2:
+                        raise ValueError(
+                            "Probe pooling produced non-2D denoised features. "
+                            "If using --probe_pooling none, activations must have sequence length 1."
+                        )
+                    logits_prime_t = probe.classifier(pooled_prime_t).reshape(-1)
+                pooled_prime = pooled_prime_t.detach().cpu().numpy()
+                logits_prime = logits_prime_t.detach().cpu().numpy()
 
                 pooled_out_chunks.append(pooled_prime.astype(np.float32))
                 delta_norm_chunks.append(delta_norm.astype(np.float32))
+                if bool(args.save_denoised_activations):
+                    xprime_chunks.append(x_prime.detach().cpu().float())
 
                 d_parallel = (pooled_prime - pooled_x[b0:b1]) @ probe_w_hat
-                logits_prime = pooled_prime @ probe_w + probe_b
                 delta_parallel_chunks.append(d_parallel.astype(np.float32))
                 logits_chunks.append(logits_prime.astype(np.float32))
                 unit_pbar.update(b1 - b0)
@@ -475,6 +632,32 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
             delta_parallel_by_seed[seed] = delta_parallel_arr
             logits_prime_by_seed[seed] = logits_prime_arr
             start_timestep_values[seed] = start_timestep_value
+
+            if bool(args.save_denoised_activations):
+                xprime_bsd = torch.cat(xprime_chunks, dim=0)
+                denoised_fields: Dict[str, object] = {
+                    "source_target_dir": str(target_dir),
+                    "source_layer": int(args.layer),
+                    "source_probe_dir": str(Path(args.probe_dir).resolve()),
+                    "source_probe_layer": int(args.probe_layer),
+                    "source_probe_pooling": str(args.probe_pooling),
+                    "run_id": run_id,
+                    "num_timesteps": int(t),
+                    "start_timestep_mode": str(args.start_timestep_mode),
+                    "start_timestep_value": None if start_timestep_value is None else float(start_timestep_value),
+                    "noise_scale": float(args.noise_scale),
+                    "seed": int(seed),
+                    "is_denoised": True,
+                    "created_at_utc": utc_now_iso(),
+                }
+                write_denoised_unit_activations(
+                    denoised_unit_dir=unit_denoised_dir,
+                    sample_ids=sample_ids,
+                    labels=labels,
+                    xprime_bsd=xprime_bsd,
+                    shard_size=int(args.denoised_shard_size),
+                    manifest_fields=denoised_fields,
+                )
 
             np.savez_compressed(
                 ckpt_npz,
@@ -528,6 +711,7 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
             "start_timestep_mode": args.start_timestep_mode,
             "start_timestep_values": {str(k): (None if v is None else float(v)) for k, v in start_timestep_values.items()},
             "noise_scale": float(args.noise_scale),
+            "probe_pooling": str(args.probe_pooling),
             "num_seeds": num_seeds,
             "num_samples": n,
             "auc_x": float(orig_auc),
@@ -551,6 +735,7 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
                 "num_timesteps": int(t),
                 "start_timestep_mode": args.start_timestep_mode,
                 "noise_scale": float(args.noise_scale),
+                "probe_pooling": str(args.probe_pooling),
                 "num_seeds": int(num_seeds),
                 "num_samples": int(n),
                 "auc_x": float(orig_auc),
@@ -636,11 +821,15 @@ def run_target_experiment(args: argparse.Namespace, target_dir: Path, logger: lo
         "probe_path": probe_path,
         "layer": int(args.layer),
         "probe_layer": int(args.probe_layer),
+        "probe_pooling": str(args.probe_pooling),
         "timesteps": timesteps,
         "start_timestep_mode": args.start_timestep_mode,
         "noise_scale": float(args.noise_scale),
         "num_seeds": int(args.num_seeds),
         "num_samples": int(n),
+        "save_denoised_activations": bool(args.save_denoised_activations),
+        "denoised_output_root": str(denoised_root),
+        "denoised_dataset_suffix": str(args.denoised_dataset_suffix),
         "results_by_timestep": results_by_timestep,
     }
     write_json(results_dir / "results.json", results_payload)
@@ -656,6 +845,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_dir", type=str, action="append", required=True, help="Target activations split dir. Repeatable.")
     parser.add_argument("--probe_dir", type=str, required=True, help="Directory containing probe_layer_*.pt")
     parser.add_argument("--probe_layer", type=int, default=7, help="Probe layer index for direction extraction")
+    parser.add_argument(
+        "--probe_pooling",
+        type=str,
+        default="mean",
+        choices=["mean", "max", "last", "attn", "none"],
+        help="Pooling used by the probe checkpoint.",
+    )
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct", help="Model name for metadata")
     parser.add_argument("--glp_model", type=str, default="generative-latent-prior/glp-llama1b-d12")
     parser.add_argument("--glp_checkpoint", type=str, default="final")
@@ -668,6 +864,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample_seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--output_root", type=str, default="results/GLP_Experiments")
+    parser.add_argument("--save_denoised_activations", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--denoised_output_root", type=str, default="data/activations_fullprompt")
+    parser.add_argument("--denoised_dataset_suffix", type=str, default="-denoised")
+    parser.add_argument("--denoised_shard_size", type=int, default=256)
     parser.add_argument("--run_id", type=str, default="pilot")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")

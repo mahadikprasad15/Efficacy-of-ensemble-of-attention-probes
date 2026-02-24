@@ -136,6 +136,7 @@ def extract_summary_rows(run_id: str, target_dir: Path, results: Dict) -> List[D
                 "num_timesteps": payload.get("num_timesteps"),
                 "start_timestep_mode": payload.get("start_timestep_mode"),
                 "start_timestep_value_mean": mean_start_timestep(start_vals),
+                "probe_pooling": payload.get("probe_pooling"),
                 "noise_scale": payload.get("noise_scale"),
                 "num_seeds": payload.get("num_seeds"),
                 "num_samples": payload.get("num_samples"),
@@ -164,6 +165,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_dir", type=str, action="append", required=True, help="Target activations split dir. Repeatable.")
     parser.add_argument("--probe_dir", type=str, required=True, help="Directory containing probe_layer_*.pt")
     parser.add_argument("--probe_layer", type=int, default=7)
+    parser.add_argument(
+        "--probe_pooling",
+        type=str,
+        default="mean",
+        choices=["mean", "max", "last", "attn", "none"],
+        help="Pooling used by the probe checkpoint.",
+    )
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
     parser.add_argument("--glp_model", type=str, default="generative-latent-prior/glp-llama1b-d12")
     parser.add_argument("--glp_checkpoint", type=str, default="final")
@@ -177,6 +185,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample_seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--output_root", type=str, default="results/GLP_Experiments")
+    parser.add_argument("--save_denoised_activations", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--denoised_output_root", type=str, default="data/activations_fullprompt")
+    parser.add_argument("--denoised_dataset_suffix", type=str, default="-denoised")
+    parser.add_argument("--denoised_shard_size", type=int, default=256)
     parser.add_argument("--run_id_prefix", type=str, default="sweep")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", type=str, default="cuda")
@@ -216,6 +228,7 @@ def main() -> int:
             "target_dirs": [str(t) for t in target_dirs],
             "probe_dir": str(Path(args.probe_dir).resolve()),
             "probe_layer": int(args.probe_layer),
+            "probe_pooling": str(args.probe_pooling),
         },
         "config": {
             "model": args.model,
@@ -229,6 +242,10 @@ def main() -> int:
             "max_samples": int(args.max_samples),
             "sample_seed": int(args.sample_seed),
             "batch_size": int(args.batch_size),
+            "save_denoised_activations": bool(args.save_denoised_activations),
+            "denoised_output_root": str(Path(args.denoised_output_root).resolve()),
+            "denoised_dataset_suffix": str(args.denoised_dataset_suffix),
+            "denoised_shard_size": int(args.denoised_shard_size),
             "device": args.device,
         },
     }
@@ -275,6 +292,8 @@ def main() -> int:
                     args.probe_dir,
                     "--probe_layer",
                     str(args.probe_layer),
+                    "--probe_pooling",
+                    str(args.probe_pooling),
                     "--model",
                     args.model,
                     "--glp_model",
@@ -299,11 +318,21 @@ def main() -> int:
                     str(args.batch_size),
                     "--output_root",
                     args.output_root,
+                    "--denoised_output_root",
+                    args.denoised_output_root,
+                    "--denoised_dataset_suffix",
+                    args.denoised_dataset_suffix,
+                    "--denoised_shard_size",
+                    str(args.denoised_shard_size),
                     "--run_id",
                     run_id,
                     "--device",
                     args.device,
                 ]
+                if bool(args.save_denoised_activations):
+                    cmd.append("--save_denoised_activations")
+                else:
+                    cmd.append("--no-save_denoised_activations")
                 if args.resume:
                     cmd.append("--resume")
                 else:
