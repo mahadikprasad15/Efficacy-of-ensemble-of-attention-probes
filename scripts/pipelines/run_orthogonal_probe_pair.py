@@ -75,6 +75,13 @@ def append_jsonl(path: Path, row: dict) -> None:
         f.write(json.dumps(row) + "\n")
 
 
+def write_jsonl_rows(path: Path, rows: Sequence[dict]) -> None:
+    ensure_dir(path.parent)
+    with path.open("w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
 def read_jsonl(path: Path) -> List[dict]:
     if not path.exists():
         return []
@@ -326,7 +333,87 @@ def run_layer(
         TensorDataset(x_target, y_target), batch_size=args.batch_size, shuffle=False, num_workers=0
     )
 
+    if bool(args.eval_only):
+        logger.info("Eval-only mode: loading saved probes and recomputing metrics; no training.")
+        for k in range(1, args.k_probes + 1):
+            p = probe_path(probes_dir, k)
+            if not p.exists():
+                logger.warning("Skipping k=%d: probe not found at %s", k, p)
+                continue
+
+            set_status(meta_dir, args.run_id, state="running", current_step=f"layer_{layer}_eval_k_{k}")
+            model = LayerProbe(input_dim=input_dim, pooling_type=model_pooling).to(args.device)
+            model.load_state_dict(torch.load(p, map_location=args.device, weights_only=True))
+
+            val_metrics_resid = evaluate_probe_with_projection(
+                model=model,
+                loader=val_loader,
+                device=args.device,
+                q_basis=q_basis,
+            )
+            target_metrics_resid = evaluate_probe_with_projection(
+                model=model,
+                loader=target_loader,
+                device=args.device,
+                q_basis=q_basis,
+            )
+            val_metrics_raw = evaluate_probe_with_projection(
+                model=model,
+                loader=val_loader,
+                device=args.device,
+                q_basis=None,
+            )
+            target_metrics_raw = evaluate_probe_with_projection(
+                model=model,
+                loader=target_loader,
+                device=args.device,
+                q_basis=None,
+            )
+
+            w, b = extract_probe_vector_and_bias(model)
+            w = w.to(args.device)
+            w_norm = float(torch.linalg.vector_norm(w).item())
+            max_cos = max_cos_to_previous(w.detach().cpu(), prev_w)
+            bias_over_norm = float(b / (w_norm + 1e-12))
+
+            row = {
+                "timestamp_utc": utc_now_iso(),
+                "run_id": args.run_id,
+                "layer": int(layer),
+                "k": int(k),
+                "method": "projection",
+                "pooling": model_pooling,
+                "eval_only": True,
+                "auc_A_val": float(val_metrics_resid["auc"]),
+                "acc_A_val": float(val_metrics_resid["accuracy"]),
+                "auc_A_val_resid": float(val_metrics_resid["auc"]),
+                "acc_A_val_resid": float(val_metrics_resid["accuracy"]),
+                "auc_A_val_raw": float(val_metrics_raw["auc"]),
+                "acc_A_val_raw": float(val_metrics_raw["accuracy"]),
+                "best_epoch": None,
+                "auc_B_target": float(target_metrics_resid["auc"]),
+                "acc_B_target": float(target_metrics_resid["accuracy"]),
+                "auc_B_target_resid": float(target_metrics_resid["auc"]),
+                "acc_B_target_resid": float(target_metrics_resid["accuracy"]),
+                "auc_B_target_raw": float(target_metrics_raw["auc"]),
+                "acc_B_target_raw": float(target_metrics_raw["accuracy"]),
+                "delta_auc_target_raw_minus_resid": float(target_metrics_raw["auc"] - target_metrics_resid["auc"]),
+                "w_norm": w_norm,
+                "bias": float(b),
+                "bias_over_w_norm": bias_over_norm,
+                "max_cos_prev": float(max_cos),
+                "probe_path": str(p),
+            }
+            existing_by_k[k] = row
+
+            q_basis, residual_norm = update_q_basis(q_basis, w)
+            if residual_norm < 1e-8:
+                logger.warning("Layer %d k=%d residual norm near zero after orthogonalization.", layer, k)
+            prev_w.append(w.detach().cpu())
+
     for k in range(1, args.k_probes + 1):
+        if bool(args.eval_only):
+            break
         if k in completed_k:
             continue
 
@@ -410,6 +497,7 @@ def run_layer(
         write_json(progress_path, progress)
 
     rows = [existing_by_k[k] for k in sorted(existing_by_k.keys())]
+    write_jsonl_rows(per_probe_jsonl, rows)
     write_csv(per_probe_csv, rows)
 
     if rows:
@@ -463,6 +551,12 @@ def main() -> int:
         help="Optional separate root for probe checkpoints. Defaults to --output_root.",
     )
     parser.add_argument("--run_id", type=str, default=None)
+    parser.add_argument(
+        "--eval_only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Only evaluate saved probes (no training). Requires probe checkpoints in probes_output_root path.",
+    )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -575,6 +669,7 @@ def main() -> int:
                     "batch_size": int(args.batch_size),
                     "seed": int(args.seed),
                 },
+                "eval_only": bool(args.eval_only),
             },
         )
 
