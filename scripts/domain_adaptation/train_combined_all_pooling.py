@@ -72,6 +72,20 @@ class AttentionPoolingProbe(nn.Module):
         return self.classifier(pooled).squeeze(-1)
 
 
+def parse_poolings(poolings_arg: str):
+    """Parse comma-separated pooling list."""
+    if not poolings_arg:
+        return POOLING_TYPES
+    vals = [p.strip().lower() for p in poolings_arg.split(',') if p.strip()]
+    out = []
+    for p in vals:
+        if p not in POOLING_TYPES:
+            raise ValueError(f"Unknown pooling '{p}'. Allowed: {POOLING_TYPES}")
+        if p not in out:
+            out.append(p)
+    return out or POOLING_TYPES
+
+
 # ============================================================================
 # DATA LOADING
 # ============================================================================
@@ -237,14 +251,15 @@ def plot_layerwise_auc(
     domain_key: str,
     output_path: str,
     label_a: str,
-    label_b: str
+    label_b: str,
+    pooling_types: List[str]
 ):
     """Plot AUC vs Layer for all pooling types for one domain."""
     fig, ax = plt.subplots(figsize=(12, 6))
     
     best_overall = {'auc': 0, 'pooling': None, 'layer': None}
     
-    for pooling in POOLING_TYPES:
+    for pooling in pooling_types:
         if pooling not in results:
             continue
         
@@ -301,12 +316,13 @@ def plot_bar_comparison(
     results: Dict[str, List[Dict]], 
     output_path: str,
     label_a: str,
-    label_b: str
+    label_b: str,
+    pooling_types: List[str]
 ):
     """Create side-by-side bar plots comparing best AUC per pooling for both domains."""
     fig, ax = plt.subplots(figsize=(12, 7))
     
-    x = np.arange(len(POOLING_TYPES))
+    x = np.arange(len(pooling_types))
     width = 0.35
     
     aucs_a = []
@@ -314,7 +330,7 @@ def plot_bar_comparison(
     best_layers_a = []
     best_layers_b = []
     
-    for pooling in POOLING_TYPES:
+    for pooling in pooling_types:
         if pooling in results:
             # Find best layer for each domain
             best_a = max(results[pooling], key=lambda r: r['auc_a'])
@@ -355,7 +371,7 @@ def plot_bar_comparison(
     ax.set_title('Combined Training: Best Layer AUC per Pooling Strategy\n(Separate Evaluation on Each Domain)', 
                  fontsize=14, fontweight='bold')
     ax.set_xticks(x)
-    ax.set_xticklabels([p.upper() for p in POOLING_TYPES])
+    ax.set_xticklabels([p.upper() for p in pooling_types])
     ax.legend(loc='upper right', fontsize=11)
     ax.set_ylim(0.4, 1.05)
     ax.grid(True, alpha=0.3, axis='y')
@@ -371,7 +387,8 @@ def plot_combined_layerwise(
     results: Dict[str, List[Dict]], 
     output_path: str,
     label_a: str,
-    label_b: str
+    label_b: str,
+    pooling_types: List[str]
 ):
     """Create a 2-panel plot with both domains side by side."""
     fig, axes = plt.subplots(1, 2, figsize=(18, 7))
@@ -379,7 +396,7 @@ def plot_combined_layerwise(
     for ax, (domain_key, domain_label) in zip(axes, [('auc_a', label_a), ('auc_b', label_b)]):
         best_overall = {'auc': 0, 'pooling': None, 'layer': None}
         
-        for pooling in POOLING_TYPES:
+        for pooling in pooling_types:
             if pooling not in results:
                 continue
             
@@ -438,6 +455,12 @@ def main():
     parser.add_argument('--probes_dir', type=str, default=None, help='Directory to save probes (default: {output_dir}/probes)')
     parser.add_argument('--model', type=str, default='meta-llama_Llama-3.2-3B-Instruct', help='Model name for probe dir structure')
     parser.add_argument(
+        '--poolings',
+        type=str,
+        default='mean,max,last,attn',
+        help='Comma-separated pooling list (subset of mean,max,last,attn)'
+    )
+    parser.add_argument(
         '--combined_probe_name',
         type=str,
         default='Deception-Combined',
@@ -453,6 +476,7 @@ def main():
     # Set probes_dir default
     if args.probes_dir is None:
         args.probes_dir = os.path.join(args.output_dir, 'probes')
+    active_poolings = parse_poolings(args.poolings)
     
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -470,12 +494,12 @@ def main():
     print(f"Device: {device}")
     print(f"Domains: {args.label_a} + {args.label_b}")
     print(f"Layers: {layers}")
-    print(f"Pooling types: {POOLING_TYPES}")
+    print(f"Pooling types: {active_poolings}")
     print(f"Epochs: {args.epochs}")
     print("=" * 70)
     
     # Results storage
-    all_results = {pooling: [] for pooling in POOLING_TYPES}
+    all_results = {pooling: [] for pooling in active_poolings}
     
     # Train for each layer
     for layer in tqdm(layers, desc="Processing layers"):
@@ -496,7 +520,7 @@ def main():
         y_train_combined = np.concatenate([y_train_a, y_train_b])
         
         # Train each pooling type
-        for pooling in POOLING_TYPES:
+        for pooling in active_poolings:
             print(f"  Training {pooling.upper()} pooling...")
             
             # Apply pooling (except for attn which keeps sequence)
@@ -551,28 +575,28 @@ def main():
     plot_layerwise_auc(
         all_results, args.label_a, 'auc_a',
         os.path.join(args.output_dir, f'layerwise_auc_{args.label_a}.png'),
-        args.label_a, args.label_b
+        args.label_a, args.label_b, active_poolings
     )
     
     # Plot 2: Layerwise AUC for Domain B
     plot_layerwise_auc(
         all_results, args.label_b, 'auc_b',
         os.path.join(args.output_dir, f'layerwise_auc_{args.label_b}.png'),
-        args.label_a, args.label_b
+        args.label_a, args.label_b, active_poolings
     )
     
     # Plot 3: Combined side-by-side layerwise
     plot_combined_layerwise(
         all_results,
         os.path.join(args.output_dir, 'layerwise_auc_combined.png'),
-        args.label_a, args.label_b
+        args.label_a, args.label_b, active_poolings
     )
     
     # Plot 4: Bar comparison of best layers
     plot_bar_comparison(
         all_results,
         os.path.join(args.output_dir, 'bar_comparison_best_layer.png'),
-        args.label_a, args.label_b
+        args.label_a, args.label_b, active_poolings
     )
     
     # ========================================================================
@@ -585,7 +609,7 @@ def main():
     print("-" * 70)
     
     summary = {}
-    for pooling in POOLING_TYPES:
+    for pooling in active_poolings:
         if pooling not in all_results or not all_results[pooling]:
             continue
         
