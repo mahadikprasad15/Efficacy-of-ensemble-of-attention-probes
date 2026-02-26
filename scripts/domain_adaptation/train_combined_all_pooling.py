@@ -142,28 +142,35 @@ def train_probe(
         - acc_a: Accuracy on domain A validation
         - acc_b: Accuracy on domain B validation
     """
+    # Use float32 arrays for stable statistics/normalization.
+    X_train = X_train.astype(np.float32, copy=False)
+    X_val_a = X_val_a.astype(np.float32, copy=False)
+    X_val_b = X_val_b.astype(np.float32, copy=False)
+
     # Handle attention pooling differently
     if pooling == 'attn':
         # X is (N, T, D)
         N, T, D = X_train.shape
         model = AttentionPoolingProbe(D).to(device)
         
-        # Normalize along feature dimension
-        mean = X_train.mean(axis=(0, 1))
-        std = X_train.std(axis=(0, 1)) + 1e-8
-        X_train_n = (X_train - mean) / std
-        X_val_a_n = (X_val_a - mean) / std
-        X_val_b_n = (X_val_b - mean) / std
+        # Normalize along feature dimension with higher-precision reduction.
+        mean = X_train.mean(axis=(0, 1), dtype=np.float64).astype(np.float32)
+        std = X_train.std(axis=(0, 1), dtype=np.float64).astype(np.float32)
+        std = np.clip(std, 1e-6, None)
+        X_train_n = np.nan_to_num((X_train - mean) / std, nan=0.0, posinf=0.0, neginf=0.0)
+        X_val_a_n = np.nan_to_num((X_val_a - mean) / std, nan=0.0, posinf=0.0, neginf=0.0)
+        X_val_b_n = np.nan_to_num((X_val_b - mean) / std, nan=0.0, posinf=0.0, neginf=0.0)
     else:
         # X is (N, D)
         D = X_train.shape[1]
         model = LinearProbe(D).to(device)  # Use LINEAR probe, not MLP!
         
-        mean = X_train.mean(axis=0)
-        std = X_train.std(axis=0) + 1e-8
-        X_train_n = (X_train - mean) / std
-        X_val_a_n = (X_val_a - mean) / std
-        X_val_b_n = (X_val_b - mean) / std
+        mean = X_train.mean(axis=0, dtype=np.float64).astype(np.float32)
+        std = X_train.std(axis=0, dtype=np.float64).astype(np.float32)
+        std = np.clip(std, 1e-6, None)
+        X_train_n = np.nan_to_num((X_train - mean) / std, nan=0.0, posinf=0.0, neginf=0.0)
+        X_val_a_n = np.nan_to_num((X_val_a - mean) / std, nan=0.0, posinf=0.0, neginf=0.0)
+        X_val_b_n = np.nan_to_num((X_val_b - mean) / std, nan=0.0, posinf=0.0, neginf=0.0)
     
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.BCEWithLogitsLoss()
