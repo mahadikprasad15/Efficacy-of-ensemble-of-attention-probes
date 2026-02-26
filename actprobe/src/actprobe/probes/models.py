@@ -3,9 +3,20 @@ Full Probe Model.
 Combines Pooling -> Classifier.
 """
 
+from typing import Optional, Sequence
+
 import torch
 import torch.nn as nn
-from .pooling import MeanPooling, MaxPooling, LastTokenPooling, LearnedAttentionPooling
+from .pooling import (
+    MeanPooling,
+    MaxPooling,
+    LastTokenPooling,
+    LearnedAttentionPooling,
+    GMHAAttentionPooling,
+    MultiMaxPooling,
+    RollingAttentionPooling,
+    RMSNorm1D,
+)
 
 
 class IdentityPooling(nn.Module):
@@ -22,7 +33,7 @@ POOLING_MAP = {
     "max": MaxPooling,
     "last": LastTokenPooling,
     "attn": LearnedAttentionPooling,
-    "none": IdentityPooling
+    "none": IdentityPooling,
 }
 
 class LayerProbe(nn.Module):
@@ -47,6 +58,187 @@ class LayerProbe(nn.Module):
         pooled = self.pooling(x) # (B, D)
         logits = self.classifier(pooled) # (B, 1)
         return logits
+
+
+class MultiAttentionProbe(nn.Module):
+    """
+    Multi-head attention probe for a single layer input.
+
+    Input: (B, T, D)
+    Output:
+      - (B, 1) for binary tasks (num_classes=1)
+      - (B, C) for multiclass tasks
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_heads: int = 8,
+        num_classes: int = 1,
+        variant: str = "gmha",
+        topk_tokens: int = 4,
+        rolling_window: int = 64,
+        rolling_stride: int = 32,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.num_heads = num_heads
+        self.num_classes = num_classes
+        self.variant = variant
+
+        if variant == "gmha":
+            self.pooling = GMHAAttentionPooling(input_dim=input_dim, num_heads=num_heads)
+        elif variant == "multimax":
+            self.pooling = MultiMaxPooling(
+                input_dim=input_dim,
+                num_heads=num_heads,
+                topk_tokens=topk_tokens,
+            )
+        elif variant == "rolling":
+            self.pooling = RollingAttentionPooling(
+                input_dim=input_dim,
+                num_heads=num_heads,
+                window_size=rolling_window,
+                stride=rolling_stride,
+            )
+        else:
+            raise ValueError(f"Unsupported variant: {variant}")
+
+        out_dim = 1 if num_classes <= 1 else num_classes
+        self.classifier = nn.Linear(input_dim, out_dim)
+
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        pooled = self.pooling(x, attention_mask=attention_mask)
+        return self.classifier(pooled)
+
+
+class MultiLayerMultiAttentionProbe(nn.Module):
+    """
+    Multi-layer attention probe with per-layer RMSNorm and L*T flattening.
+
+    Input: (B, L, T, D)
+    Process:
+      1) select input layers
+      2) per-layer RMSNorm
+      3) reshape B,L,T,D -> B,(L*T),D
+      4) multi-head attention pooling + classifier
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        input_layers: Sequence[int],
+        num_heads: int = 8,
+        num_classes: int = 1,
+        variant: str = "gmha",
+        topk_tokens: int = 4,
+        rolling_window: int = 64,
+        rolling_stride: int = 32,
+    ):
+        super().__init__()
+        if not input_layers:
+            raise ValueError("input_layers must be non-empty for multi-layer probe")
+
+        self.input_dim = input_dim
+        self.input_layers = [int(x) for x in input_layers]
+        self.num_heads = num_heads
+        self.num_classes = num_classes
+        self.variant = variant
+        self.norms = nn.ModuleList([RMSNorm1D(input_dim) for _ in self.input_layers])
+
+        if variant == "gmha":
+            self.pooling = GMHAAttentionPooling(input_dim=input_dim, num_heads=num_heads)
+        elif variant == "multimax":
+            self.pooling = MultiMaxPooling(
+                input_dim=input_dim,
+                num_heads=num_heads,
+                topk_tokens=topk_tokens,
+            )
+        elif variant == "rolling":
+            self.pooling = RollingAttentionPooling(
+                input_dim=input_dim,
+                num_heads=num_heads,
+                window_size=rolling_window,
+                stride=rolling_stride,
+            )
+        else:
+            raise ValueError(f"Unsupported variant: {variant}")
+
+        out_dim = 1 if num_classes <= 1 else num_classes
+        self.classifier = nn.Linear(input_dim, out_dim)
+
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # x: (B, L, T, D)
+        if x.dim() != 4:
+            raise ValueError(f"Expected x with shape (B,L,T,D), got {tuple(x.shape)}")
+
+        selected = []
+        masks = []
+        for idx, layer in enumerate(self.input_layers):
+            x_layer = x[:, layer, :, :]  # (B, T, D)
+            selected.append(self.norms[idx](x_layer))
+            if attention_mask is not None:
+                if attention_mask.dim() == 3:
+                    masks.append(attention_mask[:, layer, :])
+                else:
+                    masks.append(attention_mask)
+
+        x_cat = torch.stack(selected, dim=1)  # (B, Ls, T, D)
+        bsz, ls, seq_len, dim = x_cat.shape
+        x_cat = x_cat.view(bsz, ls * seq_len, dim)  # (B, Ls*T, D)
+
+        attn_mask_cat = None
+        if masks:
+            attn_mask_cat = torch.stack(masks, dim=1).view(bsz, ls * seq_len)
+
+        pooled = self.pooling(x_cat, attention_mask=attn_mask_cat)
+        return self.classifier(pooled)
+
+
+class GMHAAttentionProbe(MultiAttentionProbe):
+    def __init__(self, input_dim: int, num_heads: int = 8, num_classes: int = 1):
+        super().__init__(
+            input_dim=input_dim,
+            num_heads=num_heads,
+            num_classes=num_classes,
+            variant="gmha",
+        )
+
+
+class MultiMaxProbe(MultiAttentionProbe):
+    def __init__(
+        self,
+        input_dim: int,
+        num_heads: int = 8,
+        num_classes: int = 1,
+        topk_tokens: int = 4,
+    ):
+        super().__init__(
+            input_dim=input_dim,
+            num_heads=num_heads,
+            num_classes=num_classes,
+            variant="multimax",
+            topk_tokens=topk_tokens,
+        )
+
+
+class RollingAttentionProbe(MultiAttentionProbe):
+    def __init__(
+        self,
+        input_dim: int,
+        num_heads: int = 8,
+        num_classes: int = 1,
+        rolling_window: int = 64,
+        rolling_stride: int = 32,
+    ):
+        super().__init__(
+            input_dim=input_dim,
+            num_heads=num_heads,
+            num_classes=num_classes,
+            variant="rolling",
+            rolling_window=rolling_window,
+            rolling_stride=rolling_stride,
+        )
 
 
 class TwoLevelAttentionProbe(nn.Module):
