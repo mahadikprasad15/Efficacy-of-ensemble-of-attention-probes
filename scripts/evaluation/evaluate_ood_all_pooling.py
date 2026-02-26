@@ -57,6 +57,7 @@ import sys
 import json
 import glob
 import torch
+import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple
@@ -143,6 +144,23 @@ class CachedOODDataset(Dataset):
         return self.samples[idx]
 
 
+class AttentionLinearProbeCompat(nn.Module):
+    """
+    Compatibility model for checkpoints saved by train_combined_all_pooling.py:
+      - attn.weight / attn.bias
+      - classifier.weight / classifier.bias
+    """
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.attn = nn.Linear(input_dim, 1)
+        self.classifier = nn.Linear(input_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(self.attn(x), dim=1)  # (B, T, 1)
+        pooled = (x * weights).sum(dim=1)  # (B, D)
+        return self.classifier(pooled)
+
+
 def find_probe_files(probes_dir: str) -> List[str]:
     """Find all probe_layer_*.pt files in directory, sorted numerically."""
     pattern = os.path.join(probes_dir, "probe_layer_*.pt")
@@ -155,7 +173,7 @@ def find_probe_files(probes_dir: str) -> List[str]:
 
 
 def evaluate_probe_layer(
-    probe: LayerProbe,
+    probe: nn.Module,
     dataloader: DataLoader,
     layer_idx: int,
     device: torch.device
@@ -196,6 +214,27 @@ def evaluate_probe_layer(
     accuracy = accuracy_score(all_labels, (np.array(all_preds) > 0.5).astype(int))
 
     return auc, accuracy, np.array(all_preds), np.array(all_labels)
+
+
+def load_probe_with_compat(
+    probe_file: str,
+    pooling_type: str,
+    input_dim: int,
+    device: torch.device
+) -> nn.Module:
+    """Load probe with backward/alternate architecture compatibility."""
+    state = torch.load(probe_file, map_location=device)
+
+    # Compatibility for combined-training attn checkpoints (attn.* keys)
+    if pooling_type == "attn" and any(k.startswith("attn.") for k in state.keys()):
+        probe = AttentionLinearProbeCompat(input_dim).to(device)
+        probe.load_state_dict(state)
+        return probe
+
+    # Default actprobe probe format
+    probe = LayerProbe(input_dim=input_dim, pooling_type=pooling_type).to(device)
+    probe.load_state_dict(state)
+    return probe
 
 
 def evaluate_all_layers(
@@ -240,8 +279,12 @@ def evaluate_all_layers(
         layer_idx = int(probe_file.split('_')[-1].replace('.pt', ''))
 
         # Load probe
-        probe = LayerProbe(input_dim=D, pooling_type=pooling_type).to(device)
-        probe.load_state_dict(torch.load(probe_file, map_location=device))
+        probe = load_probe_with_compat(
+            probe_file=probe_file,
+            pooling_type=pooling_type,
+            input_dim=D,
+            device=device
+        )
 
         # Evaluate
         auc, accuracy, preds, labels = evaluate_probe_layer(
@@ -506,6 +549,11 @@ def main():
                        help="Output directory")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--strict_pooling",
+        action="store_true",
+        help="Fail immediately if any pooling evaluation errors."
+    )
 
     args = parser.parse_args()
 
@@ -598,17 +646,25 @@ def main():
     print(f"✓ Saved OOD labels: {labels_path} ({len(ood_labels)} samples)\n")
 
     for pooling, probes_dir in probe_dirs.items():
-        results = evaluate_all_layers(
-            probes_dir=probes_dir,
-            ood_dataloader=ood_dataloader,
-            pooling_type=pooling,
-            device=device,
-            save_logits=True,
-            logits_save_dir=logits_dir
-        )
-
-        if results:
-            all_results[pooling] = results
+        try:
+            results = evaluate_all_layers(
+                probes_dir=probes_dir,
+                ood_dataloader=ood_dataloader,
+                pooling_type=pooling,
+                device=device,
+                save_logits=True,
+                logits_save_dir=logits_dir
+            )
+            if results:
+                all_results[pooling] = results
+                # Persist incrementally so partial runs are usable.
+                with open(results_path, 'w') as f:
+                    json.dump(all_results, f, indent=2)
+        except Exception as e:
+            print(f"❌ Failed evaluating pooling={pooling}: {e}")
+            if args.strict_pooling:
+                raise
+            print("   Continuing with remaining poolings...")
 
     if not all_results:
         print("\n❌ No results generated!")
