@@ -430,6 +430,17 @@ def main():
     parser.add_argument('--output_dir', type=str, default='results/combined_all_pooling', help='Output dir for plots/results')
     parser.add_argument('--probes_dir', type=str, default=None, help='Directory to save probes (default: {output_dir}/probes)')
     parser.add_argument('--model', type=str, default='meta-llama_Llama-3.2-3B-Instruct', help='Model name for probe dir structure')
+    parser.add_argument(
+        '--combined_probe_name',
+        type=str,
+        default='Deception-Combined',
+        help='Combined probe domain name when using structured probe dirs'
+    )
+    parser.add_argument(
+        '--flat_probes_dir',
+        action='store_true',
+        help='If set, save probes directly to {probes_dir}/{pooling}/probe_layer_*.pt'
+    )
     args = parser.parse_args()
     
     # Set probes_dir default
@@ -500,7 +511,10 @@ def main():
             )
             
             # Save the trained probe
-            probe_dir = os.path.join(args.probes_dir, args.model, 'Deception-Combined', pooling)
+            if args.flat_probes_dir:
+                probe_dir = os.path.join(args.probes_dir, pooling)
+            else:
+                probe_dir = os.path.join(args.probes_dir, args.model, args.combined_probe_name, pooling)
             os.makedirs(probe_dir, exist_ok=True)
             probe_path = os.path.join(probe_dir, f'probe_layer_{layer}.pt')
             torch.save(metrics['model'].state_dict(), probe_path)
