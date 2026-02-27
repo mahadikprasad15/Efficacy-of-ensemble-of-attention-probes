@@ -44,6 +44,7 @@ import torch
 import logging
 import time
 import copy
+from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 from safetensors.torch import save_file
 
@@ -55,6 +56,7 @@ from actprobe.datasets.deception_loaders import (
     DeceptionInsiderTradingDataset,
     DeceptionInsiderTradingSallyConcatDataset,
     DeceptionAILiarDataset,
+    DeceptionInstructedDeceptionDataset,
 )
 from actprobe.llm.activations import ActivationRunner
 from actprobe.features.resample import resample_activations
@@ -65,6 +67,155 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Chat boundary helpers
+# ============================================================================
+
+def _normalize_input_messages(input_messages: Any) -> List[Dict[str, str]]:
+    if input_messages is None:
+        return []
+    if hasattr(input_messages, "tolist") and not isinstance(input_messages, list):
+        input_messages = input_messages.tolist()
+    if not isinstance(input_messages, list):
+        return []
+
+    normalized = []
+    for msg in input_messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", "")).strip().lower()
+        content = msg.get("content", "")
+        if content is None:
+            content = ""
+        if not isinstance(content, str):
+            content = str(content)
+        if role in {"system", "user"}:
+            normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def _chat_template_token_length(
+    tokenizer,
+    messages: List[Dict[str, str]],
+    add_generation_prompt: bool,
+) -> int:
+    """
+    Count tokens for a message list using chat template tokenization directly.
+    """
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=add_generation_prompt,
+        return_tensors="pt",
+    )
+
+    if isinstance(encoded, torch.Tensor):
+        ids = encoded
+    elif isinstance(encoded, dict):
+        ids = encoded.get("input_ids")
+    else:
+        ids = getattr(encoded, "input_ids", None)
+
+    if ids is None:
+        raise ValueError("Could not extract input_ids from chat template encoding")
+
+    if ids.ndim == 1:
+        return int(ids.shape[0])
+    return int(ids.shape[1])
+
+
+def _build_full_text_and_boundaries(
+    tokenizer,
+    prompt_messages: Any,
+    assistant_completion: str,
+    fallback_prompt: str = "",
+) -> Tuple[str, Optional[int], Optional[int], Optional[int], Optional[int]]:
+    """
+    Build full chat text and token boundaries:
+    - system_end_idx: [0, system_end_idx)
+    - user_end_idx: [system_end_idx, user_end_idx)
+    - completion_end_idx: [user_end_idx, completion_end_idx)
+    """
+    messages = _normalize_input_messages(prompt_messages)
+    if not messages:
+        return f"{fallback_prompt}{assistant_completion}", None, None, None, None
+
+    system_messages = []
+    user_messages = []
+    seen_system = False
+    for msg in messages:
+        role = msg["role"]
+        if role == "system" and not seen_system:
+            system_messages.append(msg)
+            seen_system = True
+        elif role == "user":
+            user_messages.append(msg)
+
+    su_messages = system_messages + user_messages
+    if not su_messages:
+        return f"{fallback_prompt}{assistant_completion}", None, None, None, None
+
+    full_messages = list(su_messages) + [{"role": "assistant", "content": assistant_completion}]
+
+    try:
+        full_text = tokenizer.apply_chat_template(
+            full_messages, tokenize=False, add_generation_prompt=False
+        )
+
+        system_end = 0
+        if system_messages:
+            system_end = _chat_template_token_length(
+                tokenizer, system_messages, add_generation_prompt=False
+            )
+        user_end = _chat_template_token_length(
+            tokenizer, su_messages, add_generation_prompt=True
+        )
+        completion_end = _chat_template_token_length(
+            tokenizer, full_messages, add_generation_prompt=False
+        )
+
+        # Align with the tokenizer call used by ActivationRunner.get_activations.
+        full_len_runner = int(tokenizer(full_text, return_tensors="pt").input_ids.shape[1])
+        if completion_end != full_len_runner:
+            completion_end = full_len_runner
+
+        su_text = tokenizer.apply_chat_template(
+            su_messages, tokenize=False, add_generation_prompt=True
+        )
+        user_len_runner = int(tokenizer(su_text, return_tensors="pt").input_ids.shape[1])
+        if user_end != user_len_runner:
+            user_end = user_len_runner
+
+        if system_messages:
+            sys_text = tokenizer.apply_chat_template(
+                system_messages, tokenize=False, add_generation_prompt=False
+            )
+            sys_len_runner = int(tokenizer(sys_text, return_tensors="pt").input_ids.shape[1])
+            if system_end != sys_len_runner:
+                system_end = sys_len_runner
+
+        if completion_end <= user_end:
+            return full_text, None, None, None, None
+        if system_end < 0 or user_end < 0:
+            return full_text, None, None, None, None
+
+        return full_text, system_end, user_end, completion_end, user_end
+    except Exception as exc:
+        logger.debug(f"Failed to compute chat template boundaries: {exc}")
+        prompt_text = fallback_prompt or "\n\n".join(m["content"] for m in su_messages if m.get("content"))
+        full_text = f"{prompt_text}{assistant_completion}"
+        return full_text, None, None, None, None
+
+
+def _fallback_prompt_end_idx(tokenizer, full_text: str, completion: str) -> int:
+    """
+    Fallback completion start index when chat-template boundaries are unavailable.
+    """
+    full_len = int(tokenizer(full_text, return_tensors="pt").input_ids.shape[1])
+    completion_len = int(tokenizer(completion, return_tensors="pt").input_ids.shape[1])
+    return max(0, full_len - completion_len)
+
 
 # ============================================================================
 # DeceptionLabeler: LLM-based labeling with rate limiting
@@ -238,6 +389,7 @@ DATASET_MAP = {
     "Deception-InsiderTrading": DeceptionInsiderTradingDataset,
     "Deception-InsiderTrading-SallyConcat": DeceptionInsiderTradingSallyConcatDataset,
     "Deception-AILiar": DeceptionAILiarDataset,
+    "Deception-InstructedDeception": DeceptionInstructedDeceptionDataset,
 }
 
 # ============================================================================
@@ -636,7 +788,7 @@ def main():
         batch_items.append(item)
 
         # Process batch when full or at end
-        if len(batch_prompts) == args.batch_size or i == len(ds) - 1:
+        if len(batch_prompts) == args.batch_size or i == len(items) - 1:
             try:
                 # ============================================================
                 # MODE A: Pre-generated responses (Apollo Insider Trading)
@@ -673,46 +825,17 @@ def main():
                     for p, c, meta in zip(batch_prompts, completions, boundary_meta):
                         input_messages = meta.get("input_messages")
                         if input_messages:
-                            system_msg = None
-                            user_msgs = []
-                            for msg in input_messages:
-                                role = msg.get("role")
-                                content = msg.get("content", "")
-                                if role == "system" and system_msg is None:
-                                    system_msg = content
-                                elif role == "user":
-                                    user_msgs.append(content)
-
-                            sys_messages = []
-                            if system_msg:
-                                sys_messages.append({"role": "system", "content": system_msg})
-
-                            su_messages = list(sys_messages)
-                            for um in user_msgs:
-                                su_messages.append({"role": "user", "content": um})
-
-                            full_messages = list(su_messages)
-                            full_messages.append({"role": "assistant", "content": c})
-
-                            sys_text = runner.tokenizer.apply_chat_template(
-                                sys_messages, tokenize=False, add_generation_prompt=False
-                            ) if sys_messages else ""
-                            su_text = runner.tokenizer.apply_chat_template(
-                                su_messages, tokenize=False, add_generation_prompt=True
+                            full_text, system_end, user_end, completion_end, prompt_end = _build_full_text_and_boundaries(
+                                tokenizer=runner.tokenizer,
+                                prompt_messages=input_messages,
+                                assistant_completion=c,
+                                fallback_prompt=p,
                             )
-                            full_text = runner.tokenizer.apply_chat_template(
-                                full_messages, tokenize=False, add_generation_prompt=False
-                            )
-
-                            system_end = len(runner.tokenizer(sys_text, add_special_tokens=False).input_ids) if sys_text else 0
-                            user_end = len(runner.tokenizer(su_text, add_special_tokens=False).input_ids)
-                            completion_end = len(runner.tokenizer(full_text, add_special_tokens=False).input_ids)
-
                             full_texts.append(full_text)
                             system_end_idxs.append(system_end)
                             user_end_idxs.append(user_end)
                             completion_end_idxs.append(completion_end)
-                            prompt_end_indices.append(user_end)
+                            prompt_end_indices.append(prompt_end)
                         else:
                             full_texts.append(p + c)
                             system_end_idxs.append(None)
@@ -725,10 +848,19 @@ def main():
                     else:
                         # Get activations, slicing to only completion tokens
                         if any(idx is None for idx in prompt_end_indices):
-                            prompt_end_indices = []
-                            for prompt in batch_prompts:
-                                prompt_tokens = runner.tokenizer(prompt, return_tensors="pt").input_ids
-                                prompt_end_indices.append(prompt_tokens.shape[1])
+                            filled_prompt_ends = []
+                            for idx_prompt, full_text, completion in zip(prompt_end_indices, full_texts, completions):
+                                if idx_prompt is not None:
+                                    filled_prompt_ends.append(idx_prompt)
+                                else:
+                                    filled_prompt_ends.append(
+                                        _fallback_prompt_end_idx(
+                                            tokenizer=runner.tokenizer,
+                                            full_text=full_text,
+                                            completion=completion,
+                                        )
+                                    )
+                            prompt_end_indices = filled_prompt_ends
                         raw_activations = runner.get_activations(full_texts, prompt_end_indices=prompt_end_indices)
                     
                     # Create labeled items (no Cerebras needed)
