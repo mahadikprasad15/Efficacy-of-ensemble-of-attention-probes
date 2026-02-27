@@ -2,6 +2,7 @@
 Token pooling strategies for reducing (T, D) -> (D).
 """
 
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -123,18 +124,18 @@ class GMHAAttentionPooling(BasePooling):
         super().__init__()
         if num_heads <= 0:
             raise ValueError("num_heads must be positive")
-        if input_dim % num_heads != 0:
-            raise ValueError(f"input_dim={input_dim} must be divisible by num_heads={num_heads}")
 
         self.input_dim = input_dim
         self.num_heads = num_heads
-        self.head_dim = input_dim // num_heads
+        # Allow arbitrary head counts by projecting into the nearest valid head space.
+        self.head_dim = int(math.ceil(float(input_dim) / float(num_heads)))
+        self.proj_dim = self.num_heads * self.head_dim
         self.output_dim = output_dim or input_dim
         self.topk_tokens = topk_tokens
 
-        self.w_kv = nn.Linear(input_dim, 2 * input_dim, bias=False)
+        self.w_kv = nn.Linear(input_dim, 2 * self.proj_dim, bias=False)
         self.query = nn.Parameter(torch.randn(num_heads, self.head_dim))
-        self.w_out = nn.Linear(input_dim, self.output_dim)
+        self.w_out = nn.Linear(self.proj_dim, self.output_dim)
         self.last_attention_weights = None
 
     def _compute_scores(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

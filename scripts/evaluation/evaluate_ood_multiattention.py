@@ -103,6 +103,7 @@ def build_model(
 
 
 def evaluate_binary(logits: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
+    logits = np.clip(logits, -60.0, 60.0)
     probs = 1.0 / (1.0 + np.exp(-logits))
     preds = (probs >= 0.5).astype(np.int64)
     if len(np.unique(labels)) < 2:
