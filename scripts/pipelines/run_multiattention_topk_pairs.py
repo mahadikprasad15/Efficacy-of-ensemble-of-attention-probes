@@ -194,6 +194,7 @@ def main() -> int:
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--skip_training", action="store_true")
     parser.add_argument("--skip_eval", action="store_true")
+    parser.add_argument("--continue_on_error", action="store_true")
     args = parser.parse_args()
 
     if args.num_heads_list:
@@ -207,6 +208,7 @@ def main() -> int:
     model_dir = model_to_dir(args.model)
     ood_root = Path(args.ood_results_root)
     summary = []
+    errors = []
 
     for n_heads in heads:
         for row in rows:
@@ -242,7 +244,22 @@ def main() -> int:
                     train_cmd.extend(["--input_layers", args.input_layers])
                 else:
                     train_cmd.extend(["--layer", str(layer_used)])
-                subprocess.check_call(train_cmd)
+                try:
+                    subprocess.check_call(train_cmd)
+                except subprocess.CalledProcessError as exc:
+                    errors.append(
+                        {
+                            "stage": "train",
+                            "source_probe": source_probe,
+                            "target_label": target_label,
+                            "num_heads": n_heads,
+                            "run_name": run_name,
+                            "error": str(exc),
+                        }
+                    )
+                    if not args.continue_on_error:
+                        raise
+                    continue
 
             probe_run_dir = (
                 Path(args.probes_root)
@@ -265,7 +282,22 @@ def main() -> int:
                     "--output_root", args.ood_results_root,
                     "--batch_size", str(args.batch_size),
                 ]
-                subprocess.check_call(eval_cmd)
+                try:
+                    subprocess.check_call(eval_cmd)
+                except subprocess.CalledProcessError as exc:
+                    errors.append(
+                        {
+                            "stage": "eval",
+                            "source_probe": source_probe,
+                            "target_label": target_label,
+                            "num_heads": n_heads,
+                            "run_name": run_name,
+                            "error": str(exc),
+                        }
+                    )
+                    if not args.continue_on_error:
+                        raise
+                    continue
 
             id_metrics = extract_id_metrics_from_train(probe_run_dir)
             ood_metrics = extract_ood_metrics(
@@ -299,6 +331,7 @@ def main() -> int:
     summary_root.mkdir(parents=True, exist_ok=True)
     summary_json = summary_root / "topk_orchestration_summary.json"
     summary_csv = summary_root / "topk_orchestration_summary.csv"
+    errors_json = summary_root / "topk_orchestration_errors.json"
     with summary_json.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     if summary:
@@ -306,8 +339,11 @@ def main() -> int:
             writer = csv.DictWriter(f, fieldnames=list(summary[0].keys()))
             writer.writeheader()
             writer.writerows(summary)
+    with errors_json.open("w", encoding="utf-8") as f:
+        json.dump(errors, f, indent=2)
     print(f"Saved summary json: {summary_json}")
     print(f"Saved summary csv: {summary_csv}")
+    print(f"Saved errors json: {errors_json}")
     return 0
 
 
