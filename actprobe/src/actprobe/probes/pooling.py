@@ -183,6 +183,73 @@ class GMHAAttentionPooling(BasePooling):
         return out
 
 
+class DirectQueryHeadPooling(BasePooling):
+    """
+    Direct multi-head pooling with one full-width learned query per head.
+
+    For each head h:
+      logits_h,t = <q_h, x_t> / sqrt(D)
+      weights_h = softmax(logits_h over tokens)
+      pooled_h = sum_t weights_h,t * x_t   (shape D)
+
+    Final output concatenates all head vectors:
+      pooled = concat_h(pooled_h)          (shape H*D)
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_heads: int = 8,
+        score_scale: Optional[float] = None,
+    ):
+        super().__init__()
+        if num_heads <= 0:
+            raise ValueError("num_heads must be positive")
+        if input_dim <= 0:
+            raise ValueError("input_dim must be positive")
+
+        self.input_dim = int(input_dim)
+        self.num_heads = int(num_heads)
+        self.score_scale = float(score_scale) if score_scale is not None else math.sqrt(float(input_dim))
+        if self.score_scale <= 0:
+            raise ValueError("score_scale must be positive")
+
+        self.query = nn.Parameter(torch.randn(self.num_heads, self.input_dim))
+        self.last_attention_weights = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        return_attention: bool = False,
+    ):
+        # x: (B, T, D)
+        if x.dim() != 3:
+            raise ValueError(f"Expected x with shape (B,T,D), got {tuple(x.shape)}")
+        if x.shape[-1] != self.input_dim:
+            raise ValueError(f"Expected last dim {self.input_dim}, got {x.shape[-1]}")
+
+        # (B, T, D) x (H, D) -> (B, H, T)
+        logits = torch.einsum("btd,hd->bht", x, self.query)
+        logits = logits / self.score_scale
+
+        if attention_mask is not None:
+            if attention_mask.dtype != torch.bool:
+                attention_mask = attention_mask.bool()
+            logits = logits.masked_fill(~attention_mask[:, None, :], float("-inf"))
+
+        scores = F.softmax(logits.float(), dim=-1).to(x.dtype)  # (B, H, T)
+        self.last_attention_weights = scores.detach()
+
+        # (B, H, T) x (B, T, D) -> (B, H, D)
+        pooled = torch.einsum("bht,btd->bhd", scores, x)
+        out = pooled.reshape(x.shape[0], self.num_heads * self.input_dim)  # (B, H*D)
+
+        if return_attention:
+            return out, scores
+        return out
+
+
 class MultiMaxPooling(GMHAAttentionPooling):
     """Multi-head attention pooling with top-k token selection per head."""
 
