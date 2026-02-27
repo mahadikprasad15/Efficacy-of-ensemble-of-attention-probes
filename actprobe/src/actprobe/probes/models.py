@@ -13,6 +13,7 @@ from .pooling import (
     LastTokenPooling,
     LearnedAttentionPooling,
     GMHAAttentionPooling,
+    DirectQueryHeadPooling,
     MultiMaxPooling,
     RollingAttentionPooling,
     RMSNorm1D,
@@ -88,12 +89,17 @@ class MultiAttentionProbe(nn.Module):
 
         if variant == "gmha":
             self.pooling = GMHAAttentionPooling(input_dim=input_dim, num_heads=num_heads)
+            classifier_input_dim = input_dim
+        elif variant == "direct_q":
+            self.pooling = DirectQueryHeadPooling(input_dim=input_dim, num_heads=num_heads)
+            classifier_input_dim = input_dim * num_heads
         elif variant == "multimax":
             self.pooling = MultiMaxPooling(
                 input_dim=input_dim,
                 num_heads=num_heads,
                 topk_tokens=topk_tokens,
             )
+            classifier_input_dim = input_dim
         elif variant == "rolling":
             self.pooling = RollingAttentionPooling(
                 input_dim=input_dim,
@@ -101,11 +107,12 @@ class MultiAttentionProbe(nn.Module):
                 window_size=rolling_window,
                 stride=rolling_stride,
             )
+            classifier_input_dim = input_dim
         else:
             raise ValueError(f"Unsupported variant: {variant}")
 
         out_dim = 1 if num_classes <= 1 else num_classes
-        self.classifier = nn.Linear(input_dim, out_dim)
+        self.classifier = nn.Linear(classifier_input_dim, out_dim)
 
     def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         pooled = self.pooling(x, attention_mask=attention_mask)
@@ -148,12 +155,17 @@ class MultiLayerMultiAttentionProbe(nn.Module):
 
         if variant == "gmha":
             self.pooling = GMHAAttentionPooling(input_dim=input_dim, num_heads=num_heads)
+            classifier_input_dim = input_dim
+        elif variant == "direct_q":
+            self.pooling = DirectQueryHeadPooling(input_dim=input_dim, num_heads=num_heads)
+            classifier_input_dim = input_dim * num_heads
         elif variant == "multimax":
             self.pooling = MultiMaxPooling(
                 input_dim=input_dim,
                 num_heads=num_heads,
                 topk_tokens=topk_tokens,
             )
+            classifier_input_dim = input_dim
         elif variant == "rolling":
             self.pooling = RollingAttentionPooling(
                 input_dim=input_dim,
@@ -161,11 +173,12 @@ class MultiLayerMultiAttentionProbe(nn.Module):
                 window_size=rolling_window,
                 stride=rolling_stride,
             )
+            classifier_input_dim = input_dim
         else:
             raise ValueError(f"Unsupported variant: {variant}")
 
         out_dim = 1 if num_classes <= 1 else num_classes
-        self.classifier = nn.Linear(input_dim, out_dim)
+        self.classifier = nn.Linear(classifier_input_dim, out_dim)
 
     def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (B, L, T, D)
@@ -202,6 +215,16 @@ class GMHAAttentionProbe(MultiAttentionProbe):
             num_heads=num_heads,
             num_classes=num_classes,
             variant="gmha",
+        )
+
+
+class DirectQueryAttentionProbe(MultiAttentionProbe):
+    def __init__(self, input_dim: int, num_heads: int = 8, num_classes: int = 1):
+        super().__init__(
+            input_dim=input_dim,
+            num_heads=num_heads,
+            num_classes=num_classes,
+            variant="direct_q",
         )
 
 

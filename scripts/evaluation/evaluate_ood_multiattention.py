@@ -28,9 +28,11 @@ from actprobe.probes.models import MultiAttentionProbe, MultiLayerMultiAttention
 
 PROBE_FAMILIES = {
     "gmha": {"multilayer": False, "variant": "gmha"},
+    "direct_q": {"multilayer": False, "variant": "direct_q"},
     "multimax": {"multilayer": False, "variant": "multimax"},
     "rolling": {"multilayer": False, "variant": "rolling"},
     "multilayer_gmha": {"multilayer": True, "variant": "gmha"},
+    "multilayer_direct_q": {"multilayer": True, "variant": "direct_q"},
     "multilayer_multimax": {"multilayer": True, "variant": "multimax"},
     "multilayer_rolling": {"multilayer": True, "variant": "rolling"},
 }
