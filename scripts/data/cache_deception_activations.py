@@ -56,7 +56,7 @@ from actprobe.datasets.deception_loaders import (
     DeceptionInsiderTradingDataset,
     DeceptionInsiderTradingSallyConcatDataset,
     DeceptionAILiarDataset,
-    DeceptionInstructedDeceptionDataset,
+    DeceptionTypedMessagesDataset,
     DeceptionMaskDataset,
 )
 from actprobe.llm.activations import ActivationRunner
@@ -216,6 +216,24 @@ def _fallback_prompt_end_idx(tokenizer, full_text: str, completion: str) -> int:
     full_len = int(tokenizer(full_text, return_tensors="pt").input_ids.shape[1])
     completion_len = int(tokenizer(completion, return_tensors="pt").input_ids.shape[1])
     return max(0, full_len - completion_len)
+
+
+def _infer_dataset_output_name(dataset_file: Optional[str]) -> Optional[str]:
+    """
+    Infer canonical output dataset name from typed-deception filename prefixes.
+    """
+    if not dataset_file:
+        return None
+    base = os.path.basename(dataset_file).lower()
+    if base.startswith("mask__"):
+        return "Deception-Mask"
+    if base.startswith("harm-pressure-choice__"):
+        return "Deception-HarmPressureChoice"
+    if base.startswith("convincing-game__"):
+        return "Deception-ConvincingGame"
+    if base.startswith("instructed-deception") or base.startswith("instructed_deception"):
+        return "Deception-InstructedDeception"
+    return None
 
 
 # ============================================================================
@@ -390,7 +408,7 @@ DATASET_MAP = {
     "Deception-InsiderTrading": DeceptionInsiderTradingDataset,
     "Deception-InsiderTrading-SallyConcat": DeceptionInsiderTradingSallyConcatDataset,
     "Deception-AILiar": DeceptionAILiarDataset,
-    "Deception-InstructedDeception": DeceptionInstructedDeceptionDataset,
+    "Deception-InstructedDeception": DeceptionTypedMessagesDataset,
     "Deception-Mask": DeceptionMaskDataset,
 }
 
@@ -697,7 +715,11 @@ def main():
     # 4. Prepare Output Directory
     # ========================================================================
 
-    dataset_out = args.dataset_output_name or args.dataset
+    dataset_out = args.dataset_output_name or _infer_dataset_output_name(args.dataset_file) or args.dataset
+    if args.dataset_output_name is None:
+        inferred = _infer_dataset_output_name(args.dataset_file)
+        if inferred is not None:
+            logger.info(f"[4/6] Auto-inferred dataset_output_name from dataset_file: {inferred}")
     save_dir = os.path.join(
         args.output_dir,
         args.model.replace("/", "_"),
