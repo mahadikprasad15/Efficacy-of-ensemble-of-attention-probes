@@ -712,9 +712,17 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
 
     Expected row fields (parquet/jsonl):
     - messages or messages_clean: list[{role, content}] with system/user/assistant
-    - deceptive: bool/int label (1=deceptive, 0=honest)
+    - label and/or deceptive: binary label (1=deceptive, 0=non-deceptive)
     - optional metadata: id/index/dataset/subdataset/model/temperature/...
     """
+
+    TAXONOMY_KEYS = (
+        "deception_type_primary",
+        "deception_types_mentioned",
+        "classification_reasoning",
+        "classification_confidence",
+        "classification_raw_response",
+    )
 
     def __init__(
         self,
@@ -722,18 +730,29 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
         limit: Optional[int] = None,
         data_file: str = "data/apollo_raw/instructed_deception/instructed-deception_gemma_2_9b_it_completions_deception_typed.parquet",
         random_seed: int = 42,
+        dataset_name: Optional[str] = None,
+        id_prefix: Optional[str] = None,
     ):
         super().__init__(split=split, limit=limit)
         self.data_file = data_file
         self.random_seed = random_seed
+        self.dataset_name = dataset_name
+        self.id_prefix = id_prefix
 
         possible_paths = [
             data_file,
             "data/apollo_raw/instructed_deception/instructed-deception_gemma_2_9b_it_completions_deception_typed.parquet",
             "data/apollo_raw/instructed_deception/instructed-deception_gemma_2_9b_it_completions_deception_typed.jsonl",
             "data/apollo_raw/instructed_deception/instructed-deception_clean.jsonl",
+            "data/apollo_raw/mask__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
+            "data/apolloraw/mask__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
             "data/apollo_raw/instructed-deception_gemma_2_9b_it_completions_deception_typed.parquet",
             "data/apollo_raw/instructed-deception_gemma_2_9b_it_completions_deception_typed.jsonl",
+            os.path.join(
+                os.path.expanduser("~"),
+                "Downloads",
+                "mask__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
+            ),
         ]
 
         self.actual_data_file = None
@@ -747,6 +766,13 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
                 "Instructed-deception data not found. Tried:\n"
                 + "\n".join(f"  - {p}" for p in possible_paths)
             )
+
+        # If not explicitly provided, infer metadata dataset/id prefix from source file.
+        inferred_source = os.path.basename(self.actual_data_file).lower()
+        if self.dataset_name is None:
+            self.dataset_name = "Deception-Mask" if "mask__" in inferred_source else "Deception-InstructedDeception"
+        if self.id_prefix is None:
+            self.id_prefix = "mask" if "mask__" in inferred_source else "instructed_deception"
 
     @staticmethod
     def _normalize_messages(raw_messages: Any) -> List[Dict[str, str]]:
@@ -830,8 +856,7 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
         return cleaned
 
     @staticmethod
-    def _parse_label(row: Dict[str, Any]) -> Optional[int]:
-        raw = row.get("deceptive", row.get("label", row.get("gold_label")))
+    def _coerce_binary_label(raw: Any) -> Optional[int]:
         if isinstance(raw, bool):
             return 1 if raw else 0
         if isinstance(raw, (int, float)):
@@ -843,6 +868,16 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
                 return 1
             if s in {"0", "false", "no", "honest", "positive", "non_deceptive"}:
                 return 0
+        return None
+
+    @classmethod
+    def _parse_label(cls, row: Dict[str, Any]) -> Optional[int]:
+        # Canonical label for newer deception-typed datasets is `label` (0/1).
+        for key in ("label", "deceptive", "gold_label"):
+            if key in row and row.get(key) is not None:
+                coerced = cls._coerce_binary_label(row.get(key))
+                if coerced is not None:
+                    return coerced
         return None
 
     @staticmethod
@@ -929,6 +964,7 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
                     row_split = "test"
                 row["split"] = row_split
                 split_rows.append(row)
+        rng.shuffle(split_rows)
         return split_rows
 
     def load_data(self):
@@ -940,13 +976,16 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
         skipped = {"bad_messages": 0, "missing_assistant": 0, "missing_label": 0}
 
         for idx, row in enumerate(raw_rows):
-            messages_raw = row.get("messages_clean", row.get("messages"))
+            has_messages_clean = row.get("messages_clean") is not None
+            messages_raw = row.get("messages_clean") if has_messages_clean else row.get("messages")
             messages = self._normalize_messages(messages_raw)
             if not messages:
                 skipped["bad_messages"] += 1
                 continue
 
-            messages = self._strip_system_prefix_from_first_user(messages)
+            # Keep fallback cleanup only when explicit cleaned messages are unavailable.
+            if not has_messages_clean:
+                messages = self._strip_system_prefix_from_first_user(messages)
 
             assistant_idx = None
             for i in range(len(messages) - 1, -1, -1):
@@ -969,12 +1008,12 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
             prompt = "\n\n".join((m.get("content", "") or "").strip() for m in prompt_messages if (m.get("content", "") or "").strip())
 
             base_id = row.get("id", row.get("index", row.get("original_index", idx)))
-            example_id = f"instructed_deception_{base_id}"
+            example_id = f"{self.id_prefix}_{base_id}"
 
             split_name = self._normalize_split_name(row.get("split"))
 
             metadata = {
-                "dataset": "Deception-InstructedDeception",
+                "dataset": self.dataset_name,
                 "id": example_id,
                 "split": split_name or self.split,
                 "source_id": base_id,
@@ -995,6 +1034,10 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
                         metadata["source_dataset"] = row.get(key)
                     else:
                         metadata[key] = row.get(key)
+
+            for key in self.TAXONOMY_KEYS:
+                if key in row:
+                    metadata[key] = row.get(key)
 
             processed.append(
                 {
@@ -1050,7 +1093,7 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
         n_honest = sum(1 for ex in self.data if int(ex.get("gold_label", -1)) == 0)
         n_deceptive = sum(1 for ex in self.data if int(ex.get("gold_label", -1)) == 1)
         print(
-            f"Loaded {len(self.data)} instructed-deception examples for split '{self.split}' "
+            f"Loaded {len(self.data)} {self.dataset_name} examples for split '{self.split}' "
             f"({n_honest} honest, {n_deceptive} deceptive)"
         )
         if any(v > 0 for v in skipped.values()):
@@ -1063,3 +1106,25 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         return self.data[idx]
+
+
+class DeceptionMaskDataset(DeceptionInstructedDeceptionDataset):
+    """
+    Mask dataset wrapper that reuses instructed-deception parsing logic.
+    """
+
+    def __init__(
+        self,
+        split: str = "train",
+        limit: Optional[int] = None,
+        data_file: str = "data/apollo_raw/mask__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
+        random_seed: int = 42,
+    ):
+        super().__init__(
+            split=split,
+            limit=limit,
+            data_file=data_file,
+            random_seed=random_seed,
+            dataset_name="Deception-Mask",
+            id_prefix="mask",
+        )
