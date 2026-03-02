@@ -511,6 +511,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force_reeval", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--skip_training", action="store_true", help="Skip training stage entirely.")
+    parser.add_argument("--skip_diagonals", action="store_true", help="Skip diagonal validation stage.")
     parser.add_argument(
         "--only_sources",
         type=str,
@@ -991,45 +992,49 @@ def main() -> int:
     print("[stage 4/5] compute diagonal validation cells")
     diag_datasets = rows_map["completion"] + rows_map["full"]
     diag_results: Dict[str, Dict[str, Any]] = {}
-    diag_pbar = tqdm(diag_datasets, desc="diag_cells", disable=not use_tqdm)
-    for i, ds_name in enumerate(diag_pbar, start=1):
-        if args.resume and ds_name in set(progress["completed_diag_jobs"]):
-            diag_path = out_dir / "diagonals" / f"{ds_name}.json"
-            if diag_path.exists():
-                diag_results[ds_name] = read_json(diag_path)
-            print(f"[diag] skip completed {ds_name}")
-            continue
-        t0 = time.time()
-        try:
-            diag = diagonal_from_validation(
-                dataset_name=ds_name,
-                model_root_activations=acts_model_root,
-                model_root_probes=probes_model_root,
-                poolings=poolings,
-                eval_batch_size=args.eval_batch_size,
-                device=device,
-                use_tqdm=use_tqdm,
-            )
-            diag_path = out_dir / "diagonals" / f"{ds_name}.json"
-            write_json(diag_path, diag)
-            diag_results[ds_name] = diag
-            progress["completed_diag_jobs"].append(ds_name)
-            progress["updated_at"] = utc_now()
-            write_json(progress_path, progress)
-            best = diag["overall_best"]
-            elapsed = time.time() - t0
-            print(
-                f"[diag] done {ds_name} in {elapsed:.1f}s "
-                f"(best={best['pooling']} L{best['layer']} auc={best['auc']:.4f})"
-            )
-        except Exception as exc:
-            append_jsonl(out_dir / "pairs_missing.jsonl", {"pair_id": f"{ds_name}__{ds_name}", "reason": str(exc), "stage": "diag"})
-            print(f"[diag] missing {ds_name}: {exc}")
-        if args.progress_every > 0 and i % args.progress_every == 0:
-            print(f"[diag] checkpoint at {i}/{len(diag_datasets)}")
+    if args.skip_diagonals:
+        print("[diag] skip_diagonals enabled; skipping stage 4")
+        mark_step("stage4_diag")
+    else:
+        diag_pbar = tqdm(diag_datasets, desc="diag_cells", disable=not use_tqdm)
+        for i, ds_name in enumerate(diag_pbar, start=1):
+            if args.resume and ds_name in set(progress["completed_diag_jobs"]):
+                diag_path = out_dir / "diagonals" / f"{ds_name}.json"
+                if diag_path.exists():
+                    diag_results[ds_name] = read_json(diag_path)
+                print(f"[diag] skip completed {ds_name}")
+                continue
+            t0 = time.time()
+            try:
+                diag = diagonal_from_validation(
+                    dataset_name=ds_name,
+                    model_root_activations=acts_model_root,
+                    model_root_probes=probes_model_root,
+                    poolings=poolings,
+                    eval_batch_size=args.eval_batch_size,
+                    device=device,
+                    use_tqdm=use_tqdm,
+                )
+                diag_path = out_dir / "diagonals" / f"{ds_name}.json"
+                write_json(diag_path, diag)
+                diag_results[ds_name] = diag
+                progress["completed_diag_jobs"].append(ds_name)
+                progress["updated_at"] = utc_now()
+                write_json(progress_path, progress)
+                best = diag["overall_best"]
+                elapsed = time.time() - t0
+                print(
+                    f"[diag] done {ds_name} in {elapsed:.1f}s "
+                    f"(best={best['pooling']} L{best['layer']} auc={best['auc']:.4f})"
+                )
+            except Exception as exc:
+                append_jsonl(out_dir / "pairs_missing.jsonl", {"pair_id": f"{ds_name}__{ds_name}", "reason": str(exc), "stage": "diag"})
+                print(f"[diag] missing {ds_name}: {exc}")
+            if args.progress_every > 0 and i % args.progress_every == 0:
+                print(f"[diag] checkpoint at {i}/{len(diag_datasets)}")
 
-    mark_step("stage4_diag")
-    print("[done] stage 4")
+        mark_step("stage4_diag")
+        print("[done] stage 4")
 
     # Stage 5: aggregate matrices
     update_status(status_path, "running", "stage 5 aggregate")

@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument(
+        "--skip_diagonals",
+        action="store_true",
+        help="Skip diagonal validation stage in the invoked pipeline.",
+    )
+    parser.add_argument(
         "--rebuild_matrices",
         action="store_true",
         help="After running missing evals, rebuild full matrices via the pipeline (resume + skip_training).",
@@ -122,6 +127,8 @@ def main() -> int:
         cmd.append("--no_tqdm")
     if args.resume:
         cmd.append("--resume")
+    if args.skip_diagonals:
+        cmd.append("--skip_diagonals")
     if args.dry_run:
         cmd.append("--dry_run")
 
@@ -156,6 +163,8 @@ def main() -> int:
         ]
         if args.no_tqdm:
             rebuild_cmd.append("--no_tqdm")
+        if args.skip_diagonals:
+            rebuild_cmd.append("--skip_diagonals")
         print("[rebuild] invoking pipeline to rebuild matrices:")
         print(" ".join(rebuild_cmd))
         proc = subprocess.run(rebuild_cmd, text=True)
