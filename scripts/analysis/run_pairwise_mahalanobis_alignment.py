@@ -538,12 +538,13 @@ def main() -> int:
         def needed_poolings_for_layer(ds_name: str, layer: int) -> List[str]:
             if args.covariance_scope == "all":
                 return ALL_POOLINGS
-            # required: poolings used by any cell where ds appears as source/target
+            # required: poolings used when this dataset is the source row.
+            # Attn pooling is source-probe dependent, so target-only datasets (e.g. IT)
+            # should not force attn requirements.
             pset = set()
             for (r, c), cell in cells.items():
-                if r == ds_name or c == ds_name:
-                    if cell.layer == layer:
-                        pset.add(normalize_pooling(cell.pooling))
+                if r == ds_name and cell.layer == layer:
+                    pset.add(normalize_pooling(cell.pooling))
             return sorted(pset) if pset else []
 
         for ds in datasets:
@@ -563,9 +564,8 @@ def main() -> int:
                     return attn_poolers[layer]
                 probe_path = resolve_probe_path(probes_model_root, ds, "attn", layer)
                 if not probe_path.exists():
-                    if args.allow_missing_attn:
-                        return None
-                    raise FileNotFoundError(f"Missing attn probe for {ds} layer {layer}: {probe_path}")
+                    print(f"[warn] missing attn probe for {ds} layer {layer}; using mean fallback")
+                    return None
                 attn_poolers[layer] = load_attn_pooler(probe_path, input_dim=input_dim, device=device)
                 return attn_poolers[layer]
 
@@ -737,10 +737,8 @@ def main() -> int:
         if pooling == "attn":
             probe_path = resolve_probe_path(probes_model_root, source_for_pooler, "attn", layer)
             if not probe_path.exists():
-                if args.allow_missing_attn:
-                    pooler = Pooler("mean")
-                else:
-                    raise FileNotFoundError(f"Missing attn probe for {source_for_pooler} layer {layer}: {probe_path}")
+                print(f"[warn] missing attn probe for {source_for_pooler} layer {layer}; using mean fallback")
+                pooler = Pooler("mean")
             else:
                 pooler = load_attn_pooler(probe_path, input_dim=input_dim, device=device)
         else:
