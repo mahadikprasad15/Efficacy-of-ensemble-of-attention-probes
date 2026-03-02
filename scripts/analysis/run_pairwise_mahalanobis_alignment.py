@@ -220,6 +220,25 @@ def resolve_probe_path(probes_model_root: Path, dataset_name: str, pooling: str,
     return probes_model_root / f"{base}_slices" / dataset_name / pooling / f"probe_layer_{layer}.pt"
 
 
+def probe_dataset_root(probes_model_root: Path, dataset_name: str) -> Path:
+    base = dataset_base(dataset_name)
+    return probes_model_root / f"{base}_slices" / dataset_name
+
+
+def dataset_has_any_probes(probes_model_root: Path, dataset_name: str) -> bool:
+    root = probe_dataset_root(probes_model_root, dataset_name)
+    if not root.exists():
+        return False
+    return any(root.glob("*/probe_layer_*.pt"))
+
+
+def dataset_has_attn_probes(probes_model_root: Path, dataset_name: str) -> bool:
+    root = probe_dataset_root(probes_model_root, dataset_name) / "attn"
+    if not root.exists():
+        return False
+    return any(root.glob("probe_layer_*.pt"))
+
+
 def load_classifier_weight(path: Path) -> np.ndarray:
     state = torch.load(str(path), map_location="cpu")
     w = state["classifier.weight"].detach().cpu().numpy().reshape(-1)
@@ -444,6 +463,10 @@ def main() -> int:
     full_cells = read_matrix_csv(Path(args.matrix_full_csv))
     comp_rows, comp_cols = matrix_row_col_lists(comp_cells)
     full_rows, full_cols = matrix_row_col_lists(full_cells)
+    all_datasets = sort_datasets(set(comp_rows) | set(comp_cols) | set(full_rows) | set(full_cols))
+    no_probe_datasets = {ds for ds in all_datasets if not dataset_has_any_probes(probes_model_root, ds)}
+    if no_probe_datasets:
+        print(f"[info] datasets with no probes (probe-angle NA where applicable): {sorted(no_probe_datasets)}")
     mark("load_matrices")
     print("[done] matrices loaded")
 
@@ -474,6 +497,8 @@ def main() -> int:
             if not cell:
                 continue
             if cell.layer < 0:
+                continue
+            if ds in no_probe_datasets:
                 continue
             pooling = normalize_pooling(cell.pooling)
             probe_path = resolve_probe_path(probes_model_root, ds, pooling, cell.layer)
@@ -537,7 +562,9 @@ def main() -> int:
 
         def needed_poolings_for_layer(ds_name: str, layer: int) -> List[str]:
             if args.covariance_scope == "all":
-                return ALL_POOLINGS
+                if dataset_has_attn_probes(probes_model_root, ds_name):
+                    return ALL_POOLINGS
+                return ["mean", "max", "last"]
             # required: poolings used when this dataset is the source row.
             # Attn pooling is source-probe dependent, so target-only datasets (e.g. IT)
             # should not force attn requirements.
@@ -545,6 +572,8 @@ def main() -> int:
             for (r, c), cell in cells.items():
                 if r == ds_name and cell.layer == layer:
                     pset.add(normalize_pooling(cell.pooling))
+            if "attn" in pset and not dataset_has_attn_probes(probes_model_root, ds_name):
+                pset.remove("attn")
             return sorted(pset) if pset else []
 
         for ds in datasets:
@@ -629,6 +658,8 @@ def main() -> int:
                     continue
                 if c not in canon:
                     continue
+                if r in no_probe_datasets:
+                    continue
                 cell = cells.get((r, c))
                 if cell is None or cell.layer < 0:
                     continue
@@ -659,6 +690,8 @@ def main() -> int:
                 cell_ab = cells.get((r, c))
                 cell_ba = cells.get((c, r))
                 if cell_ab is None or cell_ba is None:
+                    continue
+                if r in no_probe_datasets or c in no_probe_datasets:
                     continue
                 if cell_ab.layer < 0 or cell_ba.layer < 0:
                     continue
