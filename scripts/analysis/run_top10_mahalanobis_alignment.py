@@ -567,12 +567,11 @@ def main() -> int:
         },
     )
     update_status(status_path, "running", "starting")
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"[start] run_id={run_id}")
     print(f"[start] model={args.model} device={device}")
     print(f"[start] activations_root={args.activations_root}")
     print(f"[start] probes_root={args.probes_root}")
-
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     def done(step: str) -> bool:
         return bool(args.resume and step in progress.get("completed_steps", []))
