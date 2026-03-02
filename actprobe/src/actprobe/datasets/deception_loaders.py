@@ -706,7 +706,7 @@ class DeceptionAILiarDataset(BaseDataset):
         return self.data[idx]
 
 
-class DeceptionInstructedDeceptionDataset(BaseDataset):
+class DeceptionTypedMessagesDataset(BaseDataset):
     """
     Loader for instructed-deception data with pre-generated assistant completions.
 
@@ -763,16 +763,30 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
 
         if self.actual_data_file is None:
             raise FileNotFoundError(
-                "Instructed-deception data not found. Tried:\n"
+                "Typed deception dataset not found. Tried:\n"
                 + "\n".join(f"  - {p}" for p in possible_paths)
             )
 
         # If not explicitly provided, infer metadata dataset/id prefix from source file.
         inferred_source = os.path.basename(self.actual_data_file).lower()
         if self.dataset_name is None:
-            self.dataset_name = "Deception-Mask" if "mask__" in inferred_source else "Deception-InstructedDeception"
+            if "mask__" in inferred_source:
+                self.dataset_name = "Deception-Mask"
+            elif "harm-pressure-choice__" in inferred_source:
+                self.dataset_name = "Deception-HarmPressureChoice"
+            elif "convincing-game__" in inferred_source:
+                self.dataset_name = "Deception-ConvincingGame"
+            else:
+                self.dataset_name = "Deception-InstructedDeception"
         if self.id_prefix is None:
-            self.id_prefix = "mask" if "mask__" in inferred_source else "instructed_deception"
+            if "mask__" in inferred_source:
+                self.id_prefix = "mask"
+            elif "harm-pressure-choice__" in inferred_source:
+                self.id_prefix = "harm_pressure_choice"
+            elif "convincing-game__" in inferred_source:
+                self.id_prefix = "convincing_game"
+            else:
+                self.id_prefix = "instructed_deception"
 
     @staticmethod
     def _normalize_messages(raw_messages: Any) -> List[Dict[str, str]]:
@@ -1108,7 +1122,7 @@ class DeceptionInstructedDeceptionDataset(BaseDataset):
         return self.data[idx]
 
 
-class DeceptionMaskDataset(DeceptionInstructedDeceptionDataset):
+class DeceptionMaskDataset(DeceptionTypedMessagesDataset):
     """
     Mask dataset wrapper that reuses instructed-deception parsing logic.
     """
@@ -1128,3 +1142,7 @@ class DeceptionMaskDataset(DeceptionInstructedDeceptionDataset):
             dataset_name="Deception-Mask",
             id_prefix="mask",
         )
+
+
+# Backward-compatible alias
+DeceptionInstructedDeceptionDataset = DeceptionTypedMessagesDataset
