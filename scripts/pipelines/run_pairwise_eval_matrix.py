@@ -23,6 +23,7 @@ import csv
 import glob
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -510,6 +511,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force_reeval", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--artifact_root", type=str, default="artifacts")
+    parser.add_argument(
+        "--pipeline_results_root",
+        type=str,
+        default=None,
+        help=(
+            "Optional external directory to mirror pipeline run artifacts "
+            "(results/meta/checkpoints). "
+            "Default: <results_model_root>/All_dataset_pairwise_results"
+        ),
+    )
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
@@ -675,6 +686,7 @@ def main() -> int:
             },
             "poolings": poolings,
             "resume": bool(args.resume),
+            "pipeline_results_root": args.pipeline_results_root,
         },
     )
     update_status(status_path, "running", "starting")
@@ -684,6 +696,24 @@ def main() -> int:
     print(f"[start] probes_model_root={probes_model_root}")
     print(f"[start] results_model_root={results_model_root}")
     print_stage_dashboard(progress)
+
+    external_pipeline_root = (
+        Path(args.pipeline_results_root)
+        if args.pipeline_results_root
+        else (results_model_root / "All_dataset_pairwise_results")
+    )
+    external_run_root = external_pipeline_root / run_id
+
+    def mirror_pipeline_outputs() -> None:
+        external_run_root.mkdir(parents=True, exist_ok=True)
+        for sub in ["results", "meta", "checkpoints"]:
+            src = run_root / sub
+            if not src.exists():
+                continue
+            dst = external_run_root / sub
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
 
     def mark_step(step: str) -> None:
         done_set = set(progress["completed_steps"])
@@ -1087,6 +1117,7 @@ def main() -> int:
         },
         "outputs": {
             "run_root": str(run_root),
+            "external_run_root": str(external_run_root),
             "results_model_root": str(results_model_root),
             "matrix_completion_csv": str(out_dir / "matrix_completion.csv"),
             "matrix_full_csv": str(out_dir / "matrix_full.csv"),
@@ -1095,14 +1126,15 @@ def main() -> int:
         },
     }
     write_json(out_dir / "summary.json", summary)
+    mirror_pipeline_outputs()
     mark_step("stage5_aggregate")
 
     update_status(status_path, "completed", "finished")
     print("[done] stage 5")
     print(f"[done] summary -> {out_dir / 'summary.json'}")
+    print(f"[done] mirrored pipeline outputs -> {external_run_root}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
