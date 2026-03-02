@@ -605,10 +605,66 @@ def main() -> int:
                     mat[i, j] = np.nan
         return mat
 
+    def probe_angle_matrix_v2(
+        rows: List[str],
+        cols: List[str],
+        cells: Dict[Tuple[str, str], CellMeta],
+        sigma: np.ndarray,
+    ) -> np.ndarray:
+        mat = np.full((len(rows), len(cols)), np.nan, dtype=np.float64)
+        for i, r in enumerate(rows):
+            for j, c in enumerate(cols):
+                if r == c:
+                    mat[i, j] = 1.0
+                    continue
+                cell_ab = cells.get((r, c))
+                cell_ba = cells.get((c, r))
+                if cell_ab is None or cell_ba is None:
+                    continue
+                if cell_ab.layer < 0 or cell_ba.layer < 0:
+                    continue
+                pooling_ab = normalize_pooling(cell_ab.pooling)
+                pooling_ba = normalize_pooling(cell_ba.pooling)
+                probe_a = resolve_probe_path(probes_model_root, r, pooling_ab, cell_ab.layer)
+                probe_b = resolve_probe_path(probes_model_root, c, pooling_ba, cell_ba.layer)
+                if not probe_a.exists() or not probe_b.exists():
+                    continue
+                try:
+                    w_a = load_classifier_weight(probe_a)
+                    w_b = load_classifier_weight(probe_b)
+                    mat[i, j] = mahalanobis_cosine(w_a, w_b, sigma)
+                except Exception:
+                    mat[i, j] = np.nan
+        return mat
+
     comp_probe_angle = probe_angle_matrix(comp_rows, comp_cols, comp_cells, comp_canon, sigma_comp)
     full_probe_angle = probe_angle_matrix(full_rows, full_cols, full_cells, full_canon, sigma_full)
-    save_matrix_csv(out_dir / "probe_angle_completion.csv", comp_probe_angle, [short_name(r) for r in comp_rows], [short_name(c) for c in comp_cols])
-    save_matrix_csv(out_dir / "probe_angle_full.csv", full_probe_angle, [short_name(r) for r in full_rows], [short_name(c) for c in full_cols])
+    comp_probe_angle_v2 = probe_angle_matrix_v2(comp_rows, comp_cols, comp_cells, sigma_comp)
+    full_probe_angle_v2 = probe_angle_matrix_v2(full_rows, full_cols, full_cells, sigma_full)
+    save_matrix_csv(
+        out_dir / "probe_angle_v1_completion.csv",
+        comp_probe_angle,
+        [short_name(r) for r in comp_rows],
+        [short_name(c) for c in comp_cols],
+    )
+    save_matrix_csv(
+        out_dir / "probe_angle_v1_full.csv",
+        full_probe_angle,
+        [short_name(r) for r in full_rows],
+        [short_name(c) for c in full_cols],
+    )
+    save_matrix_csv(
+        out_dir / "probe_angle_v2_completion.csv",
+        comp_probe_angle_v2,
+        [short_name(r) for r in comp_rows],
+        [short_name(c) for c in comp_cols],
+    )
+    save_matrix_csv(
+        out_dir / "probe_angle_v2_full.csv",
+        full_probe_angle_v2,
+        [short_name(r) for r in full_rows],
+        [short_name(c) for c in full_cols],
+    )
     mark("probe_angles")
 
     # Activation mean angle matrices
@@ -713,8 +769,10 @@ def main() -> int:
             "outputs": {
                 "score_matrix_completion": str(out_dir / "score_matrix_completion.csv"),
                 "score_matrix_full": str(out_dir / "score_matrix_full.csv"),
-                "probe_angle_completion": str(out_dir / "probe_angle_completion.csv"),
-                "probe_angle_full": str(out_dir / "probe_angle_full.csv"),
+                "probe_angle_v1_completion": str(out_dir / "probe_angle_v1_completion.csv"),
+                "probe_angle_v1_full": str(out_dir / "probe_angle_v1_full.csv"),
+                "probe_angle_v2_completion": str(out_dir / "probe_angle_v2_completion.csv"),
+                "probe_angle_v2_full": str(out_dir / "probe_angle_v2_full.csv"),
                 "activation_angle_completion": str(out_dir / "activation_mean_angle_completion.csv"),
                 "activation_angle_full": str(out_dir / "activation_mean_angle_full.csv"),
             },
