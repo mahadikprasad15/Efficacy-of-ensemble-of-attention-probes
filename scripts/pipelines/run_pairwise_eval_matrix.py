@@ -510,6 +510,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force_retrain", action="store_true")
     parser.add_argument("--force_reeval", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument("--skip_training", action="store_true", help="Skip training stage entirely.")
+    parser.add_argument(
+        "--only_sources",
+        type=str,
+        default=None,
+        help="Comma-separated list of source datasets to evaluate (filters eval/collect).",
+    )
+    parser.add_argument(
+        "--only_targets",
+        type=str,
+        default=None,
+        help="Comma-separated list of target datasets to evaluate (filters eval/collect).",
+    )
+    parser.add_argument(
+        "--only_segments",
+        type=str,
+        default=None,
+        help="Comma-separated list of segments to evaluate (completion,full).",
+    )
     parser.add_argument("--artifact_root", type=str, default="artifacts")
     parser.add_argument(
         "--pipeline_results_root",
@@ -635,6 +654,9 @@ def main() -> int:
     run_id = args.run_id or utc_run_id()
     use_tqdm = not args.no_tqdm
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    only_sources = set(x.strip() for x in args.only_sources.split(",") if x.strip()) if args.only_sources else None
+    only_targets = set(x.strip() for x in args.only_targets.split(",") if x.strip()) if args.only_targets else None
+    only_segments = set(x.strip() for x in args.only_segments.split(",") if x.strip()) if args.only_segments else None
 
     # Resolve roots (supports passing either .../<model_dir> or its parent)
     acts_base, acts_model_root = split_root_and_model(Path(args.activations_root), model_dir)
@@ -695,6 +717,10 @@ def main() -> int:
     print(f"[start] activations_model_root={acts_model_root}")
     print(f"[start] probes_model_root={probes_model_root}")
     print(f"[start] results_model_root={results_model_root}")
+    if only_sources or only_targets or only_segments:
+        print(f"[filter] only_sources={sorted(only_sources) if only_sources else None}")
+        print(f"[filter] only_targets={sorted(only_targets) if only_targets else None}")
+        print(f"[filter] only_segments={sorted(only_segments) if only_segments else None}")
     print_stage_dashboard(progress)
 
     external_pipeline_root = (
@@ -726,6 +752,21 @@ def main() -> int:
     pair_jobs = build_expected_pairs()
     eval_jobs = [j for j in pair_jobs if j.action == "eval_run"]
     collect_jobs = [j for j in pair_jobs if j.action == "collect_only"]
+    if only_segments:
+        eval_jobs = [j for j in eval_jobs if j.segment in only_segments]
+        collect_jobs = [j for j in collect_jobs if j.segment in only_segments]
+    if only_sources:
+        eval_jobs = [j for j in eval_jobs if j.source_dataset in only_sources]
+        collect_jobs = [j for j in collect_jobs if j.source_dataset in only_sources]
+    if only_targets:
+        eval_jobs = [j for j in eval_jobs if j.target_dataset in only_targets]
+        collect_jobs = [j for j in collect_jobs if j.target_dataset in only_targets]
+
+    # Train only sources that appear in the filtered eval jobs (when filters are provided).
+    train_sources = list(new_sources)
+    if only_sources or only_targets or only_segments:
+        filtered_sources = {j.source_dataset for j in eval_jobs}
+        train_sources = [s for s in new_sources if s in filtered_sources]
 
     # Export expected pair tables
     expected_rows: List[Dict[str, Any]] = []
@@ -766,67 +807,71 @@ def main() -> int:
     update_status(status_path, "running", "stage 1 training")
     print("[stage 1/5] train new probes")
     train_jobs: List[Tuple[str, str]] = []
-    for ds in new_sources:
+    for ds in train_sources:
         for pooling in poolings:
             train_jobs.append((ds, pooling))
 
-    pbar = tqdm(train_jobs, desc="train_jobs", disable=not use_tqdm)
-    for idx, (dataset_name, pooling) in enumerate(pbar, start=1):
-        job_id = f"{dataset_name}__{pooling}"
-        if args.resume and job_id in set(progress["completed_train_jobs"]):
-            print(f"[train] skip completed {job_id}")
-            continue
-        base = dataset_base(dataset_name)
-        out_pool_dir = probes_model_root / f"{base}_slices" / dataset_name / pooling
-        has_probes = bool(find_probe_layers(out_pool_dir))
-        if has_probes and not args.force_retrain:
-            print(f"[train] skip existing probes {job_id}")
-            progress["completed_train_jobs"].append(job_id)
-            write_json(progress_path, progress)
-            continue
+    if args.skip_training:
+        print("[train] skip_training enabled; skipping stage 1")
+        mark_step("stage1_train")
+    else:
+        pbar = tqdm(train_jobs, desc="train_jobs", disable=not use_tqdm)
+        for idx, (dataset_name, pooling) in enumerate(pbar, start=1):
+            job_id = f"{dataset_name}__{pooling}"
+            if args.resume and job_id in set(progress["completed_train_jobs"]):
+                print(f"[train] skip completed {job_id}")
+                continue
+            base = dataset_base(dataset_name)
+            out_pool_dir = probes_model_root / f"{base}_slices" / dataset_name / pooling
+            has_probes = bool(find_probe_layers(out_pool_dir))
+            if has_probes and not args.force_retrain:
+                print(f"[train] skip existing probes {job_id}")
+                progress["completed_train_jobs"].append(job_id)
+                write_json(progress_path, progress)
+                continue
 
-        cmd = [
-            sys.executable,
-            "scripts/training/train_deception_probes.py",
-            "--model",
-            args.model,
-            "--dataset",
-            dataset_name,
-            "--activations_dir",
-            str(acts_base),
-            "--pooling",
-            pooling,
-            "--output_dir",
-            str(probes_base),
-            "--output_subdir",
-            f"{base}_slices",
-            "--output_dataset_name",
-            dataset_name,
-            "--batch_size",
-            str(args.train_batch_size),
-            "--epochs",
-            str(args.epochs),
-            "--patience",
-            str(args.patience),
-            "--lr",
-            str(args.lr),
-            "--weight_decay",
-            str(args.weight_decay),
-            "--resume",
-        ]
-        t0 = time.time()
-        print(f"[train] ({idx}/{len(train_jobs)}) start {job_id}")
-        proc = subprocess.run(cmd, text=True)
-        if proc.returncode != 0:
-            update_status(status_path, "failed", f"training failed for {job_id}")
-            raise RuntimeError(f"Training failed for {job_id}")
-        elapsed = time.time() - t0
-        print(f"[train] done {job_id} in {elapsed:.1f}s")
-        progress["completed_train_jobs"].append(job_id)
-        progress["updated_at"] = utc_now()
-        write_json(progress_path, progress)
-        if args.progress_every > 0 and idx % args.progress_every == 0:
-            print(f"[train] checkpoint at {idx}/{len(train_jobs)}")
+            cmd = [
+                sys.executable,
+                "scripts/training/train_deception_probes.py",
+                "--model",
+                args.model,
+                "--dataset",
+                dataset_name,
+                "--activations_dir",
+                str(acts_base),
+                "--pooling",
+                pooling,
+                "--output_dir",
+                str(probes_base),
+                "--output_subdir",
+                f"{base}_slices",
+                "--output_dataset_name",
+                dataset_name,
+                "--batch_size",
+                str(args.train_batch_size),
+                "--epochs",
+                str(args.epochs),
+                "--patience",
+                str(args.patience),
+                "--lr",
+                str(args.lr),
+                "--weight_decay",
+                str(args.weight_decay),
+                "--resume",
+            ]
+            t0 = time.time()
+            print(f"[train] ({idx}/{len(train_jobs)}) start {job_id}")
+            proc = subprocess.run(cmd, text=True)
+            if proc.returncode != 0:
+                update_status(status_path, "failed", f"training failed for {job_id}")
+                raise RuntimeError(f"Training failed for {job_id}")
+            elapsed = time.time() - t0
+            print(f"[train] done {job_id} in {elapsed:.1f}s")
+            progress["completed_train_jobs"].append(job_id)
+            progress["updated_at"] = utc_now()
+            write_json(progress_path, progress)
+            if args.progress_every > 0 and idx % args.progress_every == 0:
+                print(f"[train] checkpoint at {idx}/{len(train_jobs)}")
 
     mark_step("stage1_train")
     print("[done] stage 1")
@@ -1105,7 +1150,7 @@ def main() -> int:
         "completed_at": utc_now(),
         "model": args.model,
         "counts": {
-            "train_jobs_total": len(new_sources) * len(poolings),
+            "train_jobs_total": len(train_jobs),
             "train_jobs_completed": len(set(progress["completed_train_jobs"])),
             "eval_pairs_total": len(eval_jobs),
             "eval_pairs_completed": len(set(progress["completed_eval_pairs"])),
