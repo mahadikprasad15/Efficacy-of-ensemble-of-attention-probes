@@ -227,9 +227,15 @@ def load_classifier_weight(path: Path) -> np.ndarray:
 
 
 class Pooler:
-    def __init__(self, pooling: str, attn_model: Optional[AttentionLinearProbeCompat] = None):
+    def __init__(
+        self,
+        pooling: str,
+        attn_model: Optional[AttentionLinearProbeCompat] = None,
+        layer_probe_model: Optional[LayerProbe] = None,
+    ):
         self.pooling = pooling
         self.attn_model = attn_model
+        self.layer_probe_model = layer_probe_model
 
     def pool(self, x: torch.Tensor) -> torch.Tensor:
         # x: (T,D) or (D,)
@@ -242,20 +248,29 @@ class Pooler:
         if self.pooling == "last":
             return x[-1]
         if self.pooling == "attn":
-            if self.attn_model is None:
+            if self.attn_model is not None:
+                with torch.no_grad():
+                    weights = torch.softmax(self.attn_model.attn(x), dim=0)  # (T,1)
+                    return (x * weights).sum(dim=0)
+            if self.layer_probe_model is not None:
+                with torch.no_grad():
+                    return self.layer_probe_model.pooling(x.unsqueeze(0)).squeeze(0)
+            if self.attn_model is None and self.layer_probe_model is None:
                 raise RuntimeError("Attn pooling requested but attn_model is None.")
-            with torch.no_grad():
-                weights = torch.softmax(self.attn_model.attn(x), dim=0)  # (T,1)
-                return (x * weights).sum(dim=0)
         raise ValueError(f"Unsupported pooling: {self.pooling}")
 
 
 def load_attn_pooler(probe_path: Path, input_dim: int, device: torch.device) -> Pooler:
     state = torch.load(str(probe_path), map_location=device)
-    model = AttentionLinearProbeCompat(input_dim=input_dim).to(device)
+    if any(k.startswith("attn.") for k in state.keys()):
+        model = AttentionLinearProbeCompat(input_dim=input_dim).to(device)
+        model.load_state_dict(state)
+        model.eval()
+        return Pooler("attn", attn_model=model)
+    model = LayerProbe(input_dim=input_dim, pooling_type="attn").to(device)
     model.load_state_dict(state)
     model.eval()
-    return Pooler("attn", attn_model=model)
+    return Pooler("attn", layer_probe_model=model)
 
 
 def ensure_split(dataset_dir: Path, split: str, fallback: Optional[str]) -> Path:
