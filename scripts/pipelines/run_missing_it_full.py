@@ -14,7 +14,11 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence, Set
 
-from scripts.pipelines.run_pairwise_eval_matrix import (
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.pipelines.run_pairwise_eval_matrix import (  # noqa: E402
     parse_existing_pair_summary,
     split_root_and_model,
     stage_spec,
