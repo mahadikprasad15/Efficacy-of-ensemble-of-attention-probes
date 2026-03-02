@@ -249,12 +249,16 @@ class Pooler:
             return x[-1]
         if self.pooling == "attn":
             if self.attn_model is not None:
+                model_device = next(self.attn_model.parameters()).device
+                x_model = x.to(model_device)
                 with torch.no_grad():
-                    weights = torch.softmax(self.attn_model.attn(x), dim=0)  # (T,1)
-                    return (x * weights).sum(dim=0)
+                    weights = torch.softmax(self.attn_model.attn(x_model), dim=0)  # (T,1)
+                    return (x_model * weights).sum(dim=0)
             if self.layer_probe_model is not None:
+                model_device = next(self.layer_probe_model.parameters()).device
+                x_model = x.to(model_device)
                 with torch.no_grad():
-                    return self.layer_probe_model.pooling(x.unsqueeze(0)).squeeze(0)
+                    return self.layer_probe_model.pooling(x_model.unsqueeze(0)).squeeze(0)
             if self.attn_model is None and self.layer_probe_model is None:
                 raise RuntimeError("Attn pooling requested but attn_model is None.")
         raise ValueError(f"Unsupported pooling: {self.pooling}")
