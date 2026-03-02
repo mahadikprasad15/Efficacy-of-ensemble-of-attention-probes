@@ -28,6 +28,7 @@ import re
 import string
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -39,6 +40,7 @@ import torch.nn as nn
 from safetensors.torch import load_file
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import roc_auc_score
+from tqdm import tqdm
 
 import sys
 
@@ -513,6 +515,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--progress_every", type=int, default=200,
                    help="Print progress every N samples (0 to disable).")
+    p.add_argument("--no_tqdm", action="store_true",
+                   help="Disable tqdm progress bars.")
     return p.parse_args()
 
 
@@ -563,6 +567,10 @@ def main() -> int:
         },
     )
     update_status(status_path, "running", "starting")
+    print(f"[start] run_id={run_id}")
+    print(f"[start] model={args.model} device={device}")
+    print(f"[start] activations_root={args.activations_root}")
+    print(f"[start] probes_root={args.probes_root}")
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -578,8 +586,10 @@ def main() -> int:
 
     # Step 1: load tables + top10
     update_status(status_path, "running", "loading top20 tables")
+    print("[step] loading top20 tables")
     top10_csv_path = results_dir / "top10_rows.csv"
     if done("top10_selection") and top10_csv_path.exists():
+        print(f"[resume] top10 selection found at {top10_csv_path}")
         top10_df = pd.read_csv(top10_csv_path)
     else:
         df_role = load_table(
@@ -597,9 +607,11 @@ def main() -> int:
         top10_df = select_top10(df_role, df_ai)
         top10_df.to_csv(top10_csv_path, index=False)
         mark("top10_selection")
+        print(f"[done] top10 selection -> {top10_csv_path}")
 
     # Step 2: build probe rows
     update_status(status_path, "running", "resolving top10 probes")
+    print("[step] resolving probe paths")
     probe_rows: List[ProbeRow] = []
     for _, row in top10_df.iterrows():
         source_base, source_segment = parse_source_probe(str(row["Source Probe"]))
@@ -633,9 +645,11 @@ def main() -> int:
         )
     if len(probe_rows) != 10:
         raise RuntimeError(f"Expected 10 probe rows, got {len(probe_rows)}")
+    print("[done] resolved 10 probe rows")
 
     # Step 3: instantiate probes
     update_status(status_path, "running", "loading probe checkpoints")
+    print("[step] loading probe checkpoints")
     probe_handles: List[ProbeHandle] = []
     for pr in probe_rows:
         input_dim = infer_input_dim_from_probe(pr.probe_path)
@@ -649,10 +663,13 @@ def main() -> int:
             )
         )
     d_model = probe_handles[0].input_dim
+    print(f"[done] loaded probes (input_dim={d_model})")
 
     # Step 4: evaluate all probes on unique targets + stream covariance for target-test baseline
     update_status(status_path, "running", "evaluating probes on unique top10 targets")
+    print("[step] evaluating probes on unique targets")
     unique_targets = sorted({r.target_dataset for r in probe_rows})
+    print(f"[info] unique targets: {unique_targets}")
 
     probe_labels = [f"p{i}:{r.source_probe}|{r.pooling}|L{r.layer}" for i, r in enumerate(probe_rows)]
     target_labels = [t.replace("Deception-", "") for t in unique_targets]
@@ -662,6 +679,7 @@ def main() -> int:
     need_cov_probe = not (done("cov_target_test") and cov_probe_path.exists())
     acc_target = CovAccumulator(d_model) if need_cov_probe else None
 
+    use_tqdm = not args.no_tqdm
     for j, tgt in enumerate(unique_targets):
         split_dir = ensure_split(
             Path(args.activations_root),
@@ -670,11 +688,16 @@ def main() -> int:
             args.target_split,
             fallback=args.target_split_fallback,
         )
+        print(f"[targets] {tgt} split_dir={split_dir}")
 
         per_probe_logits: List[List[float]] = [[] for _ in range(len(probe_handles))]
         labels: List[int] = []
         sample_count = 0
-        for tensor, y in iter_labeled_activations(split_dir):
+        t0 = time.time()
+        iterator = iter_labeled_activations(split_dir)
+        if use_tqdm:
+            iterator = tqdm(iterator, desc=f"targets:{tgt}", unit="sample")
+        for tensor, y in iterator:
             labels.append(y)
             pooled_rows = []
             for i, ph in enumerate(probe_handles):
@@ -685,13 +708,31 @@ def main() -> int:
                 acc_target.update(np.stack(pooled_rows, axis=0))
             sample_count += 1
             if args.progress_every and sample_count % args.progress_every == 0:
-                print(f"[targets] {tgt} processed {sample_count} samples")
+                elapsed = max(time.time() - t0, 1e-6)
+                rate = sample_count / elapsed
+                print(f"[targets] {tgt} processed {sample_count} samples ({rate:.2f} samples/s)")
 
         for i in range(len(probe_handles)):
             score_unique[i, j] = compute_auc(labels, per_probe_logits[i])
+        elapsed = max(time.time() - t0, 1e-6)
+        rate = sample_count / elapsed
+        print(f"[targets] {tgt} done: {sample_count} samples ({rate:.2f} samples/s)")
+
+        # Save partial score matrices after each target segment
+        np.save(results_dir / "score_matrix_unique.partial.npy", score_unique)
+        save_matrix_csv(results_dir / "score_matrix_unique.partial.csv", score_unique, probe_labels, target_labels)
+        score_10x10_partial = np.zeros((10, 10), dtype=np.float64)
+        for jj, row in enumerate(probe_rows):
+            t = row.target_dataset
+            if t in target_to_col:
+                score_10x10_partial[:, jj] = score_unique[:, target_to_col[t]]
+        np.save(results_dir / "score_matrix_10x10.partial.npy", score_10x10_partial)
+        save_matrix_csv(results_dir / "score_matrix_10x10.partial.csv", score_10x10_partial, probe_labels, col_labels_10)
+        update_status(status_path, "running", f"finished target {tgt}")
 
     np.save(results_dir / "score_matrix_unique.npy", score_unique)
     save_matrix_csv(results_dir / "score_matrix_unique.csv", score_unique, probe_labels, target_labels)
+    print("[done] score matrices (unique targets)")
 
     # 10x10 matrix aligned to top10 target columns for correlation with 10x10 angles
     target_to_col = {t: idx for idx, t in enumerate(unique_targets)}
@@ -703,10 +744,13 @@ def main() -> int:
         score_10x10[:, j] = score_unique[:, target_to_col[t]]
     np.save(results_dir / "score_matrix_10x10.npy", score_10x10)
     save_matrix_csv(results_dir / "score_matrix_10x10.csv", score_10x10, probe_labels, col_labels_10)
+    print("[done] score matrix 10x10")
 
     # Step 5: shared Σ for probe angles from pooled target-test activations
     update_status(status_path, "running", "computing shared target-test covariance for probe angles")
+    print("[step] computing target-test covariance for probe angles")
     if done("cov_target_test") and cov_probe_path.exists():
+        print(f"[resume] using cached target covariance {cov_probe_path}")
         sigma_probe = np.load(cov_probe_path)
     else:
         if acc_target is None:
@@ -714,9 +758,11 @@ def main() -> int:
         sigma_probe = acc_target.finalize(eps=args.cov_eps)
         np.save(cov_probe_path, sigma_probe)
         mark("cov_target_test")
+        print(f"[done] target-test covariance saved -> {cov_probe_path}")
 
     # Step 6: probe angle matrix
     update_status(status_path, "running", "computing probe angle matrix")
+    print("[step] computing probe angle matrix")
     probe_angle = np.zeros((10, 10), dtype=np.float64)
     for i in range(10):
         wi = probe_handles[i].weight
@@ -725,12 +771,15 @@ def main() -> int:
             probe_angle[i, j] = mahalanobis_cosine(wi, wj, sigma_probe)
     np.save(results_dir / "probe_angle_matrix.npy", probe_angle)
     save_matrix_csv(results_dir / "probe_angle_matrix.csv", probe_angle, probe_labels, probe_labels)
+    print("[done] probe angle matrix")
 
     # Step 7: source-train means + Σ for activation means
     update_status(status_path, "running", "computing source-train activation means and covariance")
+    print("[step] computing source-train means and covariance")
     cov_source_path = checkpoints_dir / "cov_source_train.npy"
     means_path = checkpoints_dir / "source_means.npy"
     if done("source_means_cov") and cov_source_path.exists() and means_path.exists():
+        print(f"[resume] using cached source means/cov at {cov_source_path}")
         sigma_source = np.load(cov_source_path)
         source_means = np.load(means_path)
     else:
@@ -744,8 +793,12 @@ def main() -> int:
 
         for src_dataset, indices in source_to_indices.items():
             split_dir = ensure_split(Path(args.activations_root), model_dir, src_dataset, args.source_split)
+            print(f"[sources] {src_dataset} split_dir={split_dir}")
             sample_count = 0
-            for tensor, _ in iter_labeled_activations(split_dir):
+            iterator = iter_labeled_activations(split_dir)
+            if use_tqdm:
+                iterator = tqdm(iterator, desc=f"sources:{src_dataset}", unit="sample")
+            for tensor, _ in iterator:
                 pooled_rows = []
                 for idx in indices:
                     pooled = probe_handles[idx].pooled_vector(tensor).numpy().astype(np.float64)
@@ -766,9 +819,11 @@ def main() -> int:
         np.save(cov_source_path, sigma_source)
         np.save(means_path, source_means)
         mark("source_means_cov")
+        print(f"[done] source-train covariance saved -> {cov_source_path}")
 
     # Step 8: activation-mean angle matrix
     update_status(status_path, "running", "computing activation mean angle matrix")
+    print("[step] computing activation mean angle matrix")
     act_angle = np.zeros((10, 10), dtype=np.float64)
     for i in range(10):
         vi = source_means[i]
@@ -777,9 +832,11 @@ def main() -> int:
             act_angle[i, j] = mahalanobis_cosine(vi, vj, sigma_source)
     np.save(results_dir / "activation_mean_angle_matrix.npy", act_angle)
     save_matrix_csv(results_dir / "activation_mean_angle_matrix.csv", act_angle, probe_labels, probe_labels)
+    print("[done] activation mean angle matrix")
 
     # Step 9: correlations + plots
     update_status(status_path, "running", "correlating matrices and plotting")
+    print("[step] correlating matrices and plotting")
     x_pa, y_sc = matrix_offdiag_values(probe_angle, score_10x10)
     x_aa, y_pa = matrix_offdiag_values(act_angle, probe_angle)
     x_aa2, y_sc2 = matrix_offdiag_values(act_angle, score_10x10)
@@ -805,6 +862,7 @@ def main() -> int:
         },
     }
     write_json(results_dir / "correlations.json", correlations)
+    print("[done] correlations")
 
     plot_heatmap(results_dir / "plots" / "probe_angle_matrix.png", probe_angle, "Probe Mahalanobis Cosine (10x10)")
     plot_heatmap(results_dir / "plots" / "score_matrix_10x10.png", score_10x10, "Score Matrix AUC (10x10)", vmin=0.0, vmax=1.0)
