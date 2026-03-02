@@ -672,6 +672,8 @@ def main() -> int:
 
     probe_labels = [f"p{i}:{r.source_probe}|{r.pooling}|L{r.layer}" for i, r in enumerate(probe_rows)]
     target_labels = [t.replace("Deception-", "") for t in unique_targets]
+    target_to_col = {t: idx for idx, t in enumerate(unique_targets)}
+    col_labels_10 = [f"t{j}:{row.target_dataset.replace('Deception-', '')}" for j, row in enumerate(probe_rows)]
 
     score_unique = np.zeros((len(probe_rows), len(unique_targets)), dtype=np.float64)
     cov_probe_path = checkpoints_dir / "cov_target_test.npy"
@@ -734,12 +736,9 @@ def main() -> int:
     print("[done] score matrices (unique targets)")
 
     # 10x10 matrix aligned to top10 target columns for correlation with 10x10 angles
-    target_to_col = {t: idx for idx, t in enumerate(unique_targets)}
     score_10x10 = np.zeros((10, 10), dtype=np.float64)
-    col_labels_10 = []
     for j, row in enumerate(probe_rows):
         t = row.target_dataset
-        col_labels_10.append(f"t{j}:{t.replace('Deception-', '')}")
         score_10x10[:, j] = score_unique[:, target_to_col[t]]
     np.save(results_dir / "score_matrix_10x10.npy", score_10x10)
     save_matrix_csv(results_dir / "score_matrix_10x10.csv", score_10x10, probe_labels, col_labels_10)
