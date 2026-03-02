@@ -70,6 +70,7 @@ class ProbeRow:
     source_table: str
     source_probe: str
     source_dataset: str
+    source_segment: str
     target_label: str
     target_dataset: str
     pooling: str
@@ -121,12 +122,10 @@ def parse_source_probe(source_probe: str) -> Tuple[str, str]:
     s = source_probe.strip()
     if s.startswith("Roleplaying "):
         seg = s[len("Roleplaying ") :].strip().lower()
-        dataset = "Deception-Roleplaying" if seg == "full" else f"Deception-Roleplaying-{seg}"
-        return dataset, "Deception-Roleplaying"
+        return "Deception-Roleplaying", seg
     if s.startswith("AI Liar "):
         seg = s[len("AI Liar ") :].strip().lower()
-        dataset = "Deception-AILiar" if seg == "full" else f"Deception-AILiar-{seg}"
-        return dataset, "Deception-AILiar"
+        return "Deception-AILiar", seg
     raise ValueError(f"Unsupported source probe format: {source_probe}")
 
 
@@ -273,15 +272,35 @@ def infer_input_dim_from_probe(probe_path: Path) -> int:
 def resolve_probe_path(
     probes_root: Path,
     model_dir: str,
-    source_dataset: str,
     source_base: str,
+    source_segment: str,
     pooling: str,
     layer: int,
 ) -> Path:
-    path = probes_root / model_dir / f"{source_base}_slices" / source_dataset / pooling / f"probe_layer_{layer}.pt"
-    if not path.exists():
-        raise FileNotFoundError(f"Probe not found: {path}")
-    return path
+    # Build candidate dataset dirs under <base>_slices.
+    # Segment "full" may be stored as base (no suffix) or base-full.
+    candidates: List[str] = []
+    if source_segment == "full":
+        candidates = [source_base, f"{source_base}-full"]
+    else:
+        candidates = [f"{source_base}-{source_segment}"]
+
+    tried: List[Path] = []
+    for dataset_dir in candidates:
+        path = (
+            probes_root
+            / model_dir
+            / f"{source_base}_slices"
+            / dataset_dir
+            / pooling
+            / f"probe_layer_{layer}.pt"
+        )
+        tried.append(path)
+        if path.exists():
+            return path
+
+    tried_str = "\n".join(str(p) for p in tried)
+    raise FileNotFoundError(f"Probe not found. Tried:\n{tried_str}")
 
 
 def load_label_map(split_dir: Path) -> Dict[str, int]:
@@ -581,15 +600,16 @@ def main() -> int:
     update_status(status_path, "running", "resolving top10 probes")
     probe_rows: List[ProbeRow] = []
     for _, row in top10_df.iterrows():
-        source_dataset, source_base = parse_source_probe(str(row["Source Probe"]))
+        source_base, source_segment = parse_source_probe(str(row["Source Probe"]))
+        source_dataset = source_base if source_segment == "full" else f"{source_base}-{source_segment}"
         target_dataset = parse_target_dataset(str(row["Target Dataset (Test)"]))
         pooling = normalize_pooling(str(row["Best Pooling"]))
         layer = int(row["Best Layer"])
         probe_path = resolve_probe_path(
             probes_root=Path(args.probes_root),
             model_dir=model_dir,
-            source_dataset=source_dataset,
             source_base=source_base,
+            source_segment=source_segment,
             pooling=pooling,
             layer=layer,
         )
@@ -599,6 +619,7 @@ def main() -> int:
                 source_table=str(row["source_table"]),
                 source_probe=str(row["Source Probe"]),
                 source_dataset=source_dataset,
+                source_segment=source_segment,
                 target_label=str(row["Target Dataset (Test)"]),
                 target_dataset=target_dataset,
                 pooling=pooling,
