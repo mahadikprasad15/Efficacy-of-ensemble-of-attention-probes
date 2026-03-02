@@ -546,6 +546,12 @@ def main() -> int:
     status_path = meta_dir / "status.json"
     progress_path = checkpoints_dir / "progress.json"
     progress = read_json(progress_path, default={"completed_steps": []})
+    if "completed_steps" not in progress:
+        progress["completed_steps"] = []
+    if "completed_targets" not in progress:
+        progress["completed_targets"] = []
+    if "completed_sources" not in progress:
+        progress["completed_sources"] = []
 
     write_json(
         manifest_path,
@@ -583,9 +589,27 @@ def main() -> int:
         progress["updated_at"] = utc_now_iso()
         write_json(progress_path, progress)
 
+    stages: List[Tuple[str, str]] = [
+        ("top10_selection", "Load/Select Top10"),
+        ("probe_rows", "Resolve Probe Rows"),
+        ("probe_load", "Load Probe Checkpoints"),
+        ("target_eval", "Evaluate Probes On Targets"),
+        ("cov_target_test", "Compute Target Covariance"),
+        ("probe_angle", "Compute Probe Angle Matrix"),
+        ("source_means_cov", "Compute Source Means/Covariance"),
+        ("activation_angle", "Compute Activation Angle Matrix"),
+        ("correlations", "Correlate + Plot + Save"),
+    ]
+    completed_set = set(progress.get("completed_steps", []))
+    done_count = sum(1 for key, _ in stages if key in completed_set)
+    print(f"[progress] stages done={done_count}/{len(stages)} remaining={len(stages)-done_count}")
+    for idx, (key, label) in enumerate(stages, start=1):
+        status = "done" if key in completed_set else "pending"
+        print(f"[progress] [{idx}/{len(stages)}] {label}: {status}")
+
     # Step 1: load tables + top10
     update_status(status_path, "running", "loading top20 tables")
-    print("[step] loading top20 tables")
+    print("[stage 1/9] loading top20 tables")
     top10_csv_path = results_dir / "top10_rows.csv"
     if done("top10_selection") and top10_csv_path.exists():
         print(f"[resume] top10 selection found at {top10_csv_path}")
@@ -610,7 +634,7 @@ def main() -> int:
 
     # Step 2: build probe rows
     update_status(status_path, "running", "resolving top10 probes")
-    print("[step] resolving probe paths")
+    print("[stage 2/9] resolving probe paths")
     probe_rows: List[ProbeRow] = []
     for _, row in top10_df.iterrows():
         source_base, source_segment = parse_source_probe(str(row["Source Probe"]))
@@ -645,10 +669,11 @@ def main() -> int:
     if len(probe_rows) != 10:
         raise RuntimeError(f"Expected 10 probe rows, got {len(probe_rows)}")
     print("[done] resolved 10 probe rows")
+    mark("probe_rows")
 
     # Step 3: instantiate probes
     update_status(status_path, "running", "loading probe checkpoints")
-    print("[step] loading probe checkpoints")
+    print("[stage 3/9] loading probe checkpoints")
     probe_handles: List[ProbeHandle] = []
     for pr in probe_rows:
         input_dim = infer_input_dim_from_probe(pr.probe_path)
@@ -663,10 +688,11 @@ def main() -> int:
         )
     d_model = probe_handles[0].input_dim
     print(f"[done] loaded probes (input_dim={d_model})")
+    mark("probe_load")
 
     # Step 4: evaluate all probes on unique targets + stream covariance for target-test baseline
     update_status(status_path, "running", "evaluating probes on unique top10 targets")
-    print("[step] evaluating probes on unique targets")
+    print("[stage 4/9] evaluating probes on unique targets")
     unique_targets = sorted({r.target_dataset for r in probe_rows})
     print(f"[info] unique targets: {unique_targets}")
 
@@ -676,12 +702,63 @@ def main() -> int:
     col_labels_10 = [f"t{j}:{row.target_dataset.replace('Deception-', '')}" for j, row in enumerate(probe_rows)]
 
     score_unique = np.zeros((len(probe_rows), len(unique_targets)), dtype=np.float64)
+    target_eval_ckpt_path = checkpoints_dir / "target_eval_checkpoint.npz"
     cov_probe_path = checkpoints_dir / "cov_target_test.npy"
     need_cov_probe = not (done("cov_target_test") and cov_probe_path.exists())
     acc_target = CovAccumulator(d_model) if need_cov_probe else None
+    completed_targets: List[str] = list(progress.get("completed_targets", []))
+
+    if done("target_eval") and (results_dir / "score_matrix_unique.npy").exists():
+        print("[resume] target evaluation already complete; loading cached score matrix")
+        score_unique = np.load(results_dir / "score_matrix_unique.npy")
+        completed_targets = list(unique_targets)
+        if acc_target is not None and target_eval_ckpt_path.exists():
+            ckpt = np.load(target_eval_ckpt_path, allow_pickle=True)
+            if "cov_sum" in ckpt and "cov_sum_xx" in ckpt and "cov_n" in ckpt:
+                acc_target.sum = ckpt["cov_sum"].astype(np.float64)
+                acc_target.sum_xx = ckpt["cov_sum_xx"].astype(np.float64)
+                acc_target.n = int(ckpt["cov_n"])
+            else:
+                print("[resume] covariance state missing in checkpoint; target stage will recompute")
+                completed_targets = []
+    elif args.resume and target_eval_ckpt_path.exists():
+        ckpt = np.load(target_eval_ckpt_path, allow_pickle=True)
+        ckpt_targets = [str(x) for x in ckpt["target_names"].tolist()]
+        if ckpt_targets == unique_targets and tuple(ckpt["score_unique"].shape) == tuple(score_unique.shape):
+            score_unique = ckpt["score_unique"].astype(np.float64)
+            completed_targets = [str(x) for x in ckpt["completed_targets"].tolist()]
+            if acc_target is not None and "cov_sum" in ckpt and "cov_sum_xx" in ckpt and "cov_n" in ckpt:
+                acc_target.sum = ckpt["cov_sum"].astype(np.float64)
+                acc_target.sum_xx = ckpt["cov_sum_xx"].astype(np.float64)
+                acc_target.n = int(ckpt["cov_n"])
+            print(
+                f"[resume] loaded target checkpoint: completed={len(completed_targets)}/{len(unique_targets)}"
+            )
+        else:
+            print("[resume] target checkpoint exists but is incompatible; recomputing target stage")
+
+    print(
+        f"[progress] target stage completed={len(completed_targets)}/{len(unique_targets)} "
+        f"remaining={len(unique_targets)-len(completed_targets)}"
+    )
+
+    def save_target_eval_checkpoint() -> None:
+        payload = {
+            "target_names": np.array(unique_targets, dtype=object),
+            "completed_targets": np.array(completed_targets, dtype=object),
+            "score_unique": score_unique,
+        }
+        if acc_target is not None:
+            payload["cov_n"] = np.array(acc_target.n, dtype=np.int64)
+            payload["cov_sum"] = acc_target.sum
+            payload["cov_sum_xx"] = acc_target.sum_xx
+        np.savez(target_eval_ckpt_path, **payload)
 
     use_tqdm = not args.no_tqdm
     for j, tgt in enumerate(unique_targets):
+        if tgt in completed_targets:
+            print(f"[targets] skip {tgt} (already completed)")
+            continue
         split_dir = ensure_split(
             Path(args.activations_root),
             model_dir,
@@ -689,7 +766,8 @@ def main() -> int:
             args.target_split,
             fallback=args.target_split_fallback,
         )
-        print(f"[targets] {tgt} split_dir={split_dir}")
+        remaining_before = len(unique_targets) - len(completed_targets)
+        print(f"[targets] start {tgt} ({j+1}/{len(unique_targets)}), remaining before={remaining_before}, split_dir={split_dir}")
 
         per_probe_logits: List[List[float]] = [[] for _ in range(len(probe_handles))]
         labels: List[int] = []
@@ -730,6 +808,16 @@ def main() -> int:
         np.save(results_dir / "score_matrix_10x10.partial.npy", score_10x10_partial)
         save_matrix_csv(results_dir / "score_matrix_10x10.partial.csv", score_10x10_partial, probe_labels, col_labels_10)
         update_status(status_path, "running", f"finished target {tgt}")
+        if tgt not in completed_targets:
+            completed_targets.append(tgt)
+            progress["completed_targets"] = completed_targets
+            progress["updated_at"] = utc_now_iso()
+            write_json(progress_path, progress)
+        save_target_eval_checkpoint()
+        print(
+            f"[targets] checkpoint saved: completed={len(completed_targets)}/{len(unique_targets)} "
+            f"remaining={len(unique_targets)-len(completed_targets)}"
+        )
 
     np.save(results_dir / "score_matrix_unique.npy", score_unique)
     save_matrix_csv(results_dir / "score_matrix_unique.csv", score_unique, probe_labels, target_labels)
@@ -743,10 +831,11 @@ def main() -> int:
     np.save(results_dir / "score_matrix_10x10.npy", score_10x10)
     save_matrix_csv(results_dir / "score_matrix_10x10.csv", score_10x10, probe_labels, col_labels_10)
     print("[done] score matrix 10x10")
+    mark("target_eval")
 
     # Step 5: shared Σ for probe angles from pooled target-test activations
     update_status(status_path, "running", "computing shared target-test covariance for probe angles")
-    print("[step] computing target-test covariance for probe angles")
+    print("[stage 5/9] computing target-test covariance for probe angles")
     if done("cov_target_test") and cov_probe_path.exists():
         print(f"[resume] using cached target covariance {cov_probe_path}")
         sigma_probe = np.load(cov_probe_path)
@@ -760,7 +849,7 @@ def main() -> int:
 
     # Step 6: probe angle matrix
     update_status(status_path, "running", "computing probe angle matrix")
-    print("[step] computing probe angle matrix")
+    print("[stage 6/9] computing probe angle matrix")
     probe_angle = np.zeros((10, 10), dtype=np.float64)
     for i in range(10):
         wi = probe_handles[i].weight
@@ -770,12 +859,14 @@ def main() -> int:
     np.save(results_dir / "probe_angle_matrix.npy", probe_angle)
     save_matrix_csv(results_dir / "probe_angle_matrix.csv", probe_angle, probe_labels, probe_labels)
     print("[done] probe angle matrix")
+    mark("probe_angle")
 
     # Step 7: source-train means + Σ for activation means
     update_status(status_path, "running", "computing source-train activation means and covariance")
-    print("[step] computing source-train means and covariance")
+    print("[stage 7/9] computing source-train means and covariance")
     cov_source_path = checkpoints_dir / "cov_source_train.npy"
     means_path = checkpoints_dir / "source_means.npy"
+    source_eval_ckpt_path = checkpoints_dir / "source_eval_checkpoint.npz"
     if done("source_means_cov") and cov_source_path.exists() and means_path.exists():
         print(f"[resume] using cached source means/cov at {cov_source_path}")
         sigma_source = np.load(cov_source_path)
@@ -788,11 +879,56 @@ def main() -> int:
         source_to_indices: Dict[str, List[int]] = {}
         for i, pr in enumerate(probe_rows):
             source_to_indices.setdefault(pr.source_dataset, []).append(i)
+        source_datasets = sorted(source_to_indices.keys())
+        completed_sources: List[str] = list(progress.get("completed_sources", []))
 
-        for src_dataset, indices in source_to_indices.items():
+        if args.resume and source_eval_ckpt_path.exists():
+            ckpt = np.load(source_eval_ckpt_path, allow_pickle=True)
+            ckpt_sources = [str(x) for x in ckpt["source_names"].tolist()]
+            if ckpt_sources == source_datasets:
+                source_sums = ckpt["source_sums"].astype(np.float64)
+                source_counts = ckpt["source_counts"].astype(np.int64)
+                completed_sources = [str(x) for x in ckpt["completed_sources"].tolist()]
+                if "cov_sum" in ckpt and "cov_sum_xx" in ckpt and "cov_n" in ckpt:
+                    acc_source.sum = ckpt["cov_sum"].astype(np.float64)
+                    acc_source.sum_xx = ckpt["cov_sum_xx"].astype(np.float64)
+                    acc_source.n = int(ckpt["cov_n"])
+                print(
+                    f"[resume] loaded source checkpoint: completed={len(completed_sources)}/{len(source_datasets)}"
+                )
+            else:
+                print("[resume] source checkpoint exists but is incompatible; recomputing source stage")
+
+        print(
+            f"[progress] source stage completed={len(completed_sources)}/{len(source_datasets)} "
+            f"remaining={len(source_datasets)-len(completed_sources)}"
+        )
+
+        def save_source_eval_checkpoint() -> None:
+            np.savez(
+                source_eval_ckpt_path,
+                source_names=np.array(source_datasets, dtype=object),
+                completed_sources=np.array(completed_sources, dtype=object),
+                source_sums=source_sums,
+                source_counts=source_counts,
+                cov_n=np.array(acc_source.n, dtype=np.int64),
+                cov_sum=acc_source.sum,
+                cov_sum_xx=acc_source.sum_xx,
+            )
+
+        for src_dataset in source_datasets:
+            if src_dataset in completed_sources:
+                print(f"[sources] skip {src_dataset} (already completed)")
+                continue
+            indices = source_to_indices[src_dataset]
             split_dir = ensure_split(Path(args.activations_root), model_dir, src_dataset, args.source_split)
-            print(f"[sources] {src_dataset} split_dir={split_dir}")
+            remaining_before = len(source_datasets) - len(completed_sources)
+            print(
+                f"[sources] start {src_dataset} ({len(completed_sources)+1}/{len(source_datasets)}), "
+                f"remaining before={remaining_before}, split_dir={split_dir}"
+            )
             sample_count = 0
+            t0 = time.time()
             iterator = iter_labeled_activations(split_dir)
             if use_tqdm:
                 iterator = tqdm(iterator, desc=f"sources:{src_dataset}", unit="sample")
@@ -807,7 +943,22 @@ def main() -> int:
                     acc_source.update(np.stack(pooled_rows, axis=0))
                 sample_count += 1
                 if args.progress_every and sample_count % args.progress_every == 0:
-                    print(f"[sources] {src_dataset} processed {sample_count} samples")
+                    elapsed = max(time.time() - t0, 1e-6)
+                    rate = sample_count / elapsed
+                    print(f"[sources] {src_dataset} processed {sample_count} samples ({rate:.2f} samples/s)")
+            elapsed = max(time.time() - t0, 1e-6)
+            rate = sample_count / elapsed
+            print(f"[sources] {src_dataset} done: {sample_count} samples ({rate:.2f} samples/s)")
+            if src_dataset not in completed_sources:
+                completed_sources.append(src_dataset)
+                progress["completed_sources"] = completed_sources
+                progress["updated_at"] = utc_now_iso()
+                write_json(progress_path, progress)
+            save_source_eval_checkpoint()
+            print(
+                f"[sources] checkpoint saved: completed={len(completed_sources)}/{len(source_datasets)} "
+                f"remaining={len(source_datasets)-len(completed_sources)}"
+            )
 
         if np.any(source_counts == 0):
             bad = np.where(source_counts == 0)[0].tolist()
@@ -821,7 +972,7 @@ def main() -> int:
 
     # Step 8: activation-mean angle matrix
     update_status(status_path, "running", "computing activation mean angle matrix")
-    print("[step] computing activation mean angle matrix")
+    print("[stage 8/9] computing activation mean angle matrix")
     act_angle = np.zeros((10, 10), dtype=np.float64)
     for i in range(10):
         vi = source_means[i]
@@ -831,10 +982,11 @@ def main() -> int:
     np.save(results_dir / "activation_mean_angle_matrix.npy", act_angle)
     save_matrix_csv(results_dir / "activation_mean_angle_matrix.csv", act_angle, probe_labels, probe_labels)
     print("[done] activation mean angle matrix")
+    mark("activation_angle")
 
     # Step 9: correlations + plots
     update_status(status_path, "running", "correlating matrices and plotting")
-    print("[step] correlating matrices and plotting")
+    print("[stage 9/9] correlating matrices and plotting")
     x_pa, y_sc = matrix_offdiag_values(probe_angle, score_10x10)
     x_aa, y_pa = matrix_offdiag_values(act_angle, probe_angle)
     x_aa2, y_sc2 = matrix_offdiag_values(act_angle, score_10x10)
@@ -861,6 +1013,7 @@ def main() -> int:
     }
     write_json(results_dir / "correlations.json", correlations)
     print("[done] correlations")
+    mark("correlations")
 
     plot_heatmap(results_dir / "plots" / "probe_angle_matrix.png", probe_angle, "Probe Mahalanobis Cosine (10x10)")
     plot_heatmap(results_dir / "plots" / "score_matrix_10x10.png", score_10x10, "Score Matrix AUC (10x10)", vmin=0.0, vmax=1.0)
