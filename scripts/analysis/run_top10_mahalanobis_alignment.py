@@ -511,6 +511,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", action="store_true")
     p.add_argument("--cov_eps", type=float, default=1e-5)
     p.add_argument("--device", type=str, default=None)
+    p.add_argument("--progress_every", type=int, default=200,
+                   help="Print progress every N samples (0 to disable).")
     return p.parse_args()
 
 
@@ -671,6 +673,7 @@ def main() -> int:
 
         per_probe_logits: List[List[float]] = [[] for _ in range(len(probe_handles))]
         labels: List[int] = []
+        sample_count = 0
         for tensor, y in iter_labeled_activations(split_dir):
             labels.append(y)
             pooled_rows = []
@@ -680,6 +683,9 @@ def main() -> int:
                     pooled_rows.append(ph.pooled_vector(tensor).numpy().astype(np.float64))
             if acc_target is not None and pooled_rows:
                 acc_target.update(np.stack(pooled_rows, axis=0))
+            sample_count += 1
+            if args.progress_every and sample_count % args.progress_every == 0:
+                print(f"[targets] {tgt} processed {sample_count} samples")
 
         for i in range(len(probe_handles)):
             score_unique[i, j] = compute_auc(labels, per_probe_logits[i])
@@ -738,6 +744,7 @@ def main() -> int:
 
         for src_dataset, indices in source_to_indices.items():
             split_dir = ensure_split(Path(args.activations_root), model_dir, src_dataset, args.source_split)
+            sample_count = 0
             for tensor, _ in iter_labeled_activations(split_dir):
                 pooled_rows = []
                 for idx in indices:
@@ -747,6 +754,9 @@ def main() -> int:
                     pooled_rows.append(pooled)
                 if pooled_rows:
                     acc_source.update(np.stack(pooled_rows, axis=0))
+                sample_count += 1
+                if args.progress_every and sample_count % args.progress_every == 0:
+                    print(f"[sources] {src_dataset} processed {sample_count} samples")
 
         if np.any(source_counts == 0):
             bad = np.where(source_counts == 0)[0].tolist()
