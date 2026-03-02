@@ -325,6 +325,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
     p.add_argument("--artifact_root", type=str, default="artifacts")
+    p.add_argument(
+        "--output_root",
+        type=str,
+        default=None,
+        help=(
+            "Optional direct output root for runs. "
+            "If set, outputs go to <output_root>/<run_id>/... instead of artifact_root/runs/..."
+        ),
+    )
     p.add_argument("--run_id", type=str, default=None)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--cov_eps", type=float, default=1e-5)
@@ -353,7 +362,18 @@ def main() -> int:
     acts_base, acts_model_root = split_root_and_model(Path(args.activations_root), model_dir)
     probes_base, probes_model_root = split_root_and_model(Path(args.probes_root), model_dir)
 
-    run_root = Path(args.artifact_root) / "runs" / "pairwise_mahalanobis_alignment" / model_dir / "matrix6x7" / "v1" / run_id
+    if args.output_root:
+        run_root = Path(args.output_root) / run_id
+    else:
+        run_root = (
+            Path(args.artifact_root)
+            / "runs"
+            / "pairwise_mahalanobis_alignment"
+            / model_dir
+            / "matrix6x7"
+            / "v1"
+            / run_id
+        )
     meta_dir = run_root / "meta"
     chk_dir = run_root / "checkpoints"
     out_dir = run_root / "results"
