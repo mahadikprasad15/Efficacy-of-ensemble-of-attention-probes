@@ -10,7 +10,7 @@ Pipeline:
 5) Build score matrices:
    - probe x unique_target
    - probe x top10_target_row (10x10, with repeated target segments if present)
-6) Compute 10x10 probe Mahalanobis-cosine angle matrix with shared Σ from pooled target-test activations
+6) Compute 10x10 probe Mahalanobis-cosine angle matrix with per-target Σ_test (target-specific covariance)
 7) Compute 10x10 activation-mean Mahalanobis-cosine angle matrix with shared Σ from pooled source-train activations
 8) Correlate matrices and save plots/artifacts
 
@@ -690,7 +690,7 @@ def main() -> int:
     print(f"[done] loaded probes (input_dim={d_model})")
     mark("probe_load")
 
-    # Step 4: evaluate all probes on unique targets + stream covariance for target-test baseline
+    # Step 4: evaluate all probes on unique targets
     update_status(status_path, "running", "evaluating probes on unique top10 targets")
     print("[stage 4/9] evaluating probes on unique targets")
     unique_targets = sorted({r.target_dataset for r in probe_rows})
@@ -703,34 +703,18 @@ def main() -> int:
 
     score_unique = np.zeros((len(probe_rows), len(unique_targets)), dtype=np.float64)
     target_eval_ckpt_path = checkpoints_dir / "target_eval_checkpoint.npz"
-    cov_probe_path = checkpoints_dir / "cov_target_test.npy"
-    need_cov_probe = not (done("cov_target_test") and cov_probe_path.exists())
-    acc_target = CovAccumulator(d_model) if need_cov_probe else None
     completed_targets: List[str] = list(progress.get("completed_targets", []))
 
     if done("target_eval") and (results_dir / "score_matrix_unique.npy").exists():
         print("[resume] target evaluation already complete; loading cached score matrix")
         score_unique = np.load(results_dir / "score_matrix_unique.npy")
         completed_targets = list(unique_targets)
-        if acc_target is not None and target_eval_ckpt_path.exists():
-            ckpt = np.load(target_eval_ckpt_path, allow_pickle=True)
-            if "cov_sum" in ckpt and "cov_sum_xx" in ckpt and "cov_n" in ckpt:
-                acc_target.sum = ckpt["cov_sum"].astype(np.float64)
-                acc_target.sum_xx = ckpt["cov_sum_xx"].astype(np.float64)
-                acc_target.n = int(ckpt["cov_n"])
-            else:
-                print("[resume] covariance state missing in checkpoint; target stage will recompute")
-                completed_targets = []
     elif args.resume and target_eval_ckpt_path.exists():
         ckpt = np.load(target_eval_ckpt_path, allow_pickle=True)
         ckpt_targets = [str(x) for x in ckpt["target_names"].tolist()]
         if ckpt_targets == unique_targets and tuple(ckpt["score_unique"].shape) == tuple(score_unique.shape):
             score_unique = ckpt["score_unique"].astype(np.float64)
             completed_targets = [str(x) for x in ckpt["completed_targets"].tolist()]
-            if acc_target is not None and "cov_sum" in ckpt and "cov_sum_xx" in ckpt and "cov_n" in ckpt:
-                acc_target.sum = ckpt["cov_sum"].astype(np.float64)
-                acc_target.sum_xx = ckpt["cov_sum_xx"].astype(np.float64)
-                acc_target.n = int(ckpt["cov_n"])
             print(
                 f"[resume] loaded target checkpoint: completed={len(completed_targets)}/{len(unique_targets)}"
             )
@@ -748,10 +732,6 @@ def main() -> int:
             "completed_targets": np.array(completed_targets, dtype=object),
             "score_unique": score_unique,
         }
-        if acc_target is not None:
-            payload["cov_n"] = np.array(acc_target.n, dtype=np.int64)
-            payload["cov_sum"] = acc_target.sum
-            payload["cov_sum_xx"] = acc_target.sum_xx
         np.savez(target_eval_ckpt_path, **payload)
 
     use_tqdm = not args.no_tqdm
@@ -778,13 +758,8 @@ def main() -> int:
             iterator = tqdm(iterator, desc=f"targets:{tgt}", unit="sample")
         for tensor, y in iterator:
             labels.append(y)
-            pooled_rows = []
             for i, ph in enumerate(probe_handles):
                 per_probe_logits[i].append(ph.predict_logit(tensor))
-                if acc_target is not None:
-                    pooled_rows.append(ph.pooled_vector(tensor).numpy().astype(np.float64))
-            if acc_target is not None and pooled_rows:
-                acc_target.update(np.stack(pooled_rows, axis=0))
             sample_count += 1
             if args.progress_every and sample_count % args.progress_every == 0:
                 elapsed = max(time.time() - t0, 1e-6)
@@ -833,28 +808,84 @@ def main() -> int:
     print("[done] score matrix 10x10")
     mark("target_eval")
 
-    # Step 5: shared Σ for probe angles from pooled target-test activations
-    update_status(status_path, "running", "computing shared target-test covariance for probe angles")
-    print("[stage 5/9] computing target-test covariance for probe angles")
-    if done("cov_target_test") and cov_probe_path.exists():
-        print(f"[resume] using cached target covariance {cov_probe_path}")
-        sigma_probe = np.load(cov_probe_path)
-    else:
-        if acc_target is None:
-            raise RuntimeError("Target covariance accumulator is unexpectedly missing.")
-        sigma_probe = acc_target.finalize(eps=args.cov_eps)
-        np.save(cov_probe_path, sigma_probe)
-        mark("cov_target_test")
-        print(f"[done] target-test covariance saved -> {cov_probe_path}")
+    # Step 5: per-target Σ_test for probe angles
+    update_status(status_path, "running", "computing per-target test covariance for probe angles")
+    print("[stage 5/9] computing per-target target-test covariance for probe angles")
+    target_cov_dir = checkpoints_dir / "target_cov"
+    target_cov_dir.mkdir(parents=True, exist_ok=True)
+    sigma_probe_by_target: Dict[str, np.ndarray] = {}
+    cov_probe_paths: Dict[str, str] = {}
+    cov_probe_splits: Dict[str, str] = {}
+
+    def target_cov_path(target_dataset: str) -> Path:
+        safe = target_dataset.replace("/", "_")
+        return target_cov_dir / f"cov_target__{safe}__{args.target_split}.npz"
+
+    for tgt in unique_targets:
+        cov_path = target_cov_path(tgt)
+        if args.resume and cov_path.exists():
+            ckpt = np.load(cov_path, allow_pickle=True)
+            sigma_probe_by_target[tgt] = ckpt["cov"].astype(np.float64)
+            split_used = str(ckpt["split_used"].item()) if "split_used" in ckpt else args.target_split
+            cov_probe_paths[tgt] = str(cov_path)
+            cov_probe_splits[tgt] = split_used
+            print(f"[resume] using cached target covariance for {tgt}: {cov_path}")
+            continue
+
+        split_dir = ensure_split(
+            Path(args.activations_root),
+            model_dir,
+            tgt,
+            args.target_split,
+            fallback=args.target_split_fallback,
+        )
+        split_used = split_dir.name
+        acc_target = CovAccumulator(d_model)
+        sample_count = 0
+        t0 = time.time()
+        iterator = iter_labeled_activations(split_dir)
+        if use_tqdm:
+            iterator = tqdm(iterator, desc=f"cov:{tgt}", unit="sample")
+        for tensor, _ in iterator:
+            pooled_rows = [ph.pooled_vector(tensor).numpy().astype(np.float64) for ph in probe_handles]
+            if pooled_rows:
+                acc_target.update(np.stack(pooled_rows, axis=0))
+            sample_count += 1
+            if args.progress_every and sample_count % args.progress_every == 0:
+                elapsed = max(time.time() - t0, 1e-6)
+                rate = sample_count / elapsed
+                print(f"[cov] {tgt} processed {sample_count} samples ({rate:.2f} samples/s)")
+
+        sigma_tgt = acc_target.finalize(eps=args.cov_eps)
+        np.savez(
+            cov_path,
+            cov=sigma_tgt,
+            split_used=np.array(split_used),
+            target_dataset=np.array(tgt),
+            cov_n=np.array(acc_target.n, dtype=np.int64),
+            cov_sum=acc_target.sum,
+            cov_sum_xx=acc_target.sum_xx,
+            created_at=np.array(utc_now_iso()),
+        )
+        elapsed = max(time.time() - t0, 1e-6)
+        print(f"[cov] {tgt} done: {sample_count} samples ({sample_count/elapsed:.2f} samples/s)")
+        sigma_probe_by_target[tgt] = sigma_tgt
+        cov_probe_paths[tgt] = str(cov_path)
+        cov_probe_splits[tgt] = split_used
+        print(f"[done] target-test covariance saved for {tgt} -> {cov_path}")
+
+    mark("cov_target_test")
 
     # Step 6: probe angle matrix
     update_status(status_path, "running", "computing probe angle matrix")
     print("[stage 6/9] computing probe angle matrix")
     probe_angle = np.zeros((10, 10), dtype=np.float64)
-    for i in range(10):
-        wi = probe_handles[i].weight
-        for j in range(10):
-            wj = probe_handles[j].weight
+    for j in range(10):
+        tgt = probe_rows[j].target_dataset
+        sigma_probe = sigma_probe_by_target[tgt]
+        wj = probe_handles[j].weight
+        for i in range(10):
+            wi = probe_handles[i].weight
             probe_angle[i, j] = mahalanobis_cosine(wi, wj, sigma_probe)
     np.save(results_dir / "probe_angle_matrix.npy", probe_angle)
     save_matrix_csv(results_dir / "probe_angle_matrix.csv", probe_angle, probe_labels, probe_labels)
@@ -1058,8 +1089,11 @@ def main() -> int:
                 "probe_angle_shape": list(probe_angle.shape),
                 "activation_angle_shape": list(act_angle.shape),
                 "score_10x10_definition": "score[i,j] = AUC(probe_i on target segment from top10 row j)",
-                "cov_probe_definition": "Shared covariance from pooled target-test activations across all unique top10 targets and all top10 probe poolers",
-                "cov_activation_definition": "Shared covariance from pooled source-train activations across top10 source segments and row-specific poolers",
+                "cov_probe_definition": "Per-target covariance from pooled target-test activations; target column j uses Sigma_test(target_j)",
+                "cov_probe_scope": "per_target_test_dataset_segment",
+                "cov_probe_paths": cov_probe_paths,
+                "cov_probe_split_used": cov_probe_splits,
+                "cov_activation_definition": "Shared covariance from pooled source-train activations across top10 source segments and row-specific poolers (unchanged)",
             },
         },
     )
