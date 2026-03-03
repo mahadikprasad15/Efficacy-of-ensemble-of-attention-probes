@@ -156,6 +156,86 @@ class CovAccumulator:
         return cov
 
 
+class TorchCovAccumulator:
+    def __init__(self, dim: int, device: torch.device, dtype: torch.dtype = torch.float32):
+        self.dim = dim
+        self.device = device
+        self.dtype = dtype
+        self.n = 0
+        self.sum = torch.zeros(dim, dtype=dtype, device=device)
+        self.sum_xx = torch.zeros((dim, dim), dtype=dtype, device=device)
+
+    def update(self, x: torch.Tensor) -> None:
+        if x.ndim != 2 or x.shape[1] != self.dim:
+            raise ValueError(f"Expected shape (N,{self.dim}), got {tuple(x.shape)}")
+        if x.shape[0] == 0:
+            return
+        x_dev = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        self.n += int(x_dev.shape[0])
+        self.sum += x_dev.sum(dim=0)
+        self.sum_xx += x_dev.T @ x_dev
+
+    def load_state(self, cov_n: int, cov_sum: np.ndarray, cov_sum_xx: np.ndarray) -> None:
+        self.n = int(cov_n)
+        self.sum = torch.as_tensor(cov_sum, dtype=self.dtype, device=self.device)
+        self.sum_xx = torch.as_tensor(cov_sum_xx, dtype=self.dtype, device=self.device)
+
+    def state_numpy(self) -> Tuple[int, np.ndarray, np.ndarray]:
+        return (
+            int(self.n),
+            self.sum.detach().cpu().numpy().astype(np.float64),
+            self.sum_xx.detach().cpu().numpy().astype(np.float64),
+        )
+
+    def finalize(self, eps: float) -> np.ndarray:
+        if self.n < 2:
+            raise ValueError("Need at least 2 samples for covariance")
+        mean_outer = torch.outer(self.sum, self.sum) / float(self.n)
+        cov = (self.sum_xx - mean_outer) / float(self.n - 1)
+        cov = cov + torch.eye(self.dim, device=self.device, dtype=self.dtype) * float(eps)
+        return cov.detach().cpu().numpy().astype(np.float64)
+
+
+def make_cov_accumulator(dim: int, cov_backend: str, device: torch.device) -> CovAccumulator | TorchCovAccumulator:
+    if cov_backend == "gpu":
+        return TorchCovAccumulator(dim=dim, device=device, dtype=torch.float32)
+    return CovAccumulator(dim=dim)
+
+
+def restore_cov_state(
+    acc: CovAccumulator | TorchCovAccumulator,
+    cov_n: int,
+    cov_sum: np.ndarray,
+    cov_sum_xx: np.ndarray,
+) -> None:
+    if isinstance(acc, TorchCovAccumulator):
+        acc.load_state(cov_n=cov_n, cov_sum=cov_sum, cov_sum_xx=cov_sum_xx)
+        return
+    acc.n = int(cov_n)
+    acc.sum = cov_sum.astype(np.float64)
+    acc.sum_xx = cov_sum_xx.astype(np.float64)
+
+
+def cov_state_numpy(acc: CovAccumulator | TorchCovAccumulator) -> Tuple[int, np.ndarray, np.ndarray]:
+    if isinstance(acc, TorchCovAccumulator):
+        return acc.state_numpy()
+    return int(acc.n), acc.sum.astype(np.float64), acc.sum_xx.astype(np.float64)
+
+
+def cov_update_tensors(acc: CovAccumulator | TorchCovAccumulator, rows: List[torch.Tensor]) -> None:
+    if not rows:
+        return
+    if isinstance(acc, TorchCovAccumulator):
+        x = torch.stack([r.detach().reshape(-1) for r in rows], dim=0)
+        acc.update(x)
+        return
+    arr = np.stack(
+        [r.detach().cpu().numpy().reshape(-1).astype(np.float64) for r in rows],
+        axis=0,
+    )
+    acc.update(arr)
+
+
 def mahalanobis_cosine(a: np.ndarray, b: np.ndarray, sigma: np.ndarray, eps: float = 1e-12) -> float:
     num = float(a.T @ sigma @ b)
     da = float(a.T @ sigma @ a)
@@ -378,6 +458,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cov_eps", type=float, default=1e-5)
     p.add_argument("--target_split", type=str, default="test")
     p.add_argument("--target_split_fallback", type=str, default="validation")
+    p.add_argument(
+        "--cov_backend",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "gpu"],
+        help="Covariance accumulator backend: auto selects gpu when CUDA is available.",
+    )
     p.add_argument("--progress_every", type=int, default=200)
     p.add_argument("--no_tqdm", action="store_true")
     p.add_argument("--device", type=str, default=None)
@@ -397,6 +484,11 @@ def main() -> int:
     model_dir = args.model.replace("/", "_")
     run_id = args.run_id or utc_run_id()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    cov_backend = "gpu" if args.cov_backend == "auto" and device.type == "cuda" else args.cov_backend
+    if args.cov_backend == "auto" and device.type != "cuda":
+        cov_backend = "cpu"
+    if cov_backend == "gpu" and device.type != "cuda":
+        raise ValueError("--cov_backend gpu requires CUDA device")
     use_tqdm = not args.no_tqdm
 
     # Resolve roots (supports passing either .../<model_dir> or its parent)
@@ -448,11 +540,14 @@ def main() -> int:
             "covariance_scope": args.covariance_scope,
             "target_split": args.target_split,
             "target_split_fallback": args.target_split_fallback,
+            "cov_backend_requested": args.cov_backend,
+            "cov_backend_resolved": cov_backend,
         },
     )
     update_status(status_path, "running", "starting")
     print(f"[start] run_id={run_id}")
     print(f"[start] model={args.model} device={device}")
+    print(f"[start] covariance backend={cov_backend}")
 
     def mark(step: str) -> None:
         done = set(progress.get("completed_steps", []))
@@ -538,7 +633,7 @@ def main() -> int:
 
         datasets = sort_datasets(set(rows) | set(cols))
         completed: List[str] = []
-        acc: Optional[CovAccumulator] = None
+        acc: Optional[CovAccumulator | TorchCovAccumulator] = None
         cov_sum = None
         cov_sum_xx = None
         cov_n = 0
@@ -561,11 +656,9 @@ def main() -> int:
         if d_model is None:
             raise RuntimeError(f"No activations found for segment {segment}")
 
-        acc = CovAccumulator(d_model)
+        acc = make_cov_accumulator(dim=d_model, cov_backend=cov_backend, device=device)
         if cov_sum is not None and cov_sum_xx is not None:
-            acc.sum = cov_sum
-            acc.sum_xx = cov_sum_xx
-            acc.n = cov_n
+            restore_cov_state(acc, cov_n=cov_n, cov_sum=cov_sum, cov_sum_xx=cov_sum_xx)
 
         def needed_poolings_for_layer(ds_name: str, layer: int) -> List[str]:
             if args.covariance_scope == "all":
@@ -611,6 +704,7 @@ def main() -> int:
             if use_tqdm:
                 iterator = tqdm(iterator, desc=f"cov:{segment}:{short_name(ds)}", unit="sample")
             for tensor, _ in iterator:
+                pooled_rows: List[torch.Tensor] = []
                 for layer in range(layers):
                     x_layer = tensor[layer].float()
                     poolings = needed_poolings_for_layer(ds, layer)
@@ -623,19 +717,21 @@ def main() -> int:
                                 pooled = attn_pooler.pool(x_layer)
                         else:
                             pooled = Pooler(pooling).pool(x_layer)
-                        acc.update(pooled.detach().cpu().numpy().reshape(1, -1).astype(np.float64))
+                        pooled_rows.append(pooled)
+                cov_update_tensors(acc, pooled_rows)
                 sample_count += 1
                 if args.progress_every and sample_count % args.progress_every == 0:
                     elapsed = max(time.time() - t0, 1e-6)
                     print(f"[cov] {segment}:{ds} processed {sample_count} samples ({sample_count/elapsed:.2f} samples/s)")
 
             completed.append(ds)
+            cov_n_now, cov_sum_now, cov_sum_xx_now = cov_state_numpy(acc)
             np.savez(
                 cov_ckpt_path,
                 completed=np.array(completed, dtype=object),
-                cov_n=np.array(acc.n, dtype=np.int64),
-                cov_sum=acc.sum,
-                cov_sum_xx=acc.sum_xx,
+                cov_n=np.array(cov_n_now, dtype=np.int64),
+                cov_sum=cov_sum_now,
+                cov_sum_xx=cov_sum_xx_now,
             )
 
         sigma = acc.finalize(eps=args.cov_eps)
@@ -731,7 +827,7 @@ def main() -> int:
             split_used = split_dir.name
             sample, _ = next(iter_labeled_activations(split_dir))
             input_dim = int(sample.shape[-1])
-            acc = CovAccumulator(input_dim)
+            acc = make_cov_accumulator(dim=input_dim, cov_backend=cov_backend, device=device)
             attn_poolers: Dict[Tuple[str, int], Optional[Pooler]] = {}
 
             def get_attn_pooler(source_dataset: str, layer: int) -> Optional[Pooler]:
@@ -766,9 +862,9 @@ def main() -> int:
                             pooled = attn_pooler.pool(x_layer)
                     else:
                         pooled = Pooler(pooling).pool(x_layer)
-                    pooled_rows.append(pooled.detach().cpu().numpy().reshape(1, -1).astype(np.float64))
+                    pooled_rows.append(pooled)
                 if pooled_rows:
-                    acc.update(np.concatenate(pooled_rows, axis=0))
+                    cov_update_tensors(acc, pooled_rows)
                 sample_count += 1
                 if args.progress_every and sample_count % args.progress_every == 0:
                     elapsed = max(time.time() - t0, 1e-6)
@@ -778,6 +874,7 @@ def main() -> int:
                     )
 
             sigma = acc.finalize(eps=args.cov_eps)
+            cov_n_now, cov_sum_now, cov_sum_xx_now = cov_state_numpy(acc)
             combo_labels = np.array([f"{src}|L{layer}|{pool}" for src, layer, pool in combos], dtype=object)
             np.savez(
                 cov_path,
@@ -786,9 +883,9 @@ def main() -> int:
                 target_dataset=np.array(target_dataset),
                 split_used=np.array(split_used),
                 combos=combo_labels,
-                cov_n=np.array(acc.n, dtype=np.int64),
-                cov_sum=acc.sum,
-                cov_sum_xx=acc.sum_xx,
+                cov_n=np.array(cov_n_now, dtype=np.int64),
+                cov_sum=cov_sum_now,
+                cov_sum_xx=cov_sum_xx_now,
                 created_at=np.array(utc_now()),
             )
             elapsed = max(time.time() - t0, 1e-6)
