@@ -9,7 +9,8 @@ Outputs per segment:
   - probe_angle_matrix (Mahalanobis cosine between scoring probe and canonical target probe)
   - activation_mean_angle_matrix (Mahalanobis cosine between train/test activation means)
 
-Shared covariance Σ is computed per segment using pooled train activations across all datasets.
+Probe-angle covariance uses per-target Σ_test (dataset+segment specific).
+Activation-mean covariance remains shared per segment using pooled train activations across all datasets.
 Attn pooling uses the attention weights from the source dataset's attn probe at that layer.
 Missing pooling defaults to mean.
 """
@@ -375,6 +376,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--run_id", type=str, default=None)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--cov_eps", type=float, default=1e-5)
+    p.add_argument("--target_split", type=str, default="test")
+    p.add_argument("--target_split_fallback", type=str, default="validation")
     p.add_argument("--progress_every", type=int, default=200)
     p.add_argument("--no_tqdm", action="store_true")
     p.add_argument("--device", type=str, default=None)
@@ -443,6 +446,8 @@ def main() -> int:
             "matrix_completion_csv": args.matrix_completion_csv,
             "matrix_full_csv": args.matrix_full_csv,
             "covariance_scope": args.covariance_scope,
+            "target_split": args.target_split,
+            "target_split_fallback": args.target_split_fallback,
         },
     )
     update_status(status_path, "running", "starting")
@@ -512,9 +517,11 @@ def main() -> int:
     print(f"[info] canonical probes (completion)={len(comp_canon)} (full)={len(full_canon)}")
     mark("canonical_probes")
 
-    # Shared covariance per segment
+    # Covariances:
+    # - shared per-segment covariance for activation-angle metric (unchanged)
+    # - per-target test covariance for probe-angle metric (paper-style)
     update_status(status_path, "running", "computing covariances")
-    print("[stage 3/6] computing shared covariances per segment")
+    print("[stage 3/6] computing activation and probe covariances")
 
     def segment_covariance(
         segment: str,
@@ -637,6 +644,170 @@ def main() -> int:
 
     sigma_comp = segment_covariance("completion", comp_rows, comp_cols, comp_cells)
     sigma_full = segment_covariance("full", full_rows, full_cols, full_cells)
+
+    target_cov_dir = chk_dir / "target_cov"
+    target_cov_dir.mkdir(parents=True, exist_ok=True)
+
+    def target_cov_path(segment: str, target_dataset: str) -> Path:
+        safe = target_dataset.replace("/", "_")
+        return target_cov_dir / f"cov_{segment}__{safe}__{args.target_split}.npz"
+
+    def probe_combos_for_target(
+        rows: List[str],
+        cells: Dict[Tuple[str, str], CellMeta],
+        canon: Dict[str, Dict[str, Any]],
+        target_dataset: str,
+    ) -> List[Tuple[str, int, str]]:
+        combos: set[Tuple[str, int, str]] = set()
+
+        def maybe_add_combo(source_dataset: str, layer: int, pooling: str) -> None:
+            if source_dataset in no_probe_datasets:
+                return
+            if layer < 0:
+                return
+            p = normalize_pooling(pooling)
+            probe_path = resolve_probe_path(probes_model_root, source_dataset, p, layer)
+            if not probe_path.exists():
+                return
+            combos.add((source_dataset, int(layer), p))
+
+        # Row-side probes used for (row -> target_dataset) cells.
+        for r in rows:
+            cell = cells.get((r, target_dataset))
+            if cell is None or cell.layer < 0:
+                continue
+            maybe_add_combo(r, cell.layer, cell.pooling)
+
+        # Canonical probe used as column reference in v1.
+        if target_dataset in canon:
+            cc = canon[target_dataset]
+            maybe_add_combo(target_dataset, int(cc["layer"]), str(cc["pooling"]))
+
+        # Reverse-direction probe specs used in v2 (target_dataset as source).
+        for r in rows:
+            cell_rev = cells.get((target_dataset, r))
+            if cell_rev is None or cell_rev.layer < 0:
+                continue
+            maybe_add_combo(target_dataset, cell_rev.layer, cell_rev.pooling)
+
+        return sorted(combos, key=lambda x: (x[0], x[1], x[2]))
+
+    def per_target_probe_covariances(
+        segment: str,
+        rows: List[str],
+        cols: List[str],
+        cells: Dict[Tuple[str, str], CellMeta],
+        canon: Dict[str, Dict[str, Any]],
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, str], Dict[str, str]]:
+        sigma_by_target: Dict[str, np.ndarray] = {}
+        path_by_target: Dict[str, str] = {}
+        split_by_target: Dict[str, str] = {}
+
+        for target_dataset in cols:
+            cov_path = target_cov_path(segment, target_dataset)
+            if args.resume and cov_path.exists():
+                ckpt = np.load(cov_path, allow_pickle=True)
+                sigma_by_target[target_dataset] = ckpt["cov"].astype(np.float64)
+                split_used = (
+                    str(ckpt["split_used"].item())
+                    if "split_used" in ckpt
+                    else args.target_split
+                )
+                path_by_target[target_dataset] = str(cov_path)
+                split_by_target[target_dataset] = split_used
+                print(f"[resume] using cached target covariance for {segment}:{target_dataset}")
+                continue
+
+            combos = probe_combos_for_target(rows, cells, canon, target_dataset)
+            if not combos:
+                print(f"[warn] no valid probe combos for {segment}:{target_dataset}; probe-angle entries may be NaN")
+                continue
+
+            split_dir = ensure_split(
+                acts_model_root / target_dataset,
+                args.target_split,
+                args.target_split_fallback,
+            )
+            split_used = split_dir.name
+            sample, _ = next(iter_labeled_activations(split_dir))
+            input_dim = int(sample.shape[-1])
+            acc = CovAccumulator(input_dim)
+            attn_poolers: Dict[Tuple[str, int], Optional[Pooler]] = {}
+
+            def get_attn_pooler(source_dataset: str, layer: int) -> Optional[Pooler]:
+                key = (source_dataset, layer)
+                if key in attn_poolers:
+                    return attn_poolers[key]
+                probe_path = resolve_probe_path(probes_model_root, source_dataset, "attn", layer)
+                if not probe_path.exists():
+                    print(
+                        f"[warn] missing attn probe for {source_dataset} layer {layer}; "
+                        f"using mean fallback in target covariance"
+                    )
+                    attn_poolers[key] = None
+                    return None
+                attn_poolers[key] = load_attn_pooler(probe_path, input_dim=input_dim, device=device)
+                return attn_poolers[key]
+
+            t0 = time.time()
+            sample_count = 0
+            iterator = iter_labeled_activations(split_dir)
+            if use_tqdm:
+                iterator = tqdm(iterator, desc=f"cov:{segment}:{short_name(target_dataset)}", unit="sample")
+            for tensor, _ in iterator:
+                pooled_rows = []
+                for source_dataset, layer, pooling in combos:
+                    x_layer = tensor[layer].float()
+                    if pooling == "attn":
+                        attn_pooler = get_attn_pooler(source_dataset, layer)
+                        if attn_pooler is None:
+                            pooled = x_layer.mean(dim=0)
+                        else:
+                            pooled = attn_pooler.pool(x_layer)
+                    else:
+                        pooled = Pooler(pooling).pool(x_layer)
+                    pooled_rows.append(pooled.detach().cpu().numpy().reshape(1, -1).astype(np.float64))
+                if pooled_rows:
+                    acc.update(np.concatenate(pooled_rows, axis=0))
+                sample_count += 1
+                if args.progress_every and sample_count % args.progress_every == 0:
+                    elapsed = max(time.time() - t0, 1e-6)
+                    print(
+                        f"[cov-target] {segment}:{target_dataset} processed {sample_count} "
+                        f"samples ({sample_count/elapsed:.2f} samples/s)"
+                    )
+
+            sigma = acc.finalize(eps=args.cov_eps)
+            combo_labels = np.array([f"{src}|L{layer}|{pool}" for src, layer, pool in combos], dtype=object)
+            np.savez(
+                cov_path,
+                cov=sigma,
+                segment=np.array(segment),
+                target_dataset=np.array(target_dataset),
+                split_used=np.array(split_used),
+                combos=combo_labels,
+                cov_n=np.array(acc.n, dtype=np.int64),
+                cov_sum=acc.sum,
+                cov_sum_xx=acc.sum_xx,
+                created_at=np.array(utc_now()),
+            )
+            elapsed = max(time.time() - t0, 1e-6)
+            print(
+                f"[cov-target] {segment}:{target_dataset} done: {sample_count} samples "
+                f"({sample_count/elapsed:.2f} samples/s)"
+            )
+            sigma_by_target[target_dataset] = sigma
+            path_by_target[target_dataset] = str(cov_path)
+            split_by_target[target_dataset] = split_used
+
+        return sigma_by_target, path_by_target, split_by_target
+
+    comp_probe_sigma, comp_probe_cov_paths, comp_probe_cov_splits = per_target_probe_covariances(
+        "completion", comp_rows, comp_cols, comp_cells, comp_canon
+    )
+    full_probe_sigma, full_probe_cov_paths, full_probe_cov_splits = per_target_probe_covariances(
+        "full", full_rows, full_cols, full_cells, full_canon
+    )
     mark("covariances")
 
     # Probe angle matrices
@@ -648,13 +819,16 @@ def main() -> int:
         cols: List[str],
         cells: Dict[Tuple[str, str], CellMeta],
         canon: Dict[str, Dict[str, Any]],
-        sigma: np.ndarray,
+        sigma_by_target: Dict[str, np.ndarray],
     ) -> np.ndarray:
         mat = np.full((len(rows), len(cols)), np.nan, dtype=np.float64)
         for i, r in enumerate(rows):
             for j, c in enumerate(cols):
                 if r == c:
                     mat[i, j] = 1.0
+                    continue
+                sigma = sigma_by_target.get(c)
+                if sigma is None:
                     continue
                 if c not in canon:
                     continue
@@ -679,13 +853,16 @@ def main() -> int:
         rows: List[str],
         cols: List[str],
         cells: Dict[Tuple[str, str], CellMeta],
-        sigma: np.ndarray,
+        sigma_by_target: Dict[str, np.ndarray],
     ) -> np.ndarray:
         mat = np.full((len(rows), len(cols)), np.nan, dtype=np.float64)
         for i, r in enumerate(rows):
             for j, c in enumerate(cols):
                 if r == c:
                     mat[i, j] = 1.0
+                    continue
+                sigma = sigma_by_target.get(c)
+                if sigma is None:
                     continue
                 cell_ab = cells.get((r, c))
                 cell_ba = cells.get((c, r))
@@ -709,10 +886,10 @@ def main() -> int:
                     mat[i, j] = np.nan
         return mat
 
-    comp_probe_angle = probe_angle_matrix(comp_rows, comp_cols, comp_cells, comp_canon, sigma_comp)
-    full_probe_angle = probe_angle_matrix(full_rows, full_cols, full_cells, full_canon, sigma_full)
-    comp_probe_angle_v2 = probe_angle_matrix_v2(comp_rows, comp_cols, comp_cells, sigma_comp)
-    full_probe_angle_v2 = probe_angle_matrix_v2(full_rows, full_cols, full_cells, sigma_full)
+    comp_probe_angle = probe_angle_matrix(comp_rows, comp_cols, comp_cells, comp_canon, comp_probe_sigma)
+    full_probe_angle = probe_angle_matrix(full_rows, full_cols, full_cells, full_canon, full_probe_sigma)
+    comp_probe_angle_v2 = probe_angle_matrix_v2(comp_rows, comp_cols, comp_cells, comp_probe_sigma)
+    full_probe_angle_v2 = probe_angle_matrix_v2(full_rows, full_cols, full_cells, full_probe_sigma)
     save_matrix_csv(
         out_dir / "probe_angle_v1_completion.csv",
         comp_probe_angle,
@@ -836,6 +1013,17 @@ def main() -> int:
             "run_id": run_id,
             "completed_at": utc_now(),
             "model": args.model,
+            "notes": {
+                "cov_probe_definition": "Per-target covariance from pooled target-test activations; column c uses Sigma_test(c).",
+                "cov_probe_scope": "per_target_test_dataset_segment",
+                "cov_probe_split_preference": args.target_split,
+                "cov_probe_split_fallback": args.target_split_fallback,
+                "cov_probe_paths_completion": comp_probe_cov_paths,
+                "cov_probe_paths_full": full_probe_cov_paths,
+                "cov_probe_split_used_completion": comp_probe_cov_splits,
+                "cov_probe_split_used_full": full_probe_cov_splits,
+                "cov_activation_definition": "Shared covariance from pooled train activations across all datasets per segment (unchanged).",
+            },
             "outputs": {
                 "score_matrix_completion": str(out_dir / "score_matrix_completion.csv"),
                 "score_matrix_full": str(out_dir / "score_matrix_full.csv"),
