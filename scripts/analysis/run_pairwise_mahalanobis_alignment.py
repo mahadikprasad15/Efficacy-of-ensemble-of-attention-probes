@@ -226,7 +226,14 @@ def cov_update_tensors(acc: CovAccumulator | TorchCovAccumulator, rows: List[tor
     if not rows:
         return
     if isinstance(acc, TorchCovAccumulator):
-        x = torch.stack([r.detach().reshape(-1) for r in rows], dim=0)
+        # Pooling paths can return a mix of CPU/GPU tensors; normalize device here.
+        x = torch.stack(
+            [
+                r.detach().reshape(-1).to(device=acc.device, dtype=acc.dtype, non_blocking=True)
+                for r in rows
+            ],
+            dim=0,
+        )
         acc.update(x)
         return
     arr = np.stack(
