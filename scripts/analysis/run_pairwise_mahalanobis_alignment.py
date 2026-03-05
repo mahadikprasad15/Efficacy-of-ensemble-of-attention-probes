@@ -483,6 +483,18 @@ def parse_args() -> argparse.Namespace:
         choices=["all", "required"],
         help="all: use all layers+poolings for all datasets; required: only combos used by cells.",
     )
+    p.add_argument(
+        "--probe_angle_mode",
+        type=str,
+        default="both",
+        choices=["v1", "v2", "both"],
+        help="Which probe-angle matrix variants to compute.",
+    )
+    p.add_argument(
+        "--skip_activation_angles",
+        action="store_true",
+        help="Skip activation-mean angle matrices and compute probe-angle outputs only.",
+    )
     return p.parse_args()
 
 
@@ -990,123 +1002,150 @@ def main() -> int:
                     mat[i, j] = np.nan
         return mat
 
-    comp_probe_angle = probe_angle_matrix(comp_rows, comp_cols, comp_cells, comp_canon, comp_probe_sigma)
-    full_probe_angle = probe_angle_matrix(full_rows, full_cols, full_cells, full_canon, full_probe_sigma)
-    comp_probe_angle_v2 = probe_angle_matrix_v2(comp_rows, comp_cols, comp_cells, comp_probe_sigma)
-    full_probe_angle_v2 = probe_angle_matrix_v2(full_rows, full_cols, full_cells, full_probe_sigma)
-    save_matrix_csv(
-        out_dir / "probe_angle_v1_completion.csv",
-        comp_probe_angle,
-        [short_name(r) for r in comp_rows],
-        [short_name(c) for c in comp_cols],
-    )
-    save_matrix_csv(
-        out_dir / "probe_angle_v1_full.csv",
-        full_probe_angle,
-        [short_name(r) for r in full_rows],
-        [short_name(c) for c in full_cols],
-    )
-    save_matrix_csv(
-        out_dir / "probe_angle_v2_completion.csv",
-        comp_probe_angle_v2,
-        [short_name(r) for r in comp_rows],
-        [short_name(c) for c in comp_cols],
-    )
-    save_matrix_csv(
-        out_dir / "probe_angle_v2_full.csv",
-        full_probe_angle_v2,
-        [short_name(r) for r in full_rows],
-        [short_name(c) for c in full_cols],
-    )
+    probe_angle_v1_completion_path: Optional[str] = None
+    probe_angle_v1_full_path: Optional[str] = None
+    probe_angle_v2_completion_path: Optional[str] = None
+    probe_angle_v2_full_path: Optional[str] = None
+
+    if args.probe_angle_mode in ["v1", "both"]:
+        comp_probe_angle = probe_angle_matrix(comp_rows, comp_cols, comp_cells, comp_canon, comp_probe_sigma)
+        full_probe_angle = probe_angle_matrix(full_rows, full_cols, full_cells, full_canon, full_probe_sigma)
+        p_comp_v1 = out_dir / "probe_angle_v1_completion.csv"
+        p_full_v1 = out_dir / "probe_angle_v1_full.csv"
+        save_matrix_csv(
+            p_comp_v1,
+            comp_probe_angle,
+            [short_name(r) for r in comp_rows],
+            [short_name(c) for c in comp_cols],
+        )
+        save_matrix_csv(
+            p_full_v1,
+            full_probe_angle,
+            [short_name(r) for r in full_rows],
+            [short_name(c) for c in full_cols],
+        )
+        probe_angle_v1_completion_path = str(p_comp_v1)
+        probe_angle_v1_full_path = str(p_full_v1)
+
+    if args.probe_angle_mode in ["v2", "both"]:
+        comp_probe_angle_v2 = probe_angle_matrix_v2(comp_rows, comp_cols, comp_cells, comp_probe_sigma)
+        full_probe_angle_v2 = probe_angle_matrix_v2(full_rows, full_cols, full_cells, full_probe_sigma)
+        p_comp_v2 = out_dir / "probe_angle_v2_completion.csv"
+        p_full_v2 = out_dir / "probe_angle_v2_full.csv"
+        save_matrix_csv(
+            p_comp_v2,
+            comp_probe_angle_v2,
+            [short_name(r) for r in comp_rows],
+            [short_name(c) for c in comp_cols],
+        )
+        save_matrix_csv(
+            p_full_v2,
+            full_probe_angle_v2,
+            [short_name(r) for r in full_rows],
+            [short_name(c) for c in full_cols],
+        )
+        probe_angle_v2_completion_path = str(p_comp_v2)
+        probe_angle_v2_full_path = str(p_full_v2)
     mark("probe_angles")
 
     # Activation mean angle matrices
-    update_status(status_path, "running", "computing activation mean angle matrices")
-    print("[stage 5/6] computing activation mean angle matrices")
+    activation_angle_completion_path: Optional[str] = None
+    activation_angle_full_path: Optional[str] = None
+    if args.skip_activation_angles:
+        update_status(status_path, "running", "skipping activation mean angle matrices")
+        print("[stage 5/6] skip activation mean angle matrices (--skip_activation_angles)")
+        mark("activation_angles")
+    else:
+        update_status(status_path, "running", "computing activation mean angle matrices")
+        print("[stage 5/6] computing activation mean angle matrices")
 
-    mean_cache_dir = chk_dir / "means"
-    mean_cache_dir.mkdir(parents=True, exist_ok=True)
+        mean_cache_dir = chk_dir / "means"
+        mean_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def mean_cache_path(segment: str, dataset: str, split: str, source_for_pooler: str, layer: int, pooling: str) -> Path:
-        key = f"{segment}__{dataset}__{split}__src-{source_for_pooler}__L{layer}__{pooling}.npy"
-        return mean_cache_dir / key
+        def mean_cache_path(segment: str, dataset: str, split: str, source_for_pooler: str, layer: int, pooling: str) -> Path:
+            key = f"{segment}__{dataset}__{split}__src-{source_for_pooler}__L{layer}__{pooling}.npy"
+            return mean_cache_dir / key
 
-    def compute_mean(
-        segment: str,
-        dataset: str,
-        split: str,
-        source_for_pooler: str,
-        layer: int,
-        pooling: str,
-    ) -> np.ndarray:
-        cache_path = mean_cache_path(segment, dataset, split, source_for_pooler, layer, pooling)
-        if args.resume and cache_path.exists():
-            return np.load(cache_path)
+        def compute_mean(
+            segment: str,
+            dataset: str,
+            split: str,
+            source_for_pooler: str,
+            layer: int,
+            pooling: str,
+        ) -> np.ndarray:
+            cache_path = mean_cache_path(segment, dataset, split, source_for_pooler, layer, pooling)
+            if args.resume and cache_path.exists():
+                return np.load(cache_path)
 
-        split_dir = ensure_split(acts_model_root / dataset, split, "validation" if split == "val" else None)
-        sample, _ = next(iter_labeled_activations(split_dir))
-        input_dim = int(sample.shape[-1])
-        pooling = normalize_pooling(pooling)
+            split_dir = ensure_split(acts_model_root / dataset, split, "validation" if split == "val" else None)
+            sample, _ = next(iter_labeled_activations(split_dir))
+            input_dim = int(sample.shape[-1])
+            pooling = normalize_pooling(pooling)
 
-        if pooling == "attn":
-            probe_path = resolve_probe_path(probes_model_root, source_for_pooler, "attn", layer)
-            if not probe_path.exists():
-                print(f"[warn] missing attn probe for {source_for_pooler} layer {layer}; using mean fallback")
-                pooler = Pooler("mean")
-            else:
-                pooler = load_attn_pooler(probe_path, input_dim=input_dim, device=device)
-        else:
-            pooler = Pooler(pooling)
-
-        acc_sum = np.zeros(input_dim, dtype=np.float64)
-        acc_n = 0
-        iterator = iter_labeled_activations(split_dir)
-        if use_tqdm:
-            iterator = tqdm(iterator, desc=f"mean:{short_name(dataset)}:{split}:L{layer}:{pooling}", unit="sample", leave=False)
-        t0 = time.time()
-        for tensor, _ in iterator:
-            x_layer = tensor[layer].float()
-            pooled = pooler.pool(x_layer)
-            acc_sum += pooled.detach().cpu().numpy().astype(np.float64)
-            acc_n += 1
-            if args.progress_every and acc_n % args.progress_every == 0:
-                elapsed = max(time.time() - t0, 1e-6)
-                print(f"[mean] {dataset}:{split} L{layer} {pooling} processed {acc_n} ({acc_n/elapsed:.2f} samples/s)")
-        if acc_n == 0:
-            raise RuntimeError(f"No samples for mean: {dataset} {split} L{layer} {pooling}")
-        mean_vec = acc_sum / float(acc_n)
-        np.save(cache_path, mean_vec)
-        return mean_vec
-
-    def activation_angle_matrix(
-        segment: str,
-        rows: List[str],
-        cols: List[str],
-        cells: Dict[Tuple[str, str], CellMeta],
-        sigma: np.ndarray,
-    ) -> np.ndarray:
-        mat = np.full((len(rows), len(cols)), np.nan, dtype=np.float64)
-        for i, r in enumerate(rows):
-            for j, c in enumerate(cols):
-                cell = cells.get((r, c))
-                if cell is None or cell.layer < 0:
-                    continue
-                pooling = normalize_pooling(cell.pooling)
-                if r == c:
-                    # diagonal: train vs val
-                    mu_a = compute_mean(segment, r, "train", r, cell.layer, pooling)
-                    mu_b = compute_mean(segment, r, "val", r, cell.layer, pooling)
+            if pooling == "attn":
+                probe_path = resolve_probe_path(probes_model_root, source_for_pooler, "attn", layer)
+                if not probe_path.exists():
+                    print(f"[warn] missing attn probe for {source_for_pooler} layer {layer}; using mean fallback")
+                    pooler = Pooler("mean")
                 else:
-                    mu_a = compute_mean(segment, r, "train", r, cell.layer, pooling)
-                    mu_b = compute_mean(segment, c, "test", r, cell.layer, pooling)
-                mat[i, j] = mahalanobis_cosine(mu_a, mu_b, sigma)
-        return mat
+                    pooler = load_attn_pooler(probe_path, input_dim=input_dim, device=device)
+            else:
+                pooler = Pooler(pooling)
 
-    comp_act_angle = activation_angle_matrix("completion", comp_rows, comp_cols, comp_cells, sigma_comp)
-    full_act_angle = activation_angle_matrix("full", full_rows, full_cols, full_cells, sigma_full)
-    save_matrix_csv(out_dir / "activation_mean_angle_completion.csv", comp_act_angle, [short_name(r) for r in comp_rows], [short_name(c) for c in comp_cols])
-    save_matrix_csv(out_dir / "activation_mean_angle_full.csv", full_act_angle, [short_name(r) for r in full_rows], [short_name(c) for c in full_cols])
-    mark("activation_angles")
+            acc_sum = np.zeros(input_dim, dtype=np.float64)
+            acc_n = 0
+            iterator = iter_labeled_activations(split_dir)
+            if use_tqdm:
+                iterator = tqdm(iterator, desc=f"mean:{short_name(dataset)}:{split}:L{layer}:{pooling}", unit="sample", leave=False)
+            t0 = time.time()
+            for tensor, _ in iterator:
+                x_layer = tensor[layer].float()
+                pooled = pooler.pool(x_layer)
+                acc_sum += pooled.detach().cpu().numpy().astype(np.float64)
+                acc_n += 1
+                if args.progress_every and acc_n % args.progress_every == 0:
+                    elapsed = max(time.time() - t0, 1e-6)
+                    print(f"[mean] {dataset}:{split} L{layer} {pooling} processed {acc_n} ({acc_n/elapsed:.2f} samples/s)")
+            if acc_n == 0:
+                raise RuntimeError(f"No samples for mean: {dataset} {split} L{layer} {pooling}")
+            mean_vec = acc_sum / float(acc_n)
+            np.save(cache_path, mean_vec)
+            return mean_vec
+
+        def activation_angle_matrix(
+            segment: str,
+            rows: List[str],
+            cols: List[str],
+            cells: Dict[Tuple[str, str], CellMeta],
+            sigma: np.ndarray,
+        ) -> np.ndarray:
+            mat = np.full((len(rows), len(cols)), np.nan, dtype=np.float64)
+            for i, r in enumerate(rows):
+                for j, c in enumerate(cols):
+                    cell = cells.get((r, c))
+                    if cell is None or cell.layer < 0:
+                        continue
+                    pooling = normalize_pooling(cell.pooling)
+                    if r == c:
+                        # diagonal: train vs val
+                        mu_a = compute_mean(segment, r, "train", r, cell.layer, pooling)
+                        mu_b = compute_mean(segment, r, "val", r, cell.layer, pooling)
+                    else:
+                        mu_a = compute_mean(segment, r, "train", r, cell.layer, pooling)
+                        mu_b = compute_mean(segment, c, "test", r, cell.layer, pooling)
+                    mat[i, j] = mahalanobis_cosine(mu_a, mu_b, sigma)
+            return mat
+
+        comp_act_angle = activation_angle_matrix("completion", comp_rows, comp_cols, comp_cells, sigma_comp)
+        full_act_angle = activation_angle_matrix("full", full_rows, full_cols, full_cells, sigma_full)
+        p_act_comp = out_dir / "activation_mean_angle_completion.csv"
+        p_act_full = out_dir / "activation_mean_angle_full.csv"
+        save_matrix_csv(p_act_comp, comp_act_angle, [short_name(r) for r in comp_rows], [short_name(c) for c in comp_cols])
+        save_matrix_csv(p_act_full, full_act_angle, [short_name(r) for r in full_rows], [short_name(c) for c in full_cols])
+        activation_angle_completion_path = str(p_act_comp)
+        activation_angle_full_path = str(p_act_full)
+        mark("activation_angles")
 
     # Summary
     update_status(status_path, "running", "saving summary")
@@ -1122,6 +1161,8 @@ def main() -> int:
                 "cov_probe_scope": "per_target_test_dataset_segment",
                 "cov_probe_split_preference": args.target_split,
                 "cov_probe_split_fallback": args.target_split_fallback,
+                "probe_angle_mode": args.probe_angle_mode,
+                "skip_activation_angles": bool(args.skip_activation_angles),
                 "cov_probe_paths_completion": comp_probe_cov_paths,
                 "cov_probe_paths_full": full_probe_cov_paths,
                 "cov_probe_split_used_completion": comp_probe_cov_splits,
@@ -1131,12 +1172,12 @@ def main() -> int:
             "outputs": {
                 "score_matrix_completion": str(out_dir / "score_matrix_completion.csv"),
                 "score_matrix_full": str(out_dir / "score_matrix_full.csv"),
-                "probe_angle_v1_completion": str(out_dir / "probe_angle_v1_completion.csv"),
-                "probe_angle_v1_full": str(out_dir / "probe_angle_v1_full.csv"),
-                "probe_angle_v2_completion": str(out_dir / "probe_angle_v2_completion.csv"),
-                "probe_angle_v2_full": str(out_dir / "probe_angle_v2_full.csv"),
-                "activation_angle_completion": str(out_dir / "activation_mean_angle_completion.csv"),
-                "activation_angle_full": str(out_dir / "activation_mean_angle_full.csv"),
+                "probe_angle_v1_completion": probe_angle_v1_completion_path,
+                "probe_angle_v1_full": probe_angle_v1_full_path,
+                "probe_angle_v2_completion": probe_angle_v2_completion_path,
+                "probe_angle_v2_full": probe_angle_v2_full_path,
+                "activation_angle_completion": activation_angle_completion_path,
+                "activation_angle_full": activation_angle_full_path,
             },
         },
     )
