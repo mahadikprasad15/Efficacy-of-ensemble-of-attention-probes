@@ -82,7 +82,7 @@ def main() -> int:
     _, results_model_root = split_root_and_model(Path(args.results_root), model_dir)
     results_model_root.mkdir(parents=True, exist_ok=True)
 
-    rows_map, _, _, _, _ = stage_spec()
+    rows_map, _ = stage_spec()
     if args.sources:
         sources = [s.strip() for s in args.sources.split(",") if s.strip()]
     else:
