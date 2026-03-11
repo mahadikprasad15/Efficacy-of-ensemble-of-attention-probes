@@ -34,6 +34,9 @@ ACTS_RAW_ROOT = ROOT / "data" / "activations_raw"
 PROBES_ROOT = ROOT / "data" / "probes"
 OOD_ROOT = ROOT / "results" / "ood_evaluation"
 ARTIFACT_ROOT = ROOT / "artifacts"
+PAIRWISE_PIPELINE_ROOT = ROOT / "results" / "ood_evaluation" / MODEL_DIR / "All_dataset_pairwise_results"
+SCORE_MATRIX_ROOT = ROOT / "results" / "pairwise_score_matrix_from_artifacts" / MODEL_DIR
+MAHAL_ROOT = ROOT / "results" / "pairwise_mahalanobis_alignment" / MODEL_DIR / "matrix6x7" / "v1"
 
 SOURCE_DATASETS = [
     "Deception-ConvincingGame",
@@ -70,6 +73,9 @@ print("ACTS_RAW_ROOT =", ACTS_RAW_ROOT)
 print("PROBES_ROOT =", PROBES_ROOT)
 print("OOD_ROOT =", OOD_ROOT)
 print("ARTIFACT_ROOT =", ARTIFACT_ROOT)
+print("PAIRWISE_PIPELINE_ROOT =", PAIRWISE_PIPELINE_ROOT)
+print("SCORE_MATRIX_ROOT =", SCORE_MATRIX_ROOT)
+print("MAHAL_ROOT =", MAHAL_ROOT)
 ```
 
 ## Cell 3: Streaming Helpers
@@ -235,10 +241,7 @@ for dataset in SOURCE_DATASETS:
 
 ```python
 pairwise_summary = (
-    ARTIFACT_ROOT
-    / "runs"
-    / "pairwise_eval_matrix"
-    / MODEL_DIR
+    PAIRWISE_PIPELINE_ROOT
     / PAIRWISE_RUN_ID
     / "results"
     / "summary.json"
@@ -256,6 +259,7 @@ else:
         "--probes_root", str(PROBES_ROOT),
         "--results_root", str(OOD_ROOT),
         "--artifact_root", str(ARTIFACT_ROOT),
+        "--pipeline_results_root", str(PAIRWISE_PIPELINE_ROOT),
         "--model", MODEL,
         "--run_id", PAIRWISE_RUN_ID,
         "--poolings", ",".join(POOLINGS),
@@ -278,10 +282,7 @@ That matters for the principled matrix build: the diagonal cell is then filled t
 
 ```python
 principled_summary = (
-    ARTIFACT_ROOT
-    / "runs"
-    / "pairwise_score_matrix_from_artifacts"
-    / MODEL_DIR
+    SCORE_MATRIX_ROOT
     / PRINCIPLED_RUN_ID
     / "results"
     / "summary.json"
@@ -298,6 +299,7 @@ else:
         "--probes_root", str(PROBES_ROOT),
         "--ood_results_root", str(OOD_ROOT),
         "--artifact_root", str(ARTIFACT_ROOT),
+        "--output_root", str(SCORE_MATRIX_ROOT),
         "--model", MODEL,
         "--run_id", PRINCIPLED_RUN_ID,
         "--segments", "completion,full",
@@ -312,21 +314,13 @@ else:
 
 ```python
 principled_results_dir = (
-    ARTIFACT_ROOT
-    / "runs"
-    / "pairwise_score_matrix_from_artifacts"
-    / MODEL_DIR
+    SCORE_MATRIX_ROOT
     / PRINCIPLED_RUN_ID
     / "results"
 )
 
 mahal_summary = (
-    ARTIFACT_ROOT
-    / "runs"
-    / "pairwise_mahalanobis_alignment"
-    / MODEL_DIR
-    / "matrix6x7"
-    / "v1"
+    MAHAL_ROOT
     / MAHAL_RUN_ID
     / "results"
     / "summary.json"
@@ -344,6 +338,7 @@ else:
         "--activations_root", str(ACTS_ROOT),
         "--probes_root", str(PROBES_ROOT),
         "--artifact_root", str(ARTIFACT_ROOT),
+        "--output_root", str(MAHAL_ROOT),
         "--model", MODEL,
         "--run_id", MAHAL_RUN_ID,
         "--target_split", "test",
