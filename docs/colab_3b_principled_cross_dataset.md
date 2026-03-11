@@ -4,9 +4,9 @@ This is a Colab-first execution sheet for the 3B principled cross-dataset run.
 
 It enforces the intended workflow:
 
-- cache `-full` activations once for every dataset and split
-- save raw activations alongside full activations
-- derive `-completion` activations by slicing raw activations
+- cache resampled `-full` activations directly for every dataset and split
+- cache resampled `-completion` activations directly for every dataset and split
+- do not store raw activations
 - train probes for the 6 source-row datasets only
 - run the generic pairwise pipeline with the fixed `run_pairwise_eval_matrix.py`
 - build principled matrices
@@ -30,7 +30,6 @@ MODEL = "meta-llama/Llama-3.2-3B-Instruct"
 MODEL_DIR = MODEL.replace("/", "_")
 
 ACTS_ROOT = ROOT / "data" / "activations_fullprompt"
-ACTS_RAW_ROOT = ROOT / "data" / "activations_raw"
 PROBES_ROOT = ROOT / "data" / "probes"
 OOD_ROOT = ROOT / "results" / "ood_evaluation"
 ARTIFACT_ROOT = ROOT / "artifacts"
@@ -69,7 +68,6 @@ print("ROOT =", ROOT)
 print("MODEL =", MODEL)
 print("MODEL_DIR =", MODEL_DIR)
 print("ACTS_ROOT =", ACTS_ROOT)
-print("ACTS_RAW_ROOT =", ACTS_RAW_ROOT)
 print("PROBES_ROOT =", PROBES_ROOT)
 print("OOD_ROOT =", OOD_ROOT)
 print("ARTIFACT_ROOT =", ARTIFACT_ROOT)
@@ -153,7 +151,7 @@ def run_stream(label: str, cmd: list[str]) -> None:
     print(f"[done] {label} elapsed={elapsed:.1f}s")
 ```
 
-## Cell 4: Phase 1, Cache Full + Raw Activations
+## Cell 4: Phase 1, Cache Resampled Full Activations Directly
 
 ```python
 total_units = len(ALL_DATASETS) * len(SPLITS)
@@ -163,10 +161,9 @@ for dataset in ALL_DATASETS:
     for split in SPLITS:
         unit_idx += 1
         full_dir = ACTS_ROOT / MODEL_DIR / f"{dataset}-full" / split
-        raw_dir = ACTS_RAW_ROOT / MODEL_DIR / f"{dataset}-full" / split
         label = f"[phase1 {unit_idx}/{total_units}] cache {dataset}-full {split}"
 
-        if has_manifest_and_shards(full_dir) and has_manifest_and_shards(raw_dir):
+        if has_manifest_and_shards(full_dir):
             print(f"[skip] {label} outputs already exist")
             continue
 
@@ -178,9 +175,7 @@ for dataset in ALL_DATASETS:
             "--split", split,
             "--dataset_output_name", f"{dataset}-full",
             "--include_prompt_tokens",
-            "--save_raw",
             "--output_dir", str(ACTS_ROOT),
-            "--raw_output_dir", str(ACTS_RAW_ROOT),
             "--L_prime", str(L_PRIME),
             "--T_prime", str(T_PRIME),
             "--batch_size", str(CACHE_BATCH_SIZE),
@@ -195,7 +190,7 @@ for dataset in ALL_DATASETS:
         run_stream(label, cmd)
 ```
 
-## Cell 5: Phase 2, Slice Completion Activations From Raw
+## Cell 5: Phase 2, Cache Resampled Completion Activations Directly
 
 ```python
 total_units = len(ALL_DATASETS) * len(SPLITS)
@@ -204,9 +199,8 @@ unit_idx = 0
 for dataset in ALL_DATASETS:
     for split in SPLITS:
         unit_idx += 1
-        raw_dir = ACTS_RAW_ROOT / MODEL_DIR / f"{dataset}-full" / split
         completion_dir = ACTS_ROOT / MODEL_DIR / f"{dataset}-completion" / split
-        label = f"[phase2 {unit_idx}/{total_units}] slice {dataset}-completion {split}"
+        label = f"[phase2 {unit_idx}/{total_units}] cache {dataset}-completion {split}"
 
         if has_manifest_and_shards(completion_dir):
             print(f"[skip] {label} outputs already exist")
@@ -215,13 +209,22 @@ for dataset in ALL_DATASETS:
         cmd = [
             sys.executable,
             "-u",
-            "scripts/data/slice_cached_activations.py",
-            "--raw_activations_dir", str(raw_dir),
-            "--output_dir", str(completion_dir),
-            "--slice_type", "completion",
+            "scripts/data/cache_deception_activations.py",
+            "--model", MODEL,
+            "--split", split,
+            "--dataset_output_name", f"{dataset}-completion",
+            "--output_dir", str(ACTS_ROOT),
             "--L_prime", str(L_PRIME),
             "--T_prime", str(T_PRIME),
+            "--batch_size", str(CACHE_BATCH_SIZE),
         ]
+        cmd.extend(resolve_cache_dataset_args(dataset))
+
+        if dataset == "Deception-InsiderTrading":
+            cmd.append("--use_pregenerated")
+        elif dataset == "Deception-Roleplaying":
+            cmd.append("--use_gold_completions")
+
         run_stream(label, cmd)
 ```
 
