@@ -93,6 +93,27 @@ def has_manifest_and_shards(path: Path) -> bool:
     return manifest.exists() and len(shards) > 0
 
 
+def resolve_cache_dataset_args(dataset: str) -> list[str]:
+    if dataset == "Deception-ConvincingGame":
+        patterns = ["**/convincing-game__*.jsonl", "**/convincing-game__*.parquet", "**/convincing-game__*.json"]
+        base_dataset = "Deception-InstructedDeception"
+    elif dataset == "Deception-HarmPressureChoice":
+        patterns = ["**/harm-pressure-choice__*.jsonl", "**/harm-pressure-choice__*.parquet", "**/harm-pressure-choice__*.json"]
+        base_dataset = "Deception-InstructedDeception"
+    else:
+        return ["--dataset", dataset]
+
+    raw_root = ROOT / "data" / "apollo_raw"
+    matches = []
+    for pattern in patterns:
+        matches.extend(sorted(raw_root.rglob(pattern.replace("**/", ""))))
+    if not matches:
+        raise FileNotFoundError(f"Could not find typed-deception source file for {dataset} under {raw_root}")
+    dataset_file = matches[0]
+    print(f"[cache] {dataset} uses dataset_file={dataset_file}")
+    return ["--dataset", base_dataset, "--dataset_file", str(dataset_file)]
+
+
 def probe_unit_done(dataset: str, segment: str, pooling: str, expected_layers: int = 28) -> bool:
     results_path = (
         PROBES_ROOT
@@ -154,7 +175,6 @@ for dataset in ALL_DATASETS:
             "-u",
             "scripts/data/cache_deception_activations.py",
             "--model", MODEL,
-            "--dataset", dataset,
             "--split", split,
             "--dataset_output_name", f"{dataset}-full",
             "--include_prompt_tokens",
@@ -165,6 +185,7 @@ for dataset in ALL_DATASETS:
             "--T_prime", str(T_PRIME),
             "--batch_size", str(CACHE_BATCH_SIZE),
         ]
+        cmd.extend(resolve_cache_dataset_args(dataset))
 
         if dataset == "Deception-InsiderTrading":
             cmd.append("--use_pregenerated")
