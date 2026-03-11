@@ -3,11 +3,10 @@
 Train/evaluate pairwise probe matrices for completion/full deception segments.
 
 Implements:
-  - Stage 1 train new probes (CG/HPC/ID/M x completion/full)
-  - Stage 2A evaluate N pairs (new probes)
-  - Stage 2B evaluate R pairs (existing AL/RP probes)
-  - Stage 3 collect existing ✓ pairs (AL/RP -> IT)
-  - Stage 4 fill diagonals from validation metrics
+  - Stage 1 train source-row probes for the active segments
+  - Stage 2 evaluate all off-diagonal row -> column pairs
+  - Stage 3 optional compatibility collection from legacy artifact formats
+  - Stage 4 evaluate same-dataset test diagonals
   - Stage 5 aggregate completion/full matrices and export CSV/JSON
 
 Resumable + verbose progress:
@@ -135,7 +134,7 @@ class PairJob:
     source_dataset: str
     target_dataset: str
     segment: str
-    cell_type: str  # N | R | existing
+    cell_type: str  # matrix_off_diagonal
     action: str  # eval_run | collect_only
 
     @property
@@ -481,6 +480,36 @@ def diagonal_from_validation(
     return summary
 
 
+def diagonal_from_test(
+    dataset_name: str,
+    model_root_activations: Path,
+    model_root_probes: Path,
+    poolings: Sequence[str],
+    eval_batch_size: int,
+    device: torch.device,
+    use_tqdm: bool,
+) -> Dict[str, Any]:
+    dataset_dir = model_root_activations / dataset_name
+    split = "test"
+    if not (dataset_dir / split).exists():
+        raise FileNotFoundError(f"No test split found for {dataset_name} at {dataset_dir / split}")
+    summary = evaluate_pair_all_poolings(
+        source_dataset=dataset_name,
+        target_dataset=dataset_name,
+        split=split,
+        model_root_activations=model_root_activations,
+        model_root_probes=model_root_probes,
+        poolings=poolings,
+        eval_batch_size=eval_batch_size,
+        device=device,
+        use_tqdm=use_tqdm,
+    )
+    summary["source"] = "diagonal_test"
+    summary["cell_type"] = "matrix_diagonal"
+    summary["action"] = "eval_run"
+    return summary
+
+
 def write_csv_rows(path: Path, rows: List[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -512,6 +541,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--skip_training", action="store_true", help="Skip training stage entirely.")
     parser.add_argument("--skip_diagonals", action="store_true", help="Skip diagonal validation stage.")
+    parser.add_argument(
+        "--collect_existing_pairs",
+        action="store_true",
+        help=(
+            "Compatibility mode: if a pair lacks pair_summary.json, "
+            "backfill it from older artifact formats instead of reevaluating."
+        ),
+    )
     parser.add_argument(
         "--only_sources",
         type=str,
@@ -545,7 +582,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def stage_spec() -> Tuple[Dict[str, List[str]], Dict[str, List[str]], List[str], List[str], List[str]]:
+def stage_spec() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     rows = {
         "completion": [
             "Deception-ConvincingGame-completion",
@@ -584,57 +621,26 @@ def stage_spec() -> Tuple[Dict[str, List[str]], Dict[str, List[str]], List[str],
             "Deception-Roleplaying-full",
         ],
     }
-    new_sources = [
-        "Deception-ConvincingGame-completion",
-        "Deception-HarmPressureChoice-completion",
-        "Deception-InstructedDeception-completion",
-        "Deception-Mask-completion",
-        "Deception-ConvincingGame-full",
-        "Deception-HarmPressureChoice-full",
-        "Deception-InstructedDeception-full",
-        "Deception-Mask-full",
-    ]
-    existing_sources = [
-        "Deception-AILiar-completion",
-        "Deception-Roleplaying-completion",
-        "Deception-AILiar-full",
-        "Deception-Roleplaying-full",
-    ]
-    existing_collect_pairs = [
-        "Deception-AILiar-completion__Deception-InsiderTrading-completion",
-        "Deception-Roleplaying-completion__Deception-InsiderTrading-completion",
-        "Deception-AILiar-full__Deception-InsiderTrading-full",
-        "Deception-Roleplaying-full__Deception-InsiderTrading-full",
-    ]
-    return rows, cols, new_sources, existing_sources, existing_collect_pairs
+    return rows, cols
 
 
-def build_expected_pairs() -> List[PairJob]:
-    rows, cols, _, _, existing_collect_pairs = stage_spec()
-    collect_set = set(existing_collect_pairs)
+def build_expected_pairs(rows: Dict[str, List[str]], cols: Dict[str, List[str]]) -> List[PairJob]:
     jobs: List[PairJob] = []
     for seg in ["completion", "full"]:
-        for src in rows[seg]:
-            for tgt in cols[seg]:
+        for src in rows.get(seg, []):
+            for tgt in cols.get(seg, []):
                 if src == tgt:
                     continue
-                pair_id = f"{src}__{tgt}"
-                if pair_id in collect_set:
-                    jobs.append(PairJob(src, tgt, seg, "existing", "collect_only"))
-                    continue
-                if src.startswith("Deception-AILiar") or src.startswith("Deception-Roleplaying"):
-                    jobs.append(PairJob(src, tgt, seg, "R", "eval_run"))
-                else:
-                    jobs.append(PairJob(src, tgt, seg, "N", "eval_run"))
+                jobs.append(PairJob(src, tgt, seg, "matrix_off_diagonal", "eval_run"))
     return jobs
 
 
 def print_stage_dashboard(progress: Dict[str, Any]) -> None:
     stages = [
-        ("stage1_train", "Train New Probes"),
-        ("stage2_eval", "Evaluate N + R Pairs"),
-        ("stage3_collect", "Collect Existing ✓"),
-        ("stage4_diag", "Compute Diagonal Validation"),
+        ("stage1_train", "Train Source Probes"),
+        ("stage2_eval", "Evaluate Off-Diagonal Pairs"),
+        ("stage3_collect", "Collect Legacy Pairs"),
+        ("stage4_diag", "Evaluate Diagonal Test Cells"),
         ("stage5_aggregate", "Aggregate Matrices"),
     ]
     done = sum(1 for key, _ in stages if key in set(progress.get("completed_steps", [])))
@@ -709,6 +715,7 @@ def main() -> int:
             },
             "poolings": poolings,
             "resume": bool(args.resume),
+            "collect_existing_pairs": bool(args.collect_existing_pairs),
             "pipeline_results_root": args.pipeline_results_root,
         },
     )
@@ -749,25 +756,30 @@ def main() -> int:
         progress["updated_at"] = utc_now()
         write_json(progress_path, progress)
 
-    rows_map, cols_map, new_sources, _, _ = stage_spec()
-    pair_jobs = build_expected_pairs()
+    rows_map, cols_map = stage_spec()
+    pair_jobs = build_expected_pairs(rows_map, cols_map)
     eval_jobs = [j for j in pair_jobs if j.action == "eval_run"]
-    collect_jobs = [j for j in pair_jobs if j.action == "collect_only"]
+    collect_jobs: List[PairJob] = []
     if only_segments:
         eval_jobs = [j for j in eval_jobs if j.segment in only_segments]
-        collect_jobs = [j for j in collect_jobs if j.segment in only_segments]
     if only_sources:
         eval_jobs = [j for j in eval_jobs if j.source_dataset in only_sources]
-        collect_jobs = [j for j in collect_jobs if j.source_dataset in only_sources]
     if only_targets:
         eval_jobs = [j for j in eval_jobs if j.target_dataset in only_targets]
-        collect_jobs = [j for j in collect_jobs if j.target_dataset in only_targets]
 
-    # Train only sources that appear in the filtered eval jobs (when filters are provided).
-    train_sources = list(new_sources)
+    active_segments = ["completion", "full"]
+    if only_segments:
+        active_segments = [seg for seg in active_segments if seg in only_segments]
+
+    train_sources: List[str] = []
+    for seg in active_segments:
+        for ds_name in rows_map.get(seg, []):
+            if ds_name not in train_sources:
+                train_sources.append(ds_name)
+
     if only_sources or only_targets or only_segments:
         filtered_sources = {j.source_dataset for j in eval_jobs}
-        train_sources = [s for s in new_sources if s in filtered_sources]
+        train_sources = [s for s in train_sources if s in filtered_sources]
 
     # Export expected pair tables
     expected_rows: List[Dict[str, Any]] = []
@@ -794,7 +806,7 @@ def main() -> int:
     )
     write_csv_rows(
         out_dir / "pairs_collected.csv",
-        [r for r in expected_rows if r["action"] == "collect_only"],
+        [],
         ["segment", "source_dataset", "target_dataset", "cell_type", "action", "pair_id"],
     )
     print(f"[info] eval jobs={len(eval_jobs)} collect-only jobs={len(collect_jobs)}")
@@ -804,9 +816,9 @@ def main() -> int:
         update_status(status_path, "completed", "dry_run complete")
         return 0
 
-    # Stage 1: Train new probes
+    # Stage 1: Train source-row probes
     update_status(status_path, "running", "stage 1 training")
-    print("[stage 1/5] train new probes")
+    print("[stage 1/5] train source-row probes")
     train_jobs: List[Tuple[str, str]] = []
     for ds in train_sources:
         for pooling in poolings:
@@ -877,9 +889,9 @@ def main() -> int:
     mark_step("stage1_train")
     print("[done] stage 1")
 
-    # Stage 2: evaluate N+R pairs
+    # Stage 2: evaluate off-diagonal pairs
     update_status(status_path, "running", "stage 2 evaluation")
-    print("[stage 2/5] evaluate N+R pairs")
+    print("[stage 2/5] evaluate off-diagonal pairs")
     pair_summary_index: Dict[str, Dict[str, Any]] = {}
     eval_pbar = tqdm(eval_jobs, desc="eval_pairs", disable=not use_tqdm)
     for i, job in enumerate(eval_pbar, start=1):
@@ -898,6 +910,29 @@ def main() -> int:
             progress["completed_eval_pairs"].append(pair_id)
             write_json(progress_path, progress)
             continue
+        if args.collect_existing_pairs and not args.force_reeval:
+            parsed = parse_existing_pair_summary(pair_dir)
+            if parsed is not None:
+                payload = {
+                    "source_dataset": job.source_dataset,
+                    "target_dataset": job.target_dataset,
+                    "split": "test",
+                    "poolings": parsed.get("poolings", {}),
+                    "overall_best": parsed.get("overall_best", {}),
+                    "cell_type": job.cell_type,
+                    "action": "collect_only",
+                    "collected_at": utc_now(),
+                    "source_format": parsed.get("source", "unknown"),
+                }
+                pair_dir.mkdir(parents=True, exist_ok=True)
+                write_json(pair_summary_path, payload)
+                pair_summary_index[pair_id] = payload
+                progress["completed_eval_pairs"].append(pair_id)
+                progress["completed_collect_pairs"].append(pair_id)
+                progress["updated_at"] = utc_now()
+                write_json(progress_path, progress)
+                print(f"[eval] collected legacy summary {pair_id}")
+                continue
 
         pair_dir.mkdir(parents=True, exist_ok=True)
         t0 = time.time()
@@ -936,60 +971,19 @@ def main() -> int:
     mark_step("stage2_eval")
     print("[done] stage 2")
 
-    # Stage 3: collect existing ✓ pairs
-    update_status(status_path, "running", "stage 3 collect existing")
-    print("[stage 3/5] collect existing ✓ pairs")
-    collect_pbar = tqdm(collect_jobs, desc="collect_pairs", disable=not use_tqdm)
-    for i, job in enumerate(collect_pbar, start=1):
-        pair_id = job.pair_id
-        pair_dir = results_model_root / f"from-{job.source_dataset}" / f"to-{job.target_dataset}"
-        pair_summary_path = pair_dir / "pair_summary.json"
-        if args.resume and pair_id in set(progress["completed_collect_pairs"]):
-            if pair_summary_path.exists():
-                pair_summary_index[pair_id] = read_json(pair_summary_path)
-            print(f"[collect] skip completed {pair_id}")
-            continue
-        if pair_summary_path.exists():
-            pair_summary_index[pair_id] = read_json(pair_summary_path)
-            progress["completed_collect_pairs"].append(pair_id)
-            write_json(progress_path, progress)
-            print(f"[collect] found existing unified {pair_id}")
-            continue
-        parsed = parse_existing_pair_summary(pair_dir)
-        if parsed is None:
-            append_jsonl(
-                out_dir / "pairs_missing.jsonl",
-                {"pair_id": pair_id, "reason": "existing_pair_not_found", "stage": "collect"},
-            )
-            print(f"[collect] missing existing {pair_id}")
-            continue
-        payload = {
-            "source_dataset": job.source_dataset,
-            "target_dataset": job.target_dataset,
-            "split": "test",
-            "poolings": parsed.get("poolings", {}),
-            "overall_best": parsed.get("overall_best", {}),
-            "cell_type": "existing",
-            "action": "collect_only",
-            "collected_at": utc_now(),
-            "source_format": parsed.get("source", "unknown"),
-        }
-        pair_dir.mkdir(parents=True, exist_ok=True)
-        write_json(pair_summary_path, payload)
-        pair_summary_index[pair_id] = payload
-        progress["completed_collect_pairs"].append(pair_id)
-        progress["updated_at"] = utc_now()
-        write_json(progress_path, progress)
-        print(f"[collect] collected {pair_id}")
-        if args.progress_every > 0 and i % args.progress_every == 0:
-            print(f"[collect] checkpoint at {i}/{len(collect_jobs)}")
-
+    # Stage 3: optional legacy collection compatibility stage
+    update_status(status_path, "running", "stage 3 legacy collection")
+    print("[stage 3/5] legacy collection compatibility")
+    if args.collect_existing_pairs:
+        print("[collect] compatibility mode is enabled; legacy summaries were collected during stage 2 when available.")
+    else:
+        print("[collect] compatibility mode disabled; no legacy pair collection performed.")
     mark_step("stage3_collect")
     print("[done] stage 3")
 
-    # Stage 4: diagonals from validation
+    # Stage 4: same-dataset test diagonals
     update_status(status_path, "running", "stage 4 diagonals")
-    print("[stage 4/5] compute diagonal validation cells")
+    print("[stage 4/5] evaluate same-dataset test diagonal cells")
     diag_datasets = rows_map["completion"] + rows_map["full"]
     diag_results: Dict[str, Dict[str, Any]] = {}
     if args.skip_diagonals:
@@ -998,15 +992,31 @@ def main() -> int:
     else:
         diag_pbar = tqdm(diag_datasets, desc="diag_cells", disable=not use_tqdm)
         for i, ds_name in enumerate(diag_pbar, start=1):
+            pair_id = f"{ds_name}__{ds_name}"
+            pair_dir = results_model_root / f"from-{ds_name}" / f"to-{ds_name}"
+            pair_summary_path = pair_dir / "pair_summary.json"
+            diag_path = out_dir / "diagonals" / f"{ds_name}.json"
             if args.resume and ds_name in set(progress["completed_diag_jobs"]):
-                diag_path = out_dir / "diagonals" / f"{ds_name}.json"
-                if diag_path.exists():
+                if pair_summary_path.exists():
+                    summary = read_json(pair_summary_path)
+                    diag_results[ds_name] = summary
+                    pair_summary_index[pair_id] = summary
+                elif diag_path.exists():
                     diag_results[ds_name] = read_json(diag_path)
                 print(f"[diag] skip completed {ds_name}")
                 continue
+            if pair_summary_path.exists() and not args.force_reeval:
+                summary = read_json(pair_summary_path)
+                diag_results[ds_name] = summary
+                pair_summary_index[pair_id] = summary
+                progress["completed_diag_jobs"].append(ds_name)
+                progress["updated_at"] = utc_now()
+                write_json(progress_path, progress)
+                print(f"[diag] skip existing test summary {ds_name}")
+                continue
             t0 = time.time()
             try:
-                diag = diagonal_from_validation(
+                diag = diagonal_from_test(
                     dataset_name=ds_name,
                     model_root_activations=acts_model_root,
                     model_root_probes=probes_model_root,
@@ -1015,9 +1025,11 @@ def main() -> int:
                     device=device,
                     use_tqdm=use_tqdm,
                 )
-                diag_path = out_dir / "diagonals" / f"{ds_name}.json"
+                pair_dir.mkdir(parents=True, exist_ok=True)
+                write_json(pair_summary_path, diag)
                 write_json(diag_path, diag)
                 diag_results[ds_name] = diag
+                pair_summary_index[pair_id] = diag
                 progress["completed_diag_jobs"].append(ds_name)
                 progress["updated_at"] = utc_now()
                 write_json(progress_path, progress)
@@ -1048,18 +1060,27 @@ def main() -> int:
 
     def cell_metrics(source: str, target: str) -> Dict[str, Any]:
         if source == target:
-            diag = diag_results.get(source)
-            if not diag:
-                return {"status": "missing", "auc": None, "accuracy": None, "f1": None, "pooling": None, "layer": None, "source": "diag_val"}
-            best = diag["overall_best"]
+            pair_id = f"{source}__{target}"
+            summary = pair_summary_index.get(pair_id)
+            if summary is None:
+                path = results_model_root / f"from-{source}" / f"to-{target}" / "pair_summary.json"
+                if path.exists():
+                    summary = read_json(path)
+            if summary is None:
+                diag = diag_results.get(source)
+                if not diag:
+                    return {"status": "missing", "auc": None, "accuracy": None, "f1": None, "pooling": None, "layer": None, "source": "diag_missing"}
+                summary = diag
+            best = summary.get("overall_best", {})
+            f1v = best.get("f1")
             return {
-                "status": "ok",
-                "auc": float(best["auc"]),
-                "accuracy": float(best["accuracy"]),
-                "f1": float(best["f1"]),
-                "pooling": best["pooling"],
-                "layer": int(best["layer"]),
-                "source": "diag_val",
+                "status": "ok" if best else "missing",
+                "auc": float(best["auc"]) if "auc" in best else None,
+                "accuracy": float(best["accuracy"]) if "accuracy" in best else None,
+                "f1": float(f1v) if f1v is not None else None,
+                "pooling": best.get("pooling"),
+                "layer": int(best["layer"]) if "layer" in best and best["layer"] is not None else None,
+                "source": summary.get("source", summary.get("action", "diag_test")),
             }
         pair_id = f"{source}__{target}"
         summary = pair_summary_index.get(pair_id)
