@@ -563,10 +563,6 @@ def main():
 
     args = parser.parse_args()
 
-    if args.dataset == "Deception-AILiar" and not args.include_prompt_tokens:
-        logger.info("Deception-AILiar: forcing --include_prompt_tokens to store full prompt+completion activations.")
-        args.include_prompt_tokens = True
-
     logger.info(f"{'='*70}")
     logger.info(f"Deception Detection - Activation Caching Pipeline")
     logger.info(f"{'='*70}")
