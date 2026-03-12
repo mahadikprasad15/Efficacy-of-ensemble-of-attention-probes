@@ -1000,7 +1000,7 @@ def main() -> int:
         logits_ready = pair_logits_exist(pair_dir)
         logits_missing = bool(args.save_pair_logits and not logits_ready)
 
-        if args.resume and pair_id in set(progress["completed_eval_pairs"]) and not logits_missing:
+        if args.resume and pair_id in set(progress["completed_eval_pairs"]) and not logits_missing and not args.force_reeval:
             if pair_summary_path.exists():
                 pair_summary_index[pair_id] = read_json(pair_summary_path)
             print(f"[eval] skip completed {pair_id}")
@@ -1087,73 +1087,88 @@ def main() -> int:
     # Stage 4: same-dataset test diagonals
     update_status(status_path, "running", "stage 4 diagonals")
     print("[stage 4/5] evaluate same-dataset test diagonal cells")
-    diag_datasets = rows_map["completion"] + rows_map["full"]
+    filtered_eval_sources = {j.source_dataset for j in eval_jobs}
+    filtered_eval_targets = {j.target_dataset for j in eval_jobs}
+    diag_datasets: List[str] = []
+    for seg in active_segments:
+        for ds_name in rows_map.get(seg, []):
+            if ds_name not in filtered_eval_sources:
+                continue
+            if ds_name not in filtered_eval_targets:
+                continue
+            if ds_name not in diag_datasets:
+                diag_datasets.append(ds_name)
     diag_results: Dict[str, Dict[str, Any]] = {}
     if args.skip_diagonals:
         print("[diag] skip_diagonals enabled; skipping stage 4")
         mark_step("stage4_diag")
     else:
-        diag_pbar = tqdm(diag_datasets, desc="diag_cells", disable=not use_tqdm)
-        for i, ds_name in enumerate(diag_pbar, start=1):
-            pair_id = f"{ds_name}__{ds_name}"
-            pair_dir = results_model_root / f"from-{ds_name}" / f"to-{ds_name}"
-            pair_summary_path = pair_dir / "pair_summary.json"
-            diag_path = out_dir / "diagonals" / f"{ds_name}.json"
-            logits_ready = pair_logits_exist(pair_dir)
-            logits_missing = bool(args.save_pair_logits and not logits_ready)
-            if args.resume and ds_name in set(progress["completed_diag_jobs"]) and not logits_missing:
-                if pair_summary_path.exists():
+        if not diag_datasets:
+            print("[diag] no diagonal datasets remain after filtering; skipping stage 4")
+            mark_step("stage4_diag")
+            print("[done] stage 4")
+        else:
+            diag_pbar = tqdm(diag_datasets, desc="diag_cells", disable=not use_tqdm)
+            for i, ds_name in enumerate(diag_pbar, start=1):
+                pair_id = f"{ds_name}__{ds_name}"
+                pair_dir = results_model_root / f"from-{ds_name}" / f"to-{ds_name}"
+                pair_summary_path = pair_dir / "pair_summary.json"
+                diag_path = out_dir / "diagonals" / f"{ds_name}.json"
+                logits_ready = pair_logits_exist(pair_dir)
+                logits_missing = bool(args.save_pair_logits and not logits_ready)
+                if args.resume and ds_name in set(progress["completed_diag_jobs"]) and not logits_missing and not args.force_reeval:
+                    if pair_summary_path.exists():
+                        summary = read_json(pair_summary_path)
+                        diag_results[ds_name] = summary
+                        pair_summary_index[pair_id] = summary
+                    elif diag_path.exists():
+                        diag_results[ds_name] = read_json(diag_path)
+                    print(f"[diag] skip completed {ds_name}")
+                    continue
+                if pair_summary_path.exists() and not args.force_reeval and not logits_missing:
                     summary = read_json(pair_summary_path)
                     diag_results[ds_name] = summary
                     pair_summary_index[pair_id] = summary
-                elif diag_path.exists():
-                    diag_results[ds_name] = read_json(diag_path)
-                print(f"[diag] skip completed {ds_name}")
-                continue
-            if pair_summary_path.exists() and not args.force_reeval and not logits_missing:
-                summary = read_json(pair_summary_path)
-                diag_results[ds_name] = summary
-                pair_summary_index[pair_id] = summary
-                progress["completed_diag_jobs"].append(ds_name)
-                progress["updated_at"] = utc_now()
-                write_json(progress_path, progress)
-                print(f"[diag] skip existing test summary {ds_name}")
-                continue
-            t0 = time.time()
-            try:
-                diag = diagonal_from_test(
-                    dataset_name=ds_name,
-                    model_root_activations=acts_model_root,
-                    model_root_probes=probes_model_root,
-                    poolings=poolings,
-                    eval_batch_size=args.eval_batch_size,
-                    device=device,
-                    use_tqdm=use_tqdm,
-                    save_pair_logits_enabled=bool(args.save_pair_logits),
-                    pair_dir=pair_dir,
-                )
-                pair_dir.mkdir(parents=True, exist_ok=True)
-                write_json(pair_summary_path, diag)
-                write_json(diag_path, diag)
-                diag_results[ds_name] = diag
-                pair_summary_index[pair_id] = diag
-                progress["completed_diag_jobs"].append(ds_name)
-                progress["updated_at"] = utc_now()
-                write_json(progress_path, progress)
-                best = diag["overall_best"]
-                elapsed = time.time() - t0
-                print(
-                    f"[diag] done {ds_name} in {elapsed:.1f}s "
-                    f"(best={best['pooling']} L{best['layer']} auc={best['auc']:.4f})"
-                )
-            except Exception as exc:
-                append_jsonl(out_dir / "pairs_missing.jsonl", {"pair_id": f"{ds_name}__{ds_name}", "reason": str(exc), "stage": "diag"})
-                print(f"[diag] missing {ds_name}: {exc}")
-            if args.progress_every > 0 and i % args.progress_every == 0:
-                print(f"[diag] checkpoint at {i}/{len(diag_datasets)}")
+                    progress["completed_diag_jobs"].append(ds_name)
+                    progress["updated_at"] = utc_now()
+                    write_json(progress_path, progress)
+                    print(f"[diag] skip existing test summary {ds_name}")
+                    continue
+                t0 = time.time()
+                try:
+                    diag = diagonal_from_test(
+                        dataset_name=ds_name,
+                        model_root_activations=acts_model_root,
+                        model_root_probes=probes_model_root,
+                        poolings=poolings,
+                        eval_batch_size=args.eval_batch_size,
+                        device=device,
+                        use_tqdm=use_tqdm,
+                        save_pair_logits_enabled=bool(args.save_pair_logits),
+                        pair_dir=pair_dir,
+                    )
+                    pair_dir.mkdir(parents=True, exist_ok=True)
+                    write_json(pair_summary_path, diag)
+                    write_json(diag_path, diag)
+                    diag_results[ds_name] = diag
+                    pair_summary_index[pair_id] = diag
+                    progress["completed_diag_jobs"].append(ds_name)
+                    progress["updated_at"] = utc_now()
+                    write_json(progress_path, progress)
+                    best = diag["overall_best"]
+                    elapsed = time.time() - t0
+                    print(
+                        f"[diag] done {ds_name} in {elapsed:.1f}s "
+                        f"(best={best['pooling']} L{best['layer']} auc={best['auc']:.4f})"
+                    )
+                except Exception as exc:
+                    append_jsonl(out_dir / "pairs_missing.jsonl", {"pair_id": f"{ds_name}__{ds_name}", "reason": str(exc), "stage": "diag"})
+                    print(f"[diag] missing {ds_name}: {exc}")
+                if args.progress_every > 0 and i % args.progress_every == 0:
+                    print(f"[diag] checkpoint at {i}/{len(diag_datasets)}")
 
-        mark_step("stage4_diag")
-        print("[done] stage 4")
+            mark_step("stage4_diag")
+            print("[done] stage 4")
 
     # Stage 5: aggregate matrices
     update_status(status_path, "running", "stage 5 aggregate")
