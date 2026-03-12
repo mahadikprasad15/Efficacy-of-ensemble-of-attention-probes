@@ -288,6 +288,7 @@ else:
         "--run_id", PAIRWISE_RUN_ID,
         "--poolings", ",".join(POOLINGS),
         "--eval_batch_size", str(EVAL_BATCH_SIZE),
+        "--save_pair_logits",
         "--resume",
         "--skip_training",
         "--no_tqdm",
@@ -299,8 +300,12 @@ else:
 This pipeline now also writes same-dataset diagonal `test` summaries under:
 
 - `results/ood_evaluation/<model_dir>/from-<dataset>/to-<dataset>/pair_summary.json`
+- `results/ood_evaluation/<model_dir>/from-<dataset>/to-<dataset>/pair_logits.safetensors`
+- `results/ood_evaluation/<model_dir>/from-<dataset>/to-<dataset>/pair_logits_manifest.json`
 
 That matters for the principled matrix build: the diagonal cell is then filled the same way as every off-diagonal cell, namely by choosing `(pooling, layer)` on source validation and reading the selected config's AUROC from the dataset's own `test` pair artifact.
+
+When `--save_pair_logits` is enabled, phase 4 also persists the full per-sample logit vectors for every `(source dataset, target dataset, pooling, layer)` combination. If a pair summary exists but the pair-logit artifact is missing, rerunning phase 4 with `--resume --save_pair_logits` will recompute only that pair.
 
 ## Cell 8: Phase 5, Build Principled Matrices
 
@@ -371,6 +376,39 @@ else:
         "--covariance_scope", "required",
         "--progress_every", "20",
         "--no_tqdm",
+        "--resume",
+    ]
+    run_stream(label, cmd)
+```
+
+## Cell 10: Phase 7, Cluster Probes From Pairwise Logits
+
+```python
+CLUSTER_ROOT = ROOT / "results" / "probe_logit_clustering" / MODEL_DIR
+CLUSTER_RUN_ID = "20260311T000000Z-3b-probe-logit-clustering-v1"
+
+cluster_summary = (
+    CLUSTER_ROOT
+    / CLUSTER_RUN_ID
+    / "results"
+    / "summary.json"
+)
+
+label = "[phase7] probe logit clustering"
+if cluster_summary.exists():
+    print(f"[skip] {label} summary already exists at {cluster_summary}")
+else:
+    cmd = [
+        sys.executable,
+        "-u",
+        "scripts/analysis/cluster_pairwise_probe_logits.py",
+        "--ood_results_root", str(OOD_ROOT),
+        "--model", MODEL,
+        "--segments", "completion,full",
+        "--distance", "correlation",
+        "--linkage", "average",
+        "--output_root", str(ROOT / "results" / "probe_logit_clustering"),
+        "--run_id", CLUSTER_RUN_ID,
         "--resume",
     ]
     run_stream(label, cmd)

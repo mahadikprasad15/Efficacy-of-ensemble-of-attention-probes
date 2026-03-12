@@ -34,7 +34,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -73,6 +73,51 @@ def append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
+def pair_logits_tensor_path(pair_dir: Path) -> Path:
+    return pair_dir / "pair_logits.safetensors"
+
+
+def pair_logits_manifest_path(pair_dir: Path) -> Path:
+    return pair_dir / "pair_logits_manifest.json"
+
+
+def pair_logits_exist(pair_dir: Path) -> bool:
+    return pair_logits_tensor_path(pair_dir).exists() and pair_logits_manifest_path(pair_dir).exists()
+
+
+def write_pair_logits(
+    pair_dir: Path,
+    *,
+    source_dataset: str,
+    target_dataset: str,
+    split: str,
+    input_format: str,
+    sample_ids: Sequence[str],
+    labels: Sequence[int],
+    score_tensors: Dict[str, torch.Tensor],
+    score_index: Sequence[Dict[str, Any]],
+) -> None:
+    pair_dir.mkdir(parents=True, exist_ok=True)
+    tensor_path = pair_logits_tensor_path(pair_dir)
+    manifest_path = pair_logits_manifest_path(pair_dir)
+    save_file(score_tensors, str(tensor_path))
+    write_json(
+        manifest_path,
+        {
+            "source_dataset": source_dataset,
+            "target_dataset": target_dataset,
+            "split": split,
+            "input_format": input_format,
+            "num_samples": len(sample_ids),
+            "sample_ids": list(sample_ids),
+            "labels": [int(x) for x in labels],
+            "scores": list(score_index),
+            "tensor_file": tensor_path.name,
+            "created_at": utc_now(),
+        },
+    )
 
 
 def update_status(status_path: Path, state: str, message: str) -> None:
@@ -250,10 +295,11 @@ def evaluate_probe_layer(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], np.ndarray]:
     all_probs: List[float] = []
     all_preds: List[int] = []
     all_targets: List[int] = []
+    all_logits: List[float] = []
     with torch.no_grad():
         for x, y in loader:
             x = x.to(device)
@@ -261,14 +307,17 @@ def evaluate_probe_layer(
             if x.dim() == 2:
                 x = x.unsqueeze(1)
             logits = model(x.float()).reshape(-1)
+            logits_np = logits.detach().cpu().numpy()
             probs = torch.sigmoid(logits).detach().cpu().numpy()
             preds = (probs > 0.5).astype(np.int64)
+            all_logits.extend(logits_np.tolist())
             all_probs.extend(probs.tolist())
             all_preds.extend(preds.tolist())
             all_targets.extend(y.numpy().astype(np.int64).tolist())
     targets = np.array(all_targets, dtype=np.int64)
     probs = np.array(all_probs, dtype=np.float64)
     preds = np.array(all_preds, dtype=np.int64)
+    logits_arr = np.array(all_logits, dtype=np.float32)
     auc = 0.5
     if len(np.unique(targets)) >= 2:
         try:
@@ -277,7 +326,7 @@ def evaluate_probe_layer(
             auc = 0.5
     acc = float(accuracy_score(targets, preds))
     f1 = float(f1_score(targets, preds, zero_division=0))
-    return {"auc": auc, "accuracy": acc, "f1": f1}
+    return {"auc": auc, "accuracy": acc, "f1": f1}, logits_arr
 
 
 def pooling_priority(pooling: str) -> int:
@@ -312,6 +361,8 @@ def evaluate_pair_all_poolings(
     eval_batch_size: int,
     device: torch.device,
     use_tqdm: bool,
+    save_pair_logits_enabled: bool = False,
+    pair_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     target_dir = model_root_activations / target_dataset / split
     if not target_dir.exists():
@@ -328,6 +379,10 @@ def evaluate_pair_all_poolings(
 
     pooling_results: Dict[str, Any] = {}
     all_best_candidates: List[Dict[str, Any]] = []
+    score_tensors: Dict[str, torch.Tensor] = {}
+    score_index: List[Dict[str, Any]] = []
+    sample_ids = [str(item["id"]) for item in ds.items]
+    sample_labels = [int(item["label"]) for item in ds.items]
 
     for pooling in poolings:
         pooling_dir = source_probe_root / pooling
@@ -349,16 +404,26 @@ def evaluate_pair_all_poolings(
             layer_ds = LayerDataset(ds, layer_idx)
             layer_loader = DataLoader(layer_ds, batch_size=eval_batch_size, shuffle=False, num_workers=0)
             model = load_probe_model(probe_path, pooling=model_pooling, input_dim=input_dim, device=device)
-            metrics = evaluate_probe_layer(model, layer_loader, device)
-            layer_records.append(
-                {
-                    "pooling": pooling,
-                    "layer": int(layer_idx),
-                    "auc": float(metrics["auc"]),
-                    "accuracy": float(metrics["accuracy"]),
-                    "f1": float(metrics["f1"]),
-                }
-            )
+            metrics, logits_arr = evaluate_probe_layer(model, layer_loader, device)
+            record = {
+                "pooling": pooling,
+                "layer": int(layer_idx),
+                "auc": float(metrics["auc"]),
+                "accuracy": float(metrics["accuracy"]),
+                "f1": float(metrics["f1"]),
+            }
+            if save_pair_logits_enabled:
+                score_key = f"{pooling}__L{int(layer_idx)}"
+                score_tensors[score_key] = torch.from_numpy(logits_arr)
+                score_index.append(
+                    {
+                        "score_key": score_key,
+                        "pooling": pooling,
+                        "layer": int(layer_idx),
+                    }
+                )
+                record["score_key"] = score_key
+            layer_records.append(record)
         best_pool = choose_best(layer_records)
         pooling_results[pooling] = {
             "status": "ok",
@@ -370,6 +435,20 @@ def evaluate_pair_all_poolings(
     if not all_best_candidates:
         raise RuntimeError(f"No valid pooling results for {source_dataset} -> {target_dataset}")
     overall_best = choose_best(all_best_candidates)
+    if save_pair_logits_enabled:
+        if pair_dir is None:
+            raise ValueError("pair_dir is required when save_pair_logits_enabled is True")
+        write_pair_logits(
+            pair_dir,
+            source_dataset=source_dataset,
+            target_dataset=target_dataset,
+            split=split,
+            input_format=input_format,
+            sample_ids=sample_ids,
+            labels=sample_labels,
+            score_tensors=score_tensors,
+            score_index=score_index,
+        )
     return {
         "source_dataset": source_dataset,
         "target_dataset": target_dataset,
@@ -378,6 +457,9 @@ def evaluate_pair_all_poolings(
         "poolings": pooling_results,
         "overall_best": overall_best,
         "evaluated_at": utc_now(),
+        "logits_saved": bool(save_pair_logits_enabled),
+        "logits_tensor_file": pair_logits_tensor_path(pair_dir).name if save_pair_logits_enabled and pair_dir is not None else None,
+        "logits_manifest_file": pair_logits_manifest_path(pair_dir).name if save_pair_logits_enabled and pair_dir is not None else None,
     }
 
 
@@ -460,6 +542,8 @@ def diagonal_from_validation(
     eval_batch_size: int,
     device: torch.device,
     use_tqdm: bool,
+    save_pair_logits_enabled: bool = False,
+    pair_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     dataset_dir = model_root_activations / dataset_name
     split = resolve_validation_split(dataset_dir)
@@ -475,6 +559,8 @@ def diagonal_from_validation(
         eval_batch_size=eval_batch_size,
         device=device,
         use_tqdm=use_tqdm,
+        save_pair_logits_enabled=save_pair_logits_enabled,
+        pair_dir=pair_dir,
     )
     summary["source"] = "diagonal_validation"
     return summary
@@ -488,6 +574,8 @@ def diagonal_from_test(
     eval_batch_size: int,
     device: torch.device,
     use_tqdm: bool,
+    save_pair_logits_enabled: bool = False,
+    pair_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     dataset_dir = model_root_activations / dataset_name
     split = "test"
@@ -503,6 +591,8 @@ def diagonal_from_test(
         eval_batch_size=eval_batch_size,
         device=device,
         use_tqdm=use_tqdm,
+        save_pair_logits_enabled=save_pair_logits_enabled,
+        pair_dir=pair_dir,
     )
     summary["source"] = "diagonal_test"
     summary["cell_type"] = "matrix_diagonal"
@@ -541,6 +631,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--skip_training", action="store_true", help="Skip training stage entirely.")
     parser.add_argument("--skip_diagonals", action="store_true", help="Skip diagonal validation stage.")
+    parser.add_argument(
+        "--save_pair_logits",
+        action="store_true",
+        help=(
+            "Persist per-sample probe logits for every evaluated source->target pair. "
+            "Writes pair_logits.safetensors + pair_logits_manifest.json beside pair_summary.json."
+        ),
+    )
     parser.add_argument(
         "--collect_existing_pairs",
         action="store_true",
@@ -716,6 +814,7 @@ def main() -> int:
             "poolings": poolings,
             "resume": bool(args.resume),
             "collect_existing_pairs": bool(args.collect_existing_pairs),
+            "save_pair_logits": bool(args.save_pair_logits),
             "pipeline_results_root": args.pipeline_results_root,
         },
     )
@@ -898,19 +997,21 @@ def main() -> int:
         pair_id = job.pair_id
         pair_dir = results_model_root / f"from-{job.source_dataset}" / f"to-{job.target_dataset}"
         pair_summary_path = pair_dir / "pair_summary.json"
+        logits_ready = pair_logits_exist(pair_dir)
+        logits_missing = bool(args.save_pair_logits and not logits_ready)
 
-        if args.resume and pair_id in set(progress["completed_eval_pairs"]):
+        if args.resume and pair_id in set(progress["completed_eval_pairs"]) and not logits_missing:
             if pair_summary_path.exists():
                 pair_summary_index[pair_id] = read_json(pair_summary_path)
             print(f"[eval] skip completed {pair_id}")
             continue
-        if pair_summary_path.exists() and not args.force_reeval:
+        if pair_summary_path.exists() and not args.force_reeval and not logits_missing:
             print(f"[eval] skip existing summary {pair_id}")
             pair_summary_index[pair_id] = read_json(pair_summary_path)
             progress["completed_eval_pairs"].append(pair_id)
             write_json(progress_path, progress)
             continue
-        if args.collect_existing_pairs and not args.force_reeval:
+        if args.collect_existing_pairs and not args.force_reeval and not logits_missing:
             parsed = parse_existing_pair_summary(pair_dir)
             if parsed is not None:
                 payload = {
@@ -948,6 +1049,8 @@ def main() -> int:
                 eval_batch_size=args.eval_batch_size,
                 device=device,
                 use_tqdm=use_tqdm,
+                save_pair_logits_enabled=bool(args.save_pair_logits),
+                pair_dir=pair_dir,
             )
             summary["cell_type"] = job.cell_type
             summary["action"] = "eval_run"
@@ -996,7 +1099,9 @@ def main() -> int:
             pair_dir = results_model_root / f"from-{ds_name}" / f"to-{ds_name}"
             pair_summary_path = pair_dir / "pair_summary.json"
             diag_path = out_dir / "diagonals" / f"{ds_name}.json"
-            if args.resume and ds_name in set(progress["completed_diag_jobs"]):
+            logits_ready = pair_logits_exist(pair_dir)
+            logits_missing = bool(args.save_pair_logits and not logits_ready)
+            if args.resume and ds_name in set(progress["completed_diag_jobs"]) and not logits_missing:
                 if pair_summary_path.exists():
                     summary = read_json(pair_summary_path)
                     diag_results[ds_name] = summary
@@ -1005,7 +1110,7 @@ def main() -> int:
                     diag_results[ds_name] = read_json(diag_path)
                 print(f"[diag] skip completed {ds_name}")
                 continue
-            if pair_summary_path.exists() and not args.force_reeval:
+            if pair_summary_path.exists() and not args.force_reeval and not logits_missing:
                 summary = read_json(pair_summary_path)
                 diag_results[ds_name] = summary
                 pair_summary_index[pair_id] = summary
@@ -1024,6 +1129,8 @@ def main() -> int:
                     eval_batch_size=args.eval_batch_size,
                     device=device,
                     use_tqdm=use_tqdm,
+                    save_pair_logits_enabled=bool(args.save_pair_logits),
+                    pair_dir=pair_dir,
                 )
                 pair_dir.mkdir(parents=True, exist_ok=True)
                 write_json(pair_summary_path, diag)
