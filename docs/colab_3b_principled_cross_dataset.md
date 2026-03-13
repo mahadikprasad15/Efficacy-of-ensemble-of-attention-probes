@@ -425,3 +425,148 @@ print("pairwise summary:", pairwise_summary)
 print("principled summary:", principled_summary)
 print("mahal summary:", mahal_summary)
 ```
+
+## Replace Only InsiderTrading With Report-Label Data
+
+Use this recovery flow if the existing `Deception-InsiderTrading-*` activations were cached from the raw Apollo loader using `made_trade`, and you want to replace only the InsiderTrading target with the Sally-concat/report-label prepared data.
+
+### Step A: Prepare Sally-Concat Report-Label JSONL
+
+This uses the existing prep path that maps the FINAL JSONL labels into `gold_label` and `report_label`.
+
+```python
+INSIDER_FINAL_JSONL = ROOT / "data" / "apollo_raw" / "insider_trading" / "Insider_trading_final.jsonl"
+INSIDER_PREP_DIR = ROOT / "data" / "apollo_raw" / "insider_trading"
+
+cmd = [
+    sys.executable,
+    "-u",
+    "scripts/data/prepare_insider_trading_sally_dataset.py",
+    "--input_jsonl", str(INSIDER_FINAL_JSONL),
+    "--output_dir", str(INSIDER_PREP_DIR),
+    "--overwrite",
+]
+run_stream("[it-prep] prepare report-label sally-concat dataset", cmd)
+```
+
+Prepared dataset path:
+
+```python
+IT_SALLY_EXAMPLES = ROOT / "data" / "apollo_raw" / "insider_trading" / "sally_concat_examples.jsonl"
+print(IT_SALLY_EXAMPLES)
+```
+
+### Step B: Remove Existing InsiderTrading Activations
+
+```python
+from shutil import rmtree
+
+for segment in ["completion", "full"]:
+    for split in ["train", "validation", "test"]:
+        p = ACTS_ROOT / MODEL_DIR / f"Deception-InsiderTrading-{segment}" / split
+        if p.exists():
+            print("[remove]", p)
+            rmtree(p)
+```
+
+### Step C: Recache Only InsiderTrading From Sally-Concat Prepared Data
+
+Full:
+
+```python
+for split in ["train", "validation", "test"]:
+    label = f"[it-cache-full] {split}"
+    cmd = [
+        sys.executable,
+        "-u",
+        "scripts/data/cache_deception_activations.py",
+        "--model", MODEL,
+        "--dataset", "Deception-InsiderTrading-SallyConcat",
+        "--dataset_file", str(IT_SALLY_EXAMPLES),
+        "--dataset_output_name", "Deception-InsiderTrading-full",
+        "--split", split,
+        "--include_prompt_tokens",
+        "--use_pregenerated",
+        "--output_dir", str(ACTS_ROOT),
+        "--L_prime", str(L_PRIME),
+        "--T_prime", str(T_PRIME),
+        "--batch_size", str(CACHE_BATCH_SIZE),
+        "--force",
+    ]
+    run_stream(label, cmd)
+```
+
+Completion:
+
+```python
+for split in ["train", "validation", "test"]:
+    label = f"[it-cache-completion] {split}"
+    cmd = [
+        sys.executable,
+        "-u",
+        "scripts/data/cache_deception_activations.py",
+        "--model", MODEL,
+        "--dataset", "Deception-InsiderTrading-SallyConcat",
+        "--dataset_file", str(IT_SALLY_EXAMPLES),
+        "--dataset_output_name", "Deception-InsiderTrading-completion",
+        "--split", split,
+        "--use_pregenerated",
+        "--output_dir", str(ACTS_ROOT),
+        "--L_prime", str(L_PRIME),
+        "--T_prime", str(T_PRIME),
+        "--batch_size", str(CACHE_BATCH_SIZE),
+        "--force",
+    ]
+    run_stream(label, cmd)
+```
+
+### Step D: Remove Only InsiderTrading Target Pair Artifacts
+
+This deletes just the source->InsiderTrading pair outputs. It leaves all non-InsiderTrading pair evaluations intact.
+
+```python
+from shutil import rmtree
+
+for segment in ["completion", "full"]:
+    target = f"to-Deception-InsiderTrading-{segment}"
+    for source in SOURCE_DATASETS:
+        pair_dir = OOD_ROOT / MODEL_DIR / f"from-{source}-{segment}" / target
+        if pair_dir.exists():
+            print("[remove]", pair_dir)
+            rmtree(pair_dir)
+```
+
+### Step E: Reevaluate Only InsiderTrading Targets
+
+This standalone phase-4 command bypasses the coarse `pairwise_summary.exists()` skip and only reruns the `source -> InsiderTrading` target cells.
+
+```python
+label = "[phase4-it-only] reevaluate InsiderTrading target cells"
+cmd = [
+    sys.executable,
+    "-u",
+    "scripts/pipelines/run_pairwise_eval_matrix.py",
+    "--activations_root", str(ACTS_ROOT),
+    "--probes_root", str(PROBES_ROOT),
+    "--results_root", str(OOD_ROOT),
+    "--artifact_root", str(ARTIFACT_ROOT),
+    "--pipeline_results_root", str(PAIRWISE_PIPELINE_ROOT),
+    "--model", MODEL,
+    "--run_id", PAIRWISE_RUN_ID,
+    "--poolings", ",".join(POOLINGS),
+    "--eval_batch_size", str(EVAL_BATCH_SIZE),
+    "--save_pair_logits",
+    "--only_targets", "Deception-InsiderTrading-completion,Deception-InsiderTrading-full",
+    "--force_reeval",
+    "--resume",
+    "--skip_training",
+    "--skip_diagonals",
+    "--no_tqdm",
+    "--progress_every", "2",
+]
+run_stream(label, cmd)
+```
+
+### Step F: Rebuild Principled Matrices And Mahalanobis
+
+After the InsiderTrading target cells are replaced, rerun the matrix builder and Mahalanobis steps with the same run ids to refresh downstream outputs.
