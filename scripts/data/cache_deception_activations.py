@@ -56,7 +56,7 @@ from actprobe.datasets.deception_loaders import (
     DeceptionInsiderTradingDataset,
     DeceptionInsiderTradingSallyConcatDataset,
     DeceptionAILiarDataset,
-    DeceptionTypedMessagesDataset,
+    DeceptionInstructedDeceptionDataset,
     DeceptionMaskDataset,
 )
 from actprobe.llm.activations import ActivationRunner
@@ -408,7 +408,7 @@ DATASET_MAP = {
     "Deception-InsiderTrading": DeceptionInsiderTradingDataset,
     "Deception-InsiderTrading-SallyConcat": DeceptionInsiderTradingSallyConcatDataset,
     "Deception-AILiar": DeceptionAILiarDataset,
-    "Deception-InstructedDeception": DeceptionTypedMessagesDataset,
+    "Deception-InstructedDeception": DeceptionInstructedDeceptionDataset,
     "Deception-Mask": DeceptionMaskDataset,
 }
 
