@@ -724,6 +724,13 @@ class DeceptionTypedMessagesDataset(BaseDataset):
         "classification_raw_response",
     )
 
+    DATASET_MARKERS = {
+        "Deception-InstructedDeception": ("instructed-deception", "instructed_deception"),
+        "Deception-Mask": ("mask__", "mask"),
+        "Deception-HarmPressureChoice": ("harm-pressure-choice", "harm_pressure_choice"),
+        "Deception-ConvincingGame": ("convincing-game", "convincing_game"),
+    }
+
     def __init__(
         self,
         split: str = "train",
@@ -739,21 +746,7 @@ class DeceptionTypedMessagesDataset(BaseDataset):
         self.dataset_name = dataset_name
         self.id_prefix = id_prefix
 
-        possible_paths = [
-            data_file,
-            "data/apollo_raw/instructed_deception/instructed-deception_gemma_2_9b_it_completions_deception_typed.parquet",
-            "data/apollo_raw/instructed_deception/instructed-deception_gemma_2_9b_it_completions_deception_typed.jsonl",
-            "data/apollo_raw/instructed_deception/instructed-deception_clean.jsonl",
-            "data/apollo_raw/mask__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
-            "data/apolloraw/mask__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
-            "data/apollo_raw/instructed-deception_gemma_2_9b_it_completions_deception_typed.parquet",
-            "data/apollo_raw/instructed-deception_gemma_2_9b_it_completions_deception_typed.jsonl",
-            os.path.join(
-                os.path.expanduser("~"),
-                "Downloads",
-                "mask__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
-            ),
-        ]
+        possible_paths = self._candidate_paths(data_file, dataset_name)
 
         self.actual_data_file = None
         for path in possible_paths:
@@ -766,6 +759,8 @@ class DeceptionTypedMessagesDataset(BaseDataset):
                 "Typed deception dataset not found. Tried:\n"
                 + "\n".join(f"  - {p}" for p in possible_paths)
             )
+
+        self._validate_resolved_data_file()
 
         # If not explicitly provided, infer metadata dataset/id prefix from source file.
         inferred_source = os.path.basename(self.actual_data_file).lower()
@@ -787,6 +782,95 @@ class DeceptionTypedMessagesDataset(BaseDataset):
                 self.id_prefix = "convincing_game"
             else:
                 self.id_prefix = "instructed_deception"
+
+    @classmethod
+    def _candidate_paths(cls, data_file: str, dataset_name: Optional[str]) -> List[str]:
+        def _dedupe(paths: List[str]) -> List[str]:
+            seen = set()
+            ordered = []
+            for path in paths:
+                if path in seen:
+                    continue
+                seen.add(path)
+                ordered.append(path)
+            return ordered
+
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+
+        instructed_paths = [
+            data_file,
+            "data/apollo_raw/instructed-deception/instructed-deception__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
+            "data/apollo_raw/instructed-deception/instructed-deception_clean.jsonl",
+            "data/apollo_raw/instructed_deception/instructed-deception_gemma_2_9b_it_completions_deception_typed.parquet",
+            "data/apollo_raw/instructed_deception/instructed-deception_gemma_2_9b_it_completions_deception_typed.jsonl",
+            "data/apollo_raw/instructed_deception/instructed-deception_clean.jsonl",
+            "data/apollo_raw/instructed-deception_gemma_2_9b_it_completions_deception_typed.parquet",
+            "data/apollo_raw/instructed-deception_gemma_2_9b_it_completions_deception_typed.jsonl",
+            os.path.join(
+                downloads,
+                "instructed-deception__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
+            ),
+        ]
+        mask_paths = [
+            data_file,
+            "data/apollo_raw/mask__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
+            "data/apollo_raw/mask/mask__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
+            "data/apolloraw/mask__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
+            os.path.join(
+                downloads,
+                "mask__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
+            ),
+        ]
+        generic_paths = instructed_paths + mask_paths
+
+        if dataset_name == "Deception-InstructedDeception":
+            return _dedupe(instructed_paths)
+        if dataset_name == "Deception-Mask":
+            return _dedupe(mask_paths)
+        return _dedupe(generic_paths)
+
+    def _validate_resolved_data_file(self) -> None:
+        source = os.path.basename(self.actual_data_file).lower()
+        if self.dataset_name == "Deception-InstructedDeception":
+            if any(marker in source for marker in self.DATASET_MARKERS["Deception-Mask"]):
+                raise ValueError(
+                    "Resolved Deception-InstructedDeception to a Mask file. "
+                    f"Refusing to load cross-dataset fallback: {self.actual_data_file}"
+                )
+        if self.dataset_name == "Deception-Mask":
+            instructed_markers = self.DATASET_MARKERS["Deception-InstructedDeception"]
+            if any(marker in source for marker in instructed_markers) and "mask__" not in source:
+                raise ValueError(
+                    "Resolved Deception-Mask to an instructed-deception file. "
+                    f"Refusing to load cross-dataset fallback: {self.actual_data_file}"
+                )
+
+    @classmethod
+    def _classify_dataset_hint(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        for dataset_name, markers in cls.DATASET_MARKERS.items():
+            if any(marker in text for marker in markers):
+                return dataset_name
+        return None
+
+    def _validate_row_dataset(self, row: Dict[str, Any], base_id: Any) -> Optional[str]:
+        if self.dataset_name not in self.DATASET_MARKERS:
+            return None
+
+        hints = [
+            ("dataset", row.get("dataset")),
+            ("subdataset", row.get("subdataset")),
+            ("id", base_id),
+        ]
+        for key, value in hints:
+            hinted_dataset = self._classify_dataset_hint(value)
+            if hinted_dataset is not None and hinted_dataset != self.dataset_name:
+                return f"{key}={value!r} suggests {hinted_dataset}"
+        return None
 
     @staticmethod
     def _normalize_messages(raw_messages: Any) -> List[Dict[str, str]]:
@@ -988,6 +1072,7 @@ class DeceptionTypedMessagesDataset(BaseDataset):
 
         processed = []
         skipped = {"bad_messages": 0, "missing_assistant": 0, "missing_label": 0}
+        conflicting_rows = []
 
         for idx, row in enumerate(raw_rows):
             has_messages_clean = row.get("messages_clean") is not None
@@ -1022,6 +1107,10 @@ class DeceptionTypedMessagesDataset(BaseDataset):
             prompt = "\n\n".join((m.get("content", "") or "").strip() for m in prompt_messages if (m.get("content", "") or "").strip())
 
             base_id = row.get("id", row.get("index", row.get("original_index", idx)))
+            dataset_conflict = self._validate_row_dataset(row, base_id)
+            if dataset_conflict is not None:
+                conflicting_rows.append({"index": idx, "reason": dataset_conflict})
+                continue
             example_id = f"{self.id_prefix}_{base_id}"
 
             split_name = self._normalize_split_name(row.get("split"))
@@ -1061,6 +1150,16 @@ class DeceptionTypedMessagesDataset(BaseDataset):
                     "metadata": metadata,
                     "_explicit_split": split_name,
                 }
+            )
+
+        if conflicting_rows:
+            preview = "; ".join(
+                f"row {item['index']}: {item['reason']}"
+                for item in conflicting_rows[:5]
+            )
+            raise ValueError(
+                f"Found {len(conflicting_rows)} rows inconsistent with {self.dataset_name}. "
+                f"Examples: {preview}"
             )
 
         if not processed:
@@ -1144,5 +1243,23 @@ class DeceptionMaskDataset(DeceptionTypedMessagesDataset):
         )
 
 
-# Backward-compatible alias
-DeceptionInstructedDeceptionDataset = DeceptionTypedMessagesDataset
+class DeceptionInstructedDeceptionDataset(DeceptionTypedMessagesDataset):
+    """
+    Explicit instructed-deception dataset wrapper with fail-closed path resolution.
+    """
+
+    def __init__(
+        self,
+        split: str = "train",
+        limit: Optional[int] = None,
+        data_file: str = "data/apollo_raw/instructed-deception/instructed-deception__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
+        random_seed: int = 42,
+    ):
+        super().__init__(
+            split=split,
+            limit=limit,
+            data_file=data_file,
+            random_seed=random_seed,
+            dataset_name="Deception-InstructedDeception",
+            id_prefix="instructed_deception",
+        )
