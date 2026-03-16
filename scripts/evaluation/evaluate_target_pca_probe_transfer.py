@@ -11,6 +11,9 @@ Workflow:
 5. Save resumable metrics, summaries, plots, and optional mirrored outputs.
 
 This script currently supports pooled probes only: mean/max/last.
+Removal modes:
+  - cumulative: remove top-k PCs (1..k)
+  - single: remove exactly one PC index at a time
 """
 
 from __future__ import annotations
@@ -187,6 +190,25 @@ def remove_top_k_pcs(
     return (x_centered - proj) + mean[None, :]
 
 
+def remove_specific_pcs(
+    x: np.ndarray,
+    mean: np.ndarray,
+    components: np.ndarray,
+    component_indices_1based: Sequence[int],
+) -> np.ndarray:
+    if not component_indices_1based:
+        return x.copy()
+    zero_based = [int(i) - 1 for i in component_indices_1based]
+    if any(i < 0 or i >= components.shape[0] for i in zero_based):
+        raise ValueError(
+            f"Component index out of range. Requested={component_indices_1based}, available=1..{components.shape[0]}"
+        )
+    x_centered = x - mean[None, :]
+    u = components[zero_based, :]
+    proj = (x_centered @ u.T) @ u
+    return (x_centered - proj) + mean[None, :]
+
+
 def fit_pca(
     x_train: np.ndarray,
     n_components_to_save: int,
@@ -284,6 +306,7 @@ def plot_probe_by_k(
     value_key: str,
     title: str,
     out_path: Path,
+    x_label: str,
 ) -> None:
     ensure_dir(out_path.parent)
     by_probe: Dict[str, List[Tuple[int, float]]] = {}
@@ -301,7 +324,7 @@ def plot_probe_by_k(
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         plt.plot(xs, ys, marker="o", linewidth=2.0, label=probe_name)
-    plt.xlabel("k removed PCs")
+    plt.xlabel(x_label)
     plt.ylabel(value_key.replace("_", " ").title())
     plt.title(title)
     plt.grid(alpha=0.25)
@@ -390,6 +413,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--combined_run_root", type=str, default="")
     parser.add_argument("--combined_probe_names", type=str, default="")
     parser.add_argument("--k_values", type=str, default="1,2,4,8,16,32")
+    parser.add_argument("--removal_mode", type=str, choices=["cumulative", "single"], default="cumulative")
     parser.add_argument("--target_train_split", type=str, default="train")
     parser.add_argument("--target_val_split", type=str, default="validation")
     parser.add_argument("--target_test_split", type=str, default="test")
@@ -414,8 +438,8 @@ def main() -> int:
     k_values = parse_k_values(args.k_values)
     model_dir = model_dir_name(args.model)
     target_segment = dataset_segment_name(args.target_dataset, args.segment)
-    config_slug = f"plain-pca_{args.pooling}_l{args.layer}"
-    run_id = args.run_id.strip() or f"{default_run_id()}-{args.target_dataset.split('-')[-1].lower()}-{args.segment}-{args.pooling}-l{args.layer}-pca-v1"
+    config_slug = f"plain-pca-{args.removal_mode}_{args.pooling}_l{args.layer}"
+    run_id = args.run_id.strip() or f"{default_run_id()}-{args.target_dataset.split('-')[-1].lower()}-{args.segment}-{args.pooling}-l{args.layer}-pca-{args.removal_mode}-v1"
 
     artifact_root = Path(args.artifact_root)
     run_root = (
@@ -477,6 +501,7 @@ def main() -> int:
             "combined_run_root": args.combined_run_root,
             "combined_probe_names": combined_probe_names,
             "k_values": k_values,
+            "removal_mode": args.removal_mode,
             "splits": {
                 "train": args.target_train_split,
                 "validation": args.target_val_split,
@@ -492,7 +517,7 @@ def main() -> int:
         },
     )
     append_log_line(log_path, f"[start] run_id={run_id}")
-    append_log_line(log_path, f"[target] {target_segment} pooling={args.pooling} layer={args.layer}")
+    append_log_line(log_path, f"[target] {target_segment} pooling={args.pooling} layer={args.layer} removal_mode={args.removal_mode}")
 
     if args.resume and summary_path.exists():
         write_json(status_path, {"state": "completed", "message": "resume requested and summary already exists", "updated_at": utc_now_iso()})
@@ -536,6 +561,7 @@ def main() -> int:
             "n_test": int(x_test.shape[0]),
             "dim": int(x_train.shape[1]),
             "k_values": k_values,
+            "removal_mode": args.removal_mode,
             "pca_solver": args.pca_solver,
             "created_at": utc_now_iso(),
         },
@@ -601,8 +627,12 @@ def main() -> int:
                 x_val_use = x_val
                 x_test_use = x_test
             else:
-                x_val_use = remove_top_k_pcs(x_val, pca_artifact["mean"], pca_artifact["components"], k)
-                x_test_use = remove_top_k_pcs(x_test, pca_artifact["mean"], pca_artifact["components"], k)
+                if args.removal_mode == "cumulative":
+                    x_val_use = remove_top_k_pcs(x_val, pca_artifact["mean"], pca_artifact["components"], k)
+                    x_test_use = remove_top_k_pcs(x_test, pca_artifact["mean"], pca_artifact["components"], k)
+                else:
+                    x_val_use = remove_specific_pcs(x_val, pca_artifact["mean"], pca_artifact["components"], [k])
+                    x_test_use = remove_specific_pcs(x_test, pca_artifact["mean"], pca_artifact["components"], [k])
 
             for split_name, x_split, y_split in [
                 ("validation", x_val_use, y_val),
@@ -623,6 +653,7 @@ def main() -> int:
                     "layer": int(args.layer),
                     "split": split_name,
                     "k": int(k),
+                    "removal_mode": args.removal_mode,
                     "auc": float(metrics["auc"]),
                     "accuracy": float(metrics["accuracy"]),
                     "f1": float(metrics["f1"]),
@@ -644,7 +675,7 @@ def main() -> int:
 
     fieldnames = [
         "timestamp", "target_dataset", "probe_name", "probe_kind", "source_dataset", "probe_path",
-        "pooling", "layer", "split", "k", "auc", "accuracy", "f1", "count",
+        "pooling", "layer", "split", "k", "removal_mode", "auc", "accuracy", "f1", "count",
         "delta_auc_vs_baseline", "delta_accuracy_vs_baseline", "delta_f1_vs_baseline",
     ]
     write_csv(results_dir / "metrics_long.csv", rows, fieldnames)
@@ -705,6 +736,8 @@ def main() -> int:
             test_auc_mat[i, j] = float(rec["auc"])
             test_delta_mat[i, j] = float(rec["delta_auc_vs_baseline"])
 
+    axis_label = "k removed PCs" if args.removal_mode == "cumulative" else "single removed PC index"
+    mode_title = "target PCA removal" if args.removal_mode == "cumulative" else "single target PC removal"
     test_auc_heatmap = plots_dir / "target_test_auc_by_probe_k.png"
     test_delta_heatmap = plots_dir / "target_test_delta_auc_by_probe_k.png"
     test_auc_lines = plots_dir / "target_test_auc_lines.png"
@@ -714,7 +747,7 @@ def main() -> int:
         matrix=test_auc_mat,
         row_labels=probe_names,
         col_labels=[str(k) for k in k_axis],
-        title=f"{target_segment}: frozen probe AUC after target PCA removal",
+        title=f"{target_segment}: frozen probe AUC after {mode_title}",
         out_path=test_auc_heatmap,
         cbar_label="AUROC",
         cmap="YlGnBu",
@@ -726,7 +759,7 @@ def main() -> int:
         matrix=test_delta_mat,
         row_labels=probe_names,
         col_labels=[str(k) for k in k_axis],
-        title=f"{target_segment}: test AUC delta vs baseline",
+        title=f"{target_segment}: test AUC delta vs baseline ({args.removal_mode})",
         out_path=test_delta_heatmap,
         cbar_label="Delta AUROC",
         cmap="RdBu_r",
@@ -737,19 +770,21 @@ def main() -> int:
         rows=rows,
         split="test",
         value_key="auc",
-        title=f"{target_segment}: test AUROC by removed target PCs",
+        title=f"{target_segment}: test AUROC by {axis_label}",
         out_path=test_auc_lines,
+        x_label=axis_label,
     )
     plot_probe_by_k(
         rows=rows,
         split="validation",
         value_key="auc",
-        title=f"{target_segment}: validation AUROC by removed target PCs",
+        title=f"{target_segment}: validation AUROC by {axis_label}",
         out_path=val_auc_lines,
+        x_label=axis_label,
     )
 
     gallery_paths: List[str] = []
-    gallery_prefix = f"{target_segment}_{args.pooling}_l{args.layer}_plain_pca"
+    gallery_prefix = f"{target_segment}_{args.pooling}_l{args.layer}_plain_pca_{args.removal_mode}"
     for src, name in [
         (test_auc_heatmap, f"{gallery_prefix}_test_auc_by_probe_k.png"),
         (test_delta_heatmap, f"{gallery_prefix}_test_delta_auc_by_probe_k.png"),
@@ -767,6 +802,7 @@ def main() -> int:
         "target_dataset": target_segment,
         "pooling": args.pooling,
         "layer": int(args.layer),
+        "removal_mode": args.removal_mode,
         "k_values": [0] + k_values,
         "n_train": int(x_train.shape[0]),
         "n_val": int(x_val.shape[0]),
