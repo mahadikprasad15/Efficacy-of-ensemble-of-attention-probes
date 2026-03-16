@@ -546,6 +546,21 @@ def selection_score(
     return False, score, drop
 
 
+def summarize_checkpoint_payload(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if payload is None:
+        return None
+    return {
+        "epoch": int(payload["epoch"]),
+        "alpha": float(payload["alpha"]),
+        "alpha_logit": float(payload["alpha_logit"]),
+        "val_avg_source_auc": float(payload["val_avg_source_auc"]),
+        "val_self_auc": None if payload["val_self_auc"] is None else float(payload["val_self_auc"]),
+        "val_self_drop": float(payload["val_self_drop"]),
+        "selection_score": float(payload["selection_score"]),
+        "feasible": bool(payload["feasible"]),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate frozen probes after learned target-side rank-1 removal.")
     parser.add_argument("--model", type=str, required=True)
@@ -1054,25 +1069,13 @@ def main() -> int:
     write_json(
         results_dir / "selection_summary.json",
         {
-            "selected": chosen,
+            "selected": summarize_checkpoint_payload(chosen),
             "used_fallback": bool(best_feasible is None),
-            "best_feasible": None
-            if best_feasible is None
-            else {
-                "epoch": int(best_feasible["epoch"]),
-                "alpha": float(best_feasible["alpha"]),
-                "val_avg_source_auc": float(best_feasible["val_avg_source_auc"]),
-                "val_self_auc": best_feasible["val_self_auc"],
-                "val_self_drop": float(best_feasible["val_self_drop"]),
-            },
-            "best_any": {
-                "epoch": int(best_any["epoch"]),
-                "alpha": float(best_any["alpha"]),
-                "val_avg_source_auc": float(best_any["val_avg_source_auc"]),
-                "val_self_auc": best_any["val_self_auc"],
-                "val_self_drop": float(best_any["val_self_drop"]),
-                "selection_score": float(best_any["selection_score"]),
-                "feasible": bool(best_any["feasible"]),
+            "best_feasible": summarize_checkpoint_payload(best_feasible),
+            "best_any": summarize_checkpoint_payload(best_any),
+            "artifacts": {
+                "learned_direction_npz": str(results_dir / "learned_direction.npz"),
+                "training_checkpoint_pt": str(training_ckpt_path),
             },
         },
     )
