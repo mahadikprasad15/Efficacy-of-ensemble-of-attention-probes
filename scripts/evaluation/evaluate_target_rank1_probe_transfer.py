@@ -233,6 +233,15 @@ def single_probe_path(
     return single_probes_root / model_dir / f"{dataset_base}_slices" / ds / pooling / f"probe_layer_{layer}.pt"
 
 
+def combined_probe_path(
+    combined_run_root: Path,
+    combo_name: str,
+    pooling: str,
+    layer: int,
+) -> Path:
+    return combined_run_root / "probes" / combo_name / pooling / f"probe_layer_{layer}.pt"
+
+
 def load_linear_probe(probe_path: Path) -> Tuple[np.ndarray, float]:
     if not probe_path.exists():
         raise FileNotFoundError(f"Missing probe checkpoint: {probe_path}")
@@ -476,6 +485,53 @@ def build_probe_specs(
     return specs
 
 
+def build_evaluation_probe_specs(
+    *,
+    single_probes_root: Path,
+    model_dir: str,
+    evaluation_single_datasets: Sequence[str],
+    target_dataset: str,
+    segment: str,
+    pooling: str,
+    layer: int,
+    include_target_self: bool,
+    combined_run_root: str,
+    combined_probe_names: Sequence[str],
+) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = build_probe_specs(
+        single_probes_root=single_probes_root,
+        model_dir=model_dir,
+        source_datasets=evaluation_single_datasets,
+        target_dataset=target_dataset,
+        segment=segment,
+        pooling=pooling,
+        layer=layer,
+        include_target_self=include_target_self,
+    )
+
+    if combined_run_root:
+        combined_root = Path(combined_run_root)
+        for combo_name in combined_probe_names:
+            specs.append(
+                {
+                    "probe_name": combo_name,
+                    "probe_kind": "combined",
+                    "source_dataset": combo_name,
+                    "probe_path": str(combined_probe_path(combined_root, combo_name, pooling, layer)),
+                }
+            )
+
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for spec in specs:
+        name = str(spec["probe_name"])
+        if name in seen:
+            continue
+        seen.add(name)
+        deduped.append(spec)
+    return deduped
+
+
 def evaluate_probe_collection(
     x: np.ndarray,
     y: np.ndarray,
@@ -495,9 +551,12 @@ def metrics_to_rows(
     split: str,
     method: str,
     baseline_by_probe_split: Dict[Tuple[str, str], Dict[str, float]],
+    optimization_probe_names: Optional[Sequence[str]] = None,
+    self_probe_name: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    optimization_probe_name_set = set(str(x) for x in (optimization_probe_names or []))
     for spec in probe_specs:
         probe_name = spec["probe_name"]
         metrics = metrics_by_probe[probe_name]
@@ -510,6 +569,13 @@ def metrics_to_rows(
             "probe_path": spec["probe_path"],
             "split": split,
             "method": method,
+            "is_optimization_probe": bool(probe_name in optimization_probe_name_set),
+            "is_target_self_probe": bool(self_probe_name is not None and probe_name == self_probe_name),
+            "is_combined_probe": bool(str(spec["probe_kind"]) == "combined"),
+            "is_heldout_probe": bool(
+                probe_name not in optimization_probe_name_set
+                and (self_probe_name is None or probe_name != self_probe_name)
+            ),
             "auc": float(metrics["auc"]),
             "accuracy": float(metrics["accuracy"]),
             "f1": float(metrics["f1"]),
@@ -586,7 +652,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pooling", type=str, choices=SUPPORTED_POOLINGS, default="mean")
     parser.add_argument("--layer", type=int, required=True)
     parser.add_argument("--source_datasets", type=str, default="Deception-Mask")
+    parser.add_argument("--optimization_source_datasets", type=str, default="")
+    parser.add_argument("--evaluation_single_datasets", type=str, default="")
     parser.add_argument("--include_target_self", action="store_true")
+    parser.add_argument("--combined_run_root", type=str, default="")
+    parser.add_argument("--combined_probe_names", type=str, default="")
     parser.add_argument("--target_train_split", type=str, default="train")
     parser.add_argument("--target_val_split", type=str, default="validation")
     parser.add_argument("--target_test_split", type=str, default="test")
@@ -620,9 +690,16 @@ def main() -> int:
     torch.manual_seed(args.seed)
 
     source_datasets = parse_csv_list(args.source_datasets)
+    optimization_source_datasets = parse_csv_list(args.optimization_source_datasets) or source_datasets
+    evaluation_single_datasets = parse_csv_list(args.evaluation_single_datasets) or source_datasets
+    combined_probe_names = parse_csv_list(args.combined_probe_names)
     model_dir = model_dir_name(args.model)
     target_segment = dataset_segment_name(args.target_dataset, args.segment)
-    source_slug = "-".join(slugify_dataset_base(ds) for ds in source_datasets) if source_datasets else "no-source"
+    source_slug = (
+        "-".join(slugify_dataset_base(ds) for ds in optimization_source_datasets)
+        if optimization_source_datasets
+        else "no-source"
+    )
     probe_set_slug = f"frozen-{source_slug}" + ("-self" if args.include_target_self else "")
     run_id = args.run_id.strip() or (
         f"{default_run_id()}-{args.target_dataset.split('-')[-1].lower()}-{args.segment}-{args.pooling}-l{args.layer}-rank1-v1"
@@ -674,18 +751,36 @@ def main() -> int:
     random_metrics_path = results_dir / "random_direction_metrics.csv"
     summary_path = results_dir / "summary.json"
 
-    probe_specs = build_probe_specs(
+    optimization_probe_specs = build_probe_specs(
         single_probes_root=Path(args.single_probes_root),
         model_dir=model_dir,
-        source_datasets=source_datasets,
+        source_datasets=optimization_source_datasets,
+        target_dataset=args.target_dataset,
+        segment=args.segment,
+        pooling=args.pooling,
+        layer=args.layer,
+        include_target_self=False,
+    )
+    evaluation_probe_specs = build_evaluation_probe_specs(
+        single_probes_root=Path(args.single_probes_root),
+        model_dir=model_dir,
+        evaluation_single_datasets=evaluation_single_datasets,
         target_dataset=args.target_dataset,
         segment=args.segment,
         pooling=args.pooling,
         layer=args.layer,
         include_target_self=args.include_target_self,
+        combined_run_root=args.combined_run_root,
+        combined_probe_names=combined_probe_names,
     )
-    source_probe_names = source_probe_names_from_specs(probe_specs)
-    self_probe_name = target_self_probe_name(probe_specs)
+    source_probe_names = source_probe_names_from_specs(optimization_probe_specs)
+    self_probe_name = target_self_probe_name(evaluation_probe_specs)
+    heldout_probe_names = [
+        str(spec["probe_name"])
+        for spec in evaluation_probe_specs
+        if str(spec["probe_name"]) not in set(source_probe_names)
+        and str(spec["probe_name"]) != str(self_probe_name)
+    ]
 
     write_json(
         meta_dir / "run_manifest.json",
@@ -701,7 +796,11 @@ def main() -> int:
             "pooling": args.pooling,
             "layer": int(args.layer),
             "source_datasets": source_datasets,
+            "optimization_source_datasets": optimization_source_datasets,
+            "evaluation_single_datasets": evaluation_single_datasets,
             "include_target_self": bool(args.include_target_self),
+            "combined_run_root": args.combined_run_root,
+            "combined_probe_names": combined_probe_names,
             "probe_set": probe_set_slug,
             "variant": "learned-rank1",
             "optimization": {
@@ -737,7 +836,11 @@ def main() -> int:
     append_log_line(log_path, f"[start] run_id={run_id}")
     append_log_line(
         log_path,
-        f"[target] {target_segment} pooling={args.pooling} layer={args.layer} sources={source_datasets} include_target_self={args.include_target_self}",
+        (
+            f"[target] {target_segment} pooling={args.pooling} layer={args.layer} "
+            f"opt_sources={optimization_source_datasets} eval_singles={evaluation_single_datasets} "
+            f"combined={combined_probe_names} include_target_self={args.include_target_self}"
+        ),
     )
 
     progress = read_json(progress_path, default={})
@@ -785,7 +888,9 @@ def main() -> int:
     append_log_line(log_path, "[stage] loading frozen probes")
     probe_weights: Dict[str, Tuple[np.ndarray, float]] = {}
     probe_manifest_rows: List[Dict[str, Any]] = []
-    for spec in probe_specs:
+    optimization_probe_name_set = set(source_probe_names)
+    heldout_probe_name_set = set(heldout_probe_names)
+    for spec in evaluation_probe_specs:
         w, b = load_linear_probe(Path(spec["probe_path"]))
         if w.shape[0] != x_train.shape[1]:
             raise ValueError(
@@ -799,12 +904,15 @@ def main() -> int:
                 "source_dataset": spec["source_dataset"],
                 "probe_path": spec["probe_path"],
                 "dim": int(w.shape[0]),
+                "is_optimization_probe": bool(spec["probe_name"] in optimization_probe_name_set),
+                "is_target_self_probe": bool(spec["probe_name"] == self_probe_name),
+                "is_heldout_probe": bool(spec["probe_name"] in heldout_probe_name_set),
             }
         )
     write_csv(
         inputs_dir / "probe_manifest.csv",
         probe_manifest_rows,
-        ["probe_name", "probe_kind", "source_dataset", "probe_path", "dim"],
+        ["probe_name", "probe_kind", "source_dataset", "probe_path", "dim", "is_optimization_probe", "is_target_self_probe", "is_heldout_probe"],
     )
 
     append_log_line(log_path, "[stage] fitting PCA-PC1 baseline")
@@ -816,18 +924,20 @@ def main() -> int:
     metrics_rows: List[Dict[str, Any]] = []
 
     append_log_line(log_path, "[stage] evaluating no-transform baseline")
-    baseline_val = evaluate_probe_collection(x_val, y_val, probe_specs, probe_weights)
-    baseline_test = evaluate_probe_collection(x_test, y_test, probe_specs, probe_weights)
+    baseline_val = evaluate_probe_collection(x_val, y_val, evaluation_probe_specs, probe_weights)
+    baseline_test = evaluate_probe_collection(x_test, y_test, evaluation_probe_specs, probe_weights)
     for split_name, metrics_by_probe in [("validation", baseline_val), ("test", baseline_test)]:
-        for spec in probe_specs:
+        for spec in evaluation_probe_specs:
             probe_name = spec["probe_name"]
             baseline_by_probe_split[(probe_name, split_name)] = metrics_by_probe[probe_name]
         rows = metrics_to_rows(
             metrics_by_probe=metrics_by_probe,
-            probe_specs=probe_specs,
+            probe_specs=evaluation_probe_specs,
             split=split_name,
             method="baseline",
             baseline_by_probe_split=baseline_by_probe_split,
+            optimization_probe_names=source_probe_names,
+            self_probe_name=self_probe_name,
             extra={"alpha": 0.0, "direction_label": "none"},
         )
         baseline_rows.extend(rows)
@@ -844,6 +954,10 @@ def main() -> int:
             "probe_path",
             "split",
             "method",
+            "is_optimization_probe",
+            "is_target_self_probe",
+            "is_combined_probe",
+            "is_heldout_probe",
             "auc",
             "accuracy",
             "f1",
@@ -861,16 +975,18 @@ def main() -> int:
     append_log_line(log_path, "[stage] evaluating PCA-PC1 baseline")
     x_val_pca = remove_specific_pcs(x_val, pca_artifact["mean"], pca_artifact["components"], [1])
     x_test_pca = remove_specific_pcs(x_test, pca_artifact["mean"], pca_artifact["components"], [1])
-    pca_val = evaluate_probe_collection(x_val_pca, y_val, probe_specs, probe_weights)
-    pca_test = evaluate_probe_collection(x_test_pca, y_test, probe_specs, probe_weights)
+    pca_val = evaluate_probe_collection(x_val_pca, y_val, evaluation_probe_specs, probe_weights)
+    pca_test = evaluate_probe_collection(x_test_pca, y_test, evaluation_probe_specs, probe_weights)
     for split_name, metrics_by_probe in [("validation", pca_val), ("test", pca_test)]:
         metrics_rows.extend(
             metrics_to_rows(
                 metrics_by_probe=metrics_by_probe,
-                probe_specs=probe_specs,
+                probe_specs=evaluation_probe_specs,
                 split=split_name,
                 method="pca_pc1",
                 baseline_by_probe_split=baseline_by_probe_split,
+                optimization_probe_names=source_probe_names,
+                self_probe_name=self_probe_name,
                 extra={"alpha": 1.0, "direction_label": "pc1"},
             )
         )
@@ -972,7 +1088,7 @@ def main() -> int:
         direction_np = normalize_np(u.detach().cpu().numpy())
         alpha_np = float(torch.sigmoid(alpha_logit).detach().cpu().item() * float(args.alpha_max))
         x_val_trans = apply_rank1_transform_np(x_val, direction_np, alpha_np)
-        val_metrics = evaluate_probe_collection(x_val_trans, y_val, probe_specs, probe_weights)
+        val_metrics = evaluate_probe_collection(x_val_trans, y_val, evaluation_probe_specs, probe_weights)
         val_avg_source_auc = aggregate_source_auc(val_metrics, source_probe_names)
         val_self_auc = float(val_metrics[self_probe_name]["auc"]) if self_probe_name else None
         feasible, score, self_drop = selection_score(
@@ -1098,16 +1214,18 @@ def main() -> int:
     append_log_line(log_path, "[stage] evaluating learned direction")
     x_val_learned = apply_rank1_transform_np(x_val, chosen_direction, chosen_alpha)
     x_test_learned = apply_rank1_transform_np(x_test, chosen_direction, chosen_alpha)
-    learned_val = evaluate_probe_collection(x_val_learned, y_val, probe_specs, probe_weights)
-    learned_test = evaluate_probe_collection(x_test_learned, y_test, probe_specs, probe_weights)
+    learned_val = evaluate_probe_collection(x_val_learned, y_val, evaluation_probe_specs, probe_weights)
+    learned_test = evaluate_probe_collection(x_test_learned, y_test, evaluation_probe_specs, probe_weights)
     for split_name, metrics_by_probe in [("validation", learned_val), ("test", learned_test)]:
         metrics_rows.extend(
             metrics_to_rows(
                 metrics_by_probe=metrics_by_probe,
-                probe_specs=probe_specs,
+                probe_specs=evaluation_probe_specs,
                 split=split_name,
                 method="learned",
                 baseline_by_probe_split=baseline_by_probe_split,
+                optimization_probe_names=source_probe_names,
+                self_probe_name=self_probe_name,
                 extra={"alpha": chosen_alpha, "direction_label": "learned_rank1", "selected_epoch": int(chosen["epoch"])},
             )
         )
@@ -1124,17 +1242,19 @@ def main() -> int:
         label = f"random_{idx:03d}"
         x_val_rand = apply_rank1_transform_np(x_val, direction, chosen_alpha)
         x_test_rand = apply_rank1_transform_np(x_test, direction, chosen_alpha)
-        val_metrics = evaluate_probe_collection(x_val_rand, y_val, probe_specs, probe_weights)
-        test_metrics = evaluate_probe_collection(x_test_rand, y_test, probe_specs, probe_weights)
+        val_metrics = evaluate_probe_collection(x_val_rand, y_val, evaluation_probe_specs, probe_weights)
+        test_metrics = evaluate_probe_collection(x_test_rand, y_test, evaluation_probe_specs, probe_weights)
         val_avg_source_auc = aggregate_source_auc(val_metrics, source_probe_names)
         random_val_source_scores.append((idx, val_avg_source_auc))
         for split_name, metrics_by_probe in [("validation", val_metrics), ("test", test_metrics)]:
             rows = metrics_to_rows(
                 metrics_by_probe=metrics_by_probe,
-                probe_specs=probe_specs,
+                probe_specs=evaluation_probe_specs,
                 split=split_name,
                 method=label,
                 baseline_by_probe_split=baseline_by_probe_split,
+                optimization_probe_names=source_probe_names,
+                self_probe_name=self_probe_name,
                 extra={"alpha": chosen_alpha, "direction_label": label, "direction_index": int(idx)},
             )
             random_rows.extend(rows)
@@ -1170,7 +1290,7 @@ def main() -> int:
 
     random_mean_rows: List[Dict[str, Any]] = []
     for split_name in ["validation", "test"]:
-        for spec in probe_specs:
+        for spec in evaluation_probe_specs:
             probe_name = spec["probe_name"]
             probe_rows = [
                 r for r in random_rows if str(r["split"]) == split_name and str(r["probe_name"]) == probe_name
@@ -1190,6 +1310,10 @@ def main() -> int:
                     "probe_path": spec["probe_path"],
                     "split": split_name,
                     "method": "random_mean",
+                    "is_optimization_probe": bool(probe_name in optimization_probe_name_set),
+                    "is_target_self_probe": bool(self_probe_name is not None and probe_name == self_probe_name),
+                    "is_combined_probe": bool(str(spec["probe_kind"]) == "combined"),
+                    "is_heldout_probe": bool(probe_name in heldout_probe_name_set),
                     "auc": float(np.mean(aucs)),
                     "accuracy": float(np.mean(accs)),
                     "f1": float(np.mean(f1s)),
@@ -1222,6 +1346,10 @@ def main() -> int:
         "probe_path",
         "split",
         "method",
+        "is_optimization_probe",
+        "is_target_self_probe",
+        "is_combined_probe",
+        "is_heldout_probe",
         "auc",
         "accuracy",
         "f1",
@@ -1240,7 +1368,7 @@ def main() -> int:
 
     random_summary_rows: List[Dict[str, Any]] = []
     for split_name in ["validation", "test"]:
-        for spec in probe_specs:
+        for spec in evaluation_probe_specs:
             probe_name = spec["probe_name"]
             probe_rows = [
                 r for r in random_rows if str(r["split"]) == split_name and str(r["probe_name"]) == probe_name
@@ -1272,7 +1400,7 @@ def main() -> int:
     )
 
     append_log_line(log_path, "[stage] generating plots")
-    probe_order = [str(spec["probe_name"]) for spec in probe_specs]
+    probe_order = [str(spec["probe_name"]) for spec in evaluation_probe_specs]
     method_order = ["baseline", "pca_pc1", "random_mean", "random_best", "learned"]
 
     test_auc_plot = plots_dir / "test_auc_method_comparison.png"
@@ -1362,6 +1490,12 @@ def main() -> int:
         "pooling": args.pooling,
         "layer": int(args.layer),
         "source_datasets": source_datasets,
+        "optimization_source_datasets": optimization_source_datasets,
+        "evaluation_single_datasets": evaluation_single_datasets,
+        "combined_probe_names": combined_probe_names,
+        "optimization_probe_names": source_probe_names,
+        "evaluation_probe_names": [str(spec["probe_name"]) for spec in evaluation_probe_specs],
+        "heldout_probe_names": heldout_probe_names,
         "include_target_self": bool(args.include_target_self),
         "n_train": int(x_train.shape[0]),
         "n_val": int(x_val.shape[0]),
