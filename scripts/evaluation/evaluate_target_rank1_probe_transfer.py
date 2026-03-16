@@ -240,6 +240,21 @@ def load_linear_probe(probe_path: Path) -> Tuple[np.ndarray, float]:
     return extract_classifier_params(state)
 
 
+def load_trusted_torch_checkpoint(path: Path) -> Dict[str, Any]:
+    """
+    Load an internal checkpoint created by this script.
+
+    PyTorch 2.6 changed torch.load to default to weights_only=True, which breaks
+    our resumable training checkpoint because it stores NumPy arrays and the
+    optimizer state, not just tensors. This helper opts back into the previous
+    trusted behavior for this script-owned checkpoint format.
+    """
+    try:
+        return torch.load(str(path), map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(str(path), map_location="cpu")
+
+
 def append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     ensure_dir(path.parent)
     with path.open("a", encoding="utf-8") as f:
@@ -891,7 +906,7 @@ def main() -> int:
 
     resume_state: Dict[str, Any] = {}
     if args.resume and training_ckpt_path.exists():
-        resume_state = torch.load(str(training_ckpt_path), map_location="cpu")
+        resume_state = load_trusted_torch_checkpoint(training_ckpt_path)
         append_log_line(log_path, f"[resume] loaded training checkpoint epoch={resume_state.get('epoch', 0)}")
 
     start_epoch = int(resume_state.get("epoch", 0)) + 1 if resume_state else 1
