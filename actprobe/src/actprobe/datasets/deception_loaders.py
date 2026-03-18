@@ -729,6 +729,10 @@ class DeceptionTypedMessagesDataset(BaseDataset):
         "Deception-Mask": ("mask__", "mask"),
         "Deception-HarmPressureChoice": ("harm-pressure-choice", "harm_pressure_choice"),
         "Deception-ConvincingGame": ("convincing-game", "convincing_game"),
+        "Deception-ClaimsDefinitional": ("claims_definitional", "claims-definitional", "claimsdefinitional"),
+        "Deception-ClaimsEvidential": ("claims_evidential", "claims-evidential", "claimsevidential"),
+        "Deception-ClaimsFictional": ("claims_fictional", "claims-fictional", "claimsfictional"),
+        "Deception-ClaimsLogical": ("claims_logical", "claims-logical", "claimslogical"),
     }
 
     def __init__(
@@ -767,6 +771,14 @@ class DeceptionTypedMessagesDataset(BaseDataset):
         if self.dataset_name is None:
             if "mask__" in inferred_source:
                 self.dataset_name = "Deception-Mask"
+            elif "claims_definitional" in inferred_source:
+                self.dataset_name = "Deception-ClaimsDefinitional"
+            elif "claims_evidential" in inferred_source:
+                self.dataset_name = "Deception-ClaimsEvidential"
+            elif "claims_fictional" in inferred_source:
+                self.dataset_name = "Deception-ClaimsFictional"
+            elif "claims_logical" in inferred_source:
+                self.dataset_name = "Deception-ClaimsLogical"
             elif "harm-pressure-choice__" in inferred_source:
                 self.dataset_name = "Deception-HarmPressureChoice"
             elif "convincing-game__" in inferred_source:
@@ -776,6 +788,14 @@ class DeceptionTypedMessagesDataset(BaseDataset):
         if self.id_prefix is None:
             if "mask__" in inferred_source:
                 self.id_prefix = "mask"
+            elif "claims_definitional" in inferred_source:
+                self.id_prefix = "claims_definitional"
+            elif "claims_evidential" in inferred_source:
+                self.id_prefix = "claims_evidential"
+            elif "claims_fictional" in inferred_source:
+                self.id_prefix = "claims_fictional"
+            elif "claims_logical" in inferred_source:
+                self.id_prefix = "claims_logical"
             elif "harm-pressure-choice__" in inferred_source:
                 self.id_prefix = "harm_pressure_choice"
             elif "convincing-game__" in inferred_source:
@@ -821,12 +841,32 @@ class DeceptionTypedMessagesDataset(BaseDataset):
                 "mask__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
             ),
         ]
+        claims_paths = {
+            "Deception-ClaimsDefinitional": [
+                data_file,
+                "data/apollo_raw/claims_definitional/claims_definitional__truth_spec__messages_clean.jsonl",
+            ],
+            "Deception-ClaimsEvidential": [
+                data_file,
+                "data/apollo_raw/claims_evidential/claims_evidential__truth_spec__messages_clean.jsonl",
+            ],
+            "Deception-ClaimsFictional": [
+                data_file,
+                "data/apollo_raw/claims_fictional/claims_fictional__truth_spec__messages_clean.jsonl",
+            ],
+            "Deception-ClaimsLogical": [
+                data_file,
+                "data/apollo_raw/claims_logical/claims_logical__truth_spec__messages_clean.jsonl",
+            ],
+        }
         generic_paths = instructed_paths + mask_paths
 
         if dataset_name == "Deception-InstructedDeception":
             return _dedupe(instructed_paths)
         if dataset_name == "Deception-Mask":
             return _dedupe(mask_paths)
+        if dataset_name in claims_paths:
+            return _dedupe(claims_paths[dataset_name])
         return _dedupe(generic_paths)
 
     def _validate_resolved_data_file(self) -> None:
@@ -1262,4 +1302,76 @@ class DeceptionInstructedDeceptionDataset(DeceptionTypedMessagesDataset):
             random_seed=random_seed,
             dataset_name="Deception-InstructedDeception",
             id_prefix="instructed_deception",
+        )
+
+
+class DeceptionClaimsDefinitionalDataset(DeceptionTypedMessagesDataset):
+    def __init__(
+        self,
+        split: str = "train",
+        limit: Optional[int] = None,
+        data_file: str = "data/apollo_raw/claims_definitional/claims_definitional__truth_spec__messages_clean.jsonl",
+        random_seed: int = 42,
+    ):
+        super().__init__(
+            split=split,
+            limit=limit,
+            data_file=data_file,
+            random_seed=random_seed,
+            dataset_name="Deception-ClaimsDefinitional",
+            id_prefix="claims_definitional",
+        )
+
+
+class DeceptionClaimsEvidentialDataset(DeceptionTypedMessagesDataset):
+    def __init__(
+        self,
+        split: str = "train",
+        limit: Optional[int] = None,
+        data_file: str = "data/apollo_raw/claims_evidential/claims_evidential__truth_spec__messages_clean.jsonl",
+        random_seed: int = 42,
+    ):
+        super().__init__(
+            split=split,
+            limit=limit,
+            data_file=data_file,
+            random_seed=random_seed,
+            dataset_name="Deception-ClaimsEvidential",
+            id_prefix="claims_evidential",
+        )
+
+
+class DeceptionClaimsFictionalDataset(DeceptionTypedMessagesDataset):
+    def __init__(
+        self,
+        split: str = "train",
+        limit: Optional[int] = None,
+        data_file: str = "data/apollo_raw/claims_fictional/claims_fictional__truth_spec__messages_clean.jsonl",
+        random_seed: int = 42,
+    ):
+        super().__init__(
+            split=split,
+            limit=limit,
+            data_file=data_file,
+            random_seed=random_seed,
+            dataset_name="Deception-ClaimsFictional",
+            id_prefix="claims_fictional",
+        )
+
+
+class DeceptionClaimsLogicalDataset(DeceptionTypedMessagesDataset):
+    def __init__(
+        self,
+        split: str = "train",
+        limit: Optional[int] = None,
+        data_file: str = "data/apollo_raw/claims_logical/claims_logical__truth_spec__messages_clean.jsonl",
+        random_seed: int = 42,
+    ):
+        super().__init__(
+            split=split,
+            limit=limit,
+            data_file=data_file,
+            random_seed=random_seed,
+            dataset_name="Deception-ClaimsLogical",
+            id_prefix="claims_logical",
         )

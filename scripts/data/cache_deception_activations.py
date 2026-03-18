@@ -58,6 +58,10 @@ from actprobe.datasets.deception_loaders import (
     DeceptionAILiarDataset,
     DeceptionInstructedDeceptionDataset,
     DeceptionMaskDataset,
+    DeceptionClaimsDefinitionalDataset,
+    DeceptionClaimsEvidentialDataset,
+    DeceptionClaimsFictionalDataset,
+    DeceptionClaimsLogicalDataset,
 )
 from actprobe.llm.activations import ActivationRunner
 from actprobe.features.resample import resample_activations
@@ -233,6 +237,14 @@ def _infer_dataset_output_name(dataset_file: Optional[str]) -> Optional[str]:
         return "Deception-ConvincingGame"
     if base.startswith("instructed-deception") or base.startswith("instructed_deception"):
         return "Deception-InstructedDeception"
+    if base.startswith("claims_definitional"):
+        return "Deception-ClaimsDefinitional"
+    if base.startswith("claims_evidential"):
+        return "Deception-ClaimsEvidential"
+    if base.startswith("claims_fictional"):
+        return "Deception-ClaimsFictional"
+    if base.startswith("claims_logical"):
+        return "Deception-ClaimsLogical"
     return None
 
 
@@ -410,6 +422,10 @@ DATASET_MAP = {
     "Deception-AILiar": DeceptionAILiarDataset,
     "Deception-InstructedDeception": DeceptionInstructedDeceptionDataset,
     "Deception-Mask": DeceptionMaskDataset,
+    "Deception-ClaimsDefinitional": DeceptionClaimsDefinitionalDataset,
+    "Deception-ClaimsEvidential": DeceptionClaimsEvidentialDataset,
+    "Deception-ClaimsFictional": DeceptionClaimsFictionalDataset,
+    "Deception-ClaimsLogical": DeceptionClaimsLogicalDataset,
 }
 
 # ============================================================================
