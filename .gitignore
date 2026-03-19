@@ -68,3 +68,7 @@ Thumbs.db
 
 # Legacy duplicate directory (to be removed after testing)
 src/
+!actprobe/src/
+!actprobe/src/actprobe/
+!actprobe/src/actprobe/features/
+!actprobe/src/actprobe/features/dataset_fingerprint.py

@@ -65,6 +65,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def load_id_allowlist(path: str) -> set[str]:
+    """Load an allowlist json as either {"ids": [...]} or a bare list."""
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if isinstance(payload, dict):
+        ids = payload.get("ids")
+    else:
+        ids = payload
+    if not isinstance(ids, list):
+        raise ValueError(f"Allowlist must be a list or contain an 'ids' list: {path}")
+    out = {str(item) for item in ids}
+    if not out:
+        raise ValueError(f"Allowlist is empty: {path}")
+    return out
+
+
+def filter_items_by_allowlist(items: list[dict], allowlist: set[str]) -> list[dict]:
+    """Keep only items whose ids appear in the allowlist."""
+    return [item for item in items if str(item.get("id")) in allowlist]
+
 # ============================================================================
 # Dataset loader
 # ============================================================================
@@ -750,6 +771,12 @@ def main():
         action="store_true",
         help="If set, splits 20%% of training data for validation (if validation split missing)"
     )
+    parser.add_argument(
+        "--train_id_allowlist_json",
+        type=str,
+        default=None,
+        help="Optional JSON allowlist of training sample ids. Validation/test remain unchanged.",
+    )
 
     args = parser.parse_args()
 
@@ -824,6 +851,23 @@ def main():
         stats_pooling=args.pooling,
         stats_eps=args.norm_eps
     )
+
+    if args.train_id_allowlist_json:
+        allowlist = load_id_allowlist(args.train_id_allowlist_json)
+        filtered_items = filter_items_by_allowlist(train_dataset.items, allowlist)
+        if not filtered_items:
+            logger.error(
+                f"No training samples remain after applying allowlist: {args.train_id_allowlist_json}"
+            )
+            return 1
+        missing_count = len(allowlist) - len(filtered_items)
+        logger.info(
+            f"Applied training allowlist: kept {len(filtered_items)}/{len(train_dataset.items)} "
+            f"samples from {args.train_id_allowlist_json}"
+        )
+        if missing_count > 0:
+            logger.warning(f"Allowlist ids missing from training split: {missing_count}")
+        train_dataset.items = filtered_items
 
     if splits_exist['validation']:
         val_dataset = CachedDeceptionDataset(
@@ -1063,10 +1107,11 @@ def main():
             checkpoint_every=args.attr_checkpoint_every,
             norm=layer_norm,
         )
+        model.load_state_dict(torch.load(args.output_model_path, map_location=device))
+        _, best_val_acc, _, _ = evaluate(model, layer_val_loader, device, norm=layer_norm)
 
         # Test
         if test_dataset:
-            model.load_state_dict(torch.load(args.output_model_path))
             layer_test_dataset = LayerDataset(test_dataset, args.layer)
             layer_test_loader = DataLoader(
                 layer_test_dataset,
@@ -1076,6 +1121,9 @@ def main():
             )
             test_auc, test_acc, _, _ = evaluate(model, layer_test_loader, device, norm=layer_norm)
             logger.info(f"Test AUC: {test_auc:.4f} | Test Acc: {test_acc:.4f}")
+        else:
+            test_auc = None
+            test_acc = None
 
         # Attribution + checkpoint eval
         if args.attr_enable and checkpoints:
@@ -1112,6 +1160,42 @@ def main():
                 attr_out_dir=attr_out_dir,
                 device=device
             )
+
+        single_result = [{
+            'layer': args.layer,
+            'val_auc': best_val_auc,
+            'val_acc': best_val_acc,
+            'epoch': best_epoch,
+            'test_auc': test_auc,
+            'test_acc': test_acc,
+        }]
+        with open(results_path, 'w') as f:
+            json.dump(single_result, f, indent=2)
+        logger.info(f"Saved results to {results_path}")
+
+        best_probe_info = {
+            'best_layer': args.layer,
+            'best_val_auc': best_val_auc,
+            'best_val_acc': best_val_acc,
+            'best_epoch': best_epoch,
+            'test_auc': test_auc,
+            'test_acc': test_acc,
+            'probe_path': args.output_model_path,
+            'pooling': args.pooling,
+            'pool_before_batch': args.pool_before_batch,
+            'model_pooling_type': model_pooling_type,
+            'model': args.model,
+            'dataset': args.dataset,
+            'output_dataset': output_dataset,
+            'output_subdir': args.output_subdir,
+            'suffix_condition': args.suffix_condition if hasattr(args, 'suffix_condition') else None,
+            'input_dim': D,
+            'train_id_allowlist_json': args.train_id_allowlist_json,
+        }
+        best_probe_path = os.path.join(output_dir, "best_probe.json")
+        with open(best_probe_path, 'w') as f:
+            json.dump(best_probe_info, f, indent=2)
+        logger.info(f"Saved best probe info to {best_probe_path}")
 
     else:
         # Train on all layers
