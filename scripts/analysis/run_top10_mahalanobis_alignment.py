@@ -136,18 +136,18 @@ def parse_target_dataset(label: str) -> str:
     if "insidertrading" not in v:
         raise ValueError(f"Only InsiderTrading targets supported, got: {label}")
     if "completion" in v:
-        return "Deception-InsiderTrading-completion"
+        return "Deception-InsiderTrading-SallyConcat-completion"
     if "system" in v:
-        return "Deception-InsiderTrading-system"
+        return "Deception-InsiderTrading-SallyConcat-system"
     if "user" in v:
-        return "Deception-InsiderTrading-user"
+        return "Deception-InsiderTrading-SallyConcat-user"
     if "prompt" in v:
-        return "Deception-InsiderTrading-prompt"
+        return "Deception-InsiderTrading-SallyConcat-prompt"
     if "full" in v:
-        return "Deception-InsiderTrading"
+        return "Deception-InsiderTrading-SallyConcat"
     compact = v.replace(" ", "")
     if compact in {"insidertrading", "deception-insidertrading"}:
-        return "Deception-InsiderTrading"
+        return "Deception-InsiderTrading-SallyConcat"
     raise ValueError(f"Cannot parse target dataset from: {label}")
 
 

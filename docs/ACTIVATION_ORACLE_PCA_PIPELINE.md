@@ -64,7 +64,7 @@ Both scripts emit live `tqdm` progress bars and periodic log lines to stdout.
 python -u scripts/activation_oracle/prepare_oracle_vectors_exp2.py \
   --model_name meta-llama/Llama-3.2-1B-Instruct \
   --saved_pca_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/results/pca_ablation/meta-llama_Llama-3.2-1B-Instruct/Deception-Roleplaying \
-  --activations_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-1B-Instruct/Deception-InsiderTrading/test \
+  --activations_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-1B-Instruct/Deception-InsiderTrading-SallyConcat/test \
   --probes_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/probes/meta-llama_Llama-3.2-1B-Instruct/Deception-Roleplaying \
   --matrix_preset locked_v1 \
   --questions_config configs/activation_oracle/questions_exp2_v1.json \

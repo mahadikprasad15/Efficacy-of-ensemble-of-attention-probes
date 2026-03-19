@@ -240,10 +240,10 @@ def discover_insider_targets(activations_model_root: Path, split: str) -> List[D
         if not child.is_dir():
             continue
         ds = child.name
-        if ds == "Deception-InsiderTrading":
+        if ds == "Deception-InsiderTrading-SallyConcat":
             segment = "full"
-        elif ds.startswith("Deception-InsiderTrading-"):
-            segment = ds[len("Deception-InsiderTrading-") :].strip().lower()
+        elif ds.startswith("Deception-InsiderTrading-SallyConcat-"):
+            segment = ds[len("Deception-InsiderTrading-SallyConcat-") :].strip().lower()
         else:
             continue
 
@@ -632,7 +632,7 @@ def main() -> None:
             "--results_dir",
             str(train_results_root),
             "--ood_dataset",
-            "Deception-InsiderTrading",
+            "Deception-InsiderTrading-SallyConcat",
             "--ood_split",
             args.target_split,
             "--epochs",
@@ -708,7 +708,7 @@ def main() -> None:
                 results_model_root
                 / "layer_agnostic_top5"
                 / f"from-{from_slug}-pool-{pooling}"
-                / f"to-Deception-InsiderTrading-{segment}"
+                / f"to-Deception-InsiderTrading-SallyConcat-{segment}"
             )
             out_dir.mkdir(parents=True, exist_ok=True)
             result_json = out_dir / "results.json"

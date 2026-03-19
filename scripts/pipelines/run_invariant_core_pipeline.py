@@ -317,7 +317,7 @@ def main():
                         help='Number of OOD samples for evaluation')
     parser.add_argument('--domain_a', type=str, default='Deception-Roleplaying',
                         help='Domain A name')
-    parser.add_argument('--domain_b', type=str, default='Deception-InsiderTrading',
+    parser.add_argument('--domain_b', type=str, default='Deception-InsiderTrading-SallyConcat',
                         help='Domain B name')
     args = parser.parse_args()
     

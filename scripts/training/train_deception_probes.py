@@ -725,7 +725,7 @@ def main():
     parser.add_argument("--attr_top_n", type=int, default=100, help="Top-N samples to save")
     parser.add_argument("--attr_checkpoint_every", type=int, default=1, help="Checkpoint frequency (epochs)")
     parser.add_argument("--attr_out_dir", type=str, default=None, help="Output directory for attribution results")
-    parser.add_argument("--ood_dataset", type=str, default="Deception-InsiderTrading", help="OOD dataset for checkpoint eval")
+    parser.add_argument("--ood_dataset", type=str, default="Deception-InsiderTrading-SallyConcat", help="OOD dataset for checkpoint eval")
     parser.add_argument("--ood_split", type=str, default="test", help="OOD split for checkpoint eval")
     parser.add_argument("--ood_activations_dir", type=str, default=None, help="Base activations dir for OOD (default: --activations_dir)")
     parser.add_argument(

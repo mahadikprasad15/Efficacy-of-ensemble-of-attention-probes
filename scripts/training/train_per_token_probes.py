@@ -21,11 +21,11 @@ Usage:
 
 For flipped (OOD) training:
     python scripts/training/train_per_token_probes.py \
-        --train_activations data/activations/.../Deception-InsiderTrading/train \
-        --val_activations data/activations/.../Deception-InsiderTrading/validation \
+        --train_activations data/activations/.../Deception-InsiderTrading-SallyConcat/train \
+        --val_activations data/activations/.../Deception-InsiderTrading-SallyConcat/validation \
         --output_dir data/probes_per_token_flipped \
         --model meta-llama_Llama-3.2-3B-Instruct \
-        --dataset Deception-InsiderTrading
+        --dataset Deception-InsiderTrading-SallyConcat
 """
 
 import os

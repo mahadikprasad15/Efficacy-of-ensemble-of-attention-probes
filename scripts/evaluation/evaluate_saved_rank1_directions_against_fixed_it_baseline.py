@@ -338,7 +338,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--single_probes_root", type=str, default="data/probes")
     parser.add_argument("--source_sweep_root", type=str, required=True)
     parser.add_argument("--fixed_results_dir", type=str, required=True)
-    parser.add_argument("--target_dataset", type=str, default="Deception-InsiderTrading")
+    parser.add_argument("--target_dataset", type=str, default="Deception-InsiderTrading-SallyConcat")
     parser.add_argument("--segment", type=str, choices=["completion", "full"], default="completion")
     parser.add_argument("--pooling", type=str, choices=SUPPORTED_POOLINGS, default="mean")
     parser.add_argument("--layer", type=int, default=15)

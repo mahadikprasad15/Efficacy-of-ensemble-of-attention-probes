@@ -771,7 +771,7 @@ def main():
     
     parser.add_argument("--model", type=str, required=True, help="Model name (for directory structure)")
     parser.add_argument("--dataset", type=str, default="Deception-Roleplaying", help="Training dataset")
-    parser.add_argument("--ood_dataset", type=str, default="Deception-InsiderTrading", help="OOD evaluation dataset")
+    parser.add_argument("--ood_dataset", type=str, default="Deception-InsiderTrading-SallyConcat", help="OOD evaluation dataset")
     parser.add_argument("--activations_dir", type=str, default="data/activations", help="Base activations directory")
     parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "max", "last", "attn"], help="Token pooling method")
     parser.add_argument("--output_dir", type=str, default="data/probes_layer_agnostic", help="Output directory for probes")

@@ -29,7 +29,7 @@ from actprobe.probes.ensemble import GatedEnsemble
 # ============================================================================
 parser = argparse.ArgumentParser(description='Layer Colored Attention Analysis')
 parser.add_argument('--ood_dir', type=str, 
-                    default='data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test')
+                    default='data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/test')
 parser.add_argument('--apollo_data', type=str,
                     default='data/apollo_raw/insider_trading/llama-70b-3.3-generations.json')
 parser.add_argument('--probes_base', type=str,

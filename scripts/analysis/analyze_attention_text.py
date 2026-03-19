@@ -27,9 +27,9 @@ from actprobe.probes.models import LayerProbe
 # ============================================================================
 parser = argparse.ArgumentParser(description='Attention Text Analysis')
 parser.add_argument('--ood_dir', type=str, 
-                    default='data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test')
+                    default='data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/test')
 parser.add_argument('--apollo_data', type=str,
-                    default='data/apollo_raw/insider_trading/llama-70b-3.3-generations.json')
+                    default='data/apollo_raw/insider_trading/sally_concat_examples.jsonl')
 parser.add_argument('--probes_base', type=str,
                     default='data/probes/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying')
 parser.add_argument('--output_dir', type=str, default='results/mechanistic_analysis')
@@ -75,33 +75,22 @@ print("\nLoading Apollo data for original text...")
 apollo_texts = {}
 try:
     with open(APOLLO_DATA, 'r') as f:
-        apollo_data = json.load(f)
-    
-    # IDs are formatted as "insider_{idx}" based on array index
-    for idx, item in enumerate(apollo_data):
-        item_id = f"insider_{idx}"
-        
-        # Get metadata
-        metadata = item.get('metadata', {})
-        
-        # Extract trade_message (the key deceptive/honest content)
-        trade_message = metadata.get('trade_message', '')
-        
-        # If no trade_message, get last assistant message
-        if not trade_message:
-            transcript = item.get('transcript', [])
-            for msg in reversed(transcript):
-                if msg.get('role') == 'assistant':
-                    trade_message = msg.get('content', '')
-                    break
-        
-        made_trade = metadata.get('made_trade', '')
-        
-        if trade_message:
-            apollo_texts[item_id] = {
-                'text': trade_message,
-                'made_trade': made_trade
-            }
+        for idx, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            item = json.loads(line)
+            metadata = item.get('metadata', {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            item_id = str(metadata.get('id', f"insider_sally_{idx}"))
+            trade_message = item.get('completion', '')
+            report_label = metadata.get('report_label', '')
+            if trade_message:
+                apollo_texts[item_id] = {
+                    'text': trade_message,
+                    'report_label': report_label
+                }
     
     print(f"✓ Loaded {len(apollo_texts)} Apollo texts")
     # Show sample IDs

@@ -8,7 +8,7 @@ between Roleplaying and InsiderTrading activations.
 Usage:
     python scripts/analyze_cca_subspace.py \
         --activations_a data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
-        --activations_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
+        --activations_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
         --label_a "Roleplaying" \
         --label_b "InsiderTrading" \
         --layer 18 \

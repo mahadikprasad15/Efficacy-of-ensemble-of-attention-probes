@@ -11,7 +11,7 @@ This project investigates whether learned pooling strategies (mean, max, last, *
 | Dataset | Type | Source | Use |
 |---------|------|--------|-----|
 | **Deception-Roleplaying** | AI roleplaying deceptive characters | Custom | In-distribution (train/val) |
-| **Deception-InsiderTrading** | AI hiding insider trading decisions | Apollo Research | Out-of-distribution (test) |
+| **Deception-InsiderTrading-SallyConcat** | AI hiding insider trading decisions | Apollo Research | Out-of-distribution (test) |
 
 ### Model
 - **Llama-3.2-3B-Instruct** (meta-llama)
@@ -74,7 +74,7 @@ Evaluate trained probes on out-of-distribution data (Insider Trading).
 # Cache OOD activations
 python scripts/cache_deception_activations.py \
     --model meta-llama/Llama-3.2-3B-Instruct \
-    --dataset Deception-InsiderTrading \
+    --dataset Deception-InsiderTrading-SallyConcat \
     --split test \
     --limit 200
 ```
@@ -83,7 +83,7 @@ Run OOD evaluation:
 ```bash
 python scripts/evaluate_ood_all_pooling.py \
     --model meta-llama/Llama-3.2-3B-Instruct \
-    --ood_dir data/activations/.../Deception-InsiderTrading/test \
+    --ood_dir data/activations/.../Deception-InsiderTrading-SallyConcat/test \
     --probes_dir data/probes/.../Deception-Roleplaying
 ```
 

@@ -189,7 +189,7 @@ def main() -> int:
     parser.add_argument("--segment", type=str, choices=["completion", "full"], required=True)
 
     parser.add_argument("--train_datasets", type=str, default=",".join(DEFAULT_TRAIN_DATASETS))
-    parser.add_argument("--test_only_datasets", type=str, default="Deception-InsiderTrading")
+    parser.add_argument("--test_only_datasets", type=str, default="Deception-InsiderTrading-SallyConcat")
 
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--val_split", type=str, default="validation")

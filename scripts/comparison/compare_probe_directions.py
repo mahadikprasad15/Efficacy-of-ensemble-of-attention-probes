@@ -8,7 +8,7 @@ to understand if they learn the same or different "deception" directions.
 Usage:
     python scripts/compare_probe_directions.py \
         --probes_dir_a data/probes/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying \
-        --probes_dir_b data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading \
+        --probes_dir_b data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat \
         --label_a "Roleplaying" \
         --label_b "InsiderTrading" \
         --output_dir results/probe_comparison

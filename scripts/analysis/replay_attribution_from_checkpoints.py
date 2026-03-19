@@ -677,7 +677,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--val_split", type=str, default="validation")
 
-    parser.add_argument("--ood_dataset", type=str, default="Deception-InsiderTrading")
+    parser.add_argument("--ood_dataset", type=str, default="Deception-InsiderTrading-SallyConcat")
     parser.add_argument("--ood_split", type=str, default="test")
     parser.add_argument("--ood_activations_root", type=str, default=None)
 

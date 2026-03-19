@@ -9,7 +9,7 @@ for compatibility with evaluation scripts.
 Usage:
     python scripts/data/cache_soft_prefix_activations.py \
         --model meta-llama/Llama-3.2-3B-Instruct \
-        --dataset Deception-InsiderTrading \
+        --dataset Deception-InsiderTrading-SallyConcat \
         --soft_prefix_ckpt checkpoints/soft_prefix/.../
         --output_dir data/soft_prefix_activations
 """
@@ -26,7 +26,10 @@ from safetensors.torch import save_file, load_file
 # Add src to path
 sys.path.append(os.path.join(os.getcwd(), 'actprobe', 'src'))
 
-from actprobe.datasets.deception_loaders import DeceptionInsiderTradingDataset, DeceptionRoleplayingDataset
+from actprobe.datasets.deception_loaders import (
+    DeceptionInsiderTradingSallyConcatDataset,
+    DeceptionRoleplayingDataset,
+)
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logging.basicConfig(
@@ -109,7 +112,7 @@ def main():
     parser.add_argument("--model", type=str, required=True,
                         help="HuggingFace model name")
     parser.add_argument("--dataset", type=str, required=True,
-                        choices=["Deception-InsiderTrading", "Deception-Roleplaying"],
+                        choices=["Deception-InsiderTrading-SallyConcat", "Deception-Roleplaying"],
                         help="Dataset to cache")
     parser.add_argument("--split", type=str, default="test",
                         help="Dataset split")
@@ -143,9 +146,9 @@ def main():
     
     logger.info("\n[1/4] Loading dataset...")
     
-    if args.dataset == "Deception-InsiderTrading":
-        data_file = os.path.join(args.data_dir, "insider_trading/llama-70b-3.3-generations.json")
-        dataset = DeceptionInsiderTradingDataset(
+    if args.dataset == "Deception-InsiderTrading-SallyConcat":
+        data_file = os.path.join(args.data_dir, "insider_trading/sally_concat_examples.jsonl")
+        dataset = DeceptionInsiderTradingSallyConcatDataset(
             split=args.split,
             limit=args.limit,
             data_file=data_file
@@ -256,7 +259,7 @@ def main():
                     'shard': shard_idx,
                     'activation_shape': list(tensor.shape),
                     'dataset': item["metadata"].get("dataset", args.dataset),
-                    'made_trade': item["metadata"].get("made_trade", "")
+                    'report_label': item["metadata"].get("report_label", "")
                 })
             
             pbar.update(len(batch_items))

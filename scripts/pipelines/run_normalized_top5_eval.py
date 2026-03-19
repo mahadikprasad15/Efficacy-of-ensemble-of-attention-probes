@@ -88,7 +88,7 @@ def map_source_probe_to_train_dataset_name(source_probe: str) -> str:
 def target_to_dataset_name(value: str) -> str:
     v = str(value).strip().lower()
     if "insidertrading" in v:
-        base = "Deception-InsiderTrading"
+        base = "Deception-InsiderTrading-SallyConcat"
     elif "roleplaying" in v:
         base = "Deception-Roleplaying"
     elif "ai liar" in v or "ailiar" in v:
@@ -116,8 +116,8 @@ def base_dataset_from_train_dataset(dataset: str) -> str:
         return "Deception-AILiar"
     if dataset.startswith("Deception-Roleplaying"):
         return "Deception-Roleplaying"
-    if dataset.startswith("Deception-InsiderTrading"):
-        return "Deception-InsiderTrading"
+    if dataset.startswith("Deception-InsiderTrading-SallyConcat"):
+        return "Deception-InsiderTrading-SallyConcat"
     return dataset.split("-", 1)[0]
 
 

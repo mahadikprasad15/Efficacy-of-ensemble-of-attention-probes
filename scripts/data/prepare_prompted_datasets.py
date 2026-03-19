@@ -323,103 +323,66 @@ def load_from_cached_manifest(manifest_dir: str, dataset_type: str) -> List[Dict
 
 def load_from_raw_insider_trading(json_path: str, split: str = "train") -> List[Dict[str, Any]]:
     """
-    Load directly from Apollo's raw InsiderTrading JSON.
-    
-    This is the preferred method for InsiderTrading since it has full data.
+    Load directly from Sally InsiderTrading JSONL.
     """
-    import random
-    
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"Raw data not found: {json_path}")
-    
-    logger.info(f"Loading from raw InsiderTrading JSON: {json_path}")
-    
-    with open(json_path, 'r') as f:
-        raw_data = json.load(f)
-    
-    logger.info(f"  Loaded {len(raw_data)} rollouts")
-    
-    # Label mapping
-    LABEL_MAP = {"yes": 1, "no": 0, "invalid": -1}
-    
+
+    logger.info(f"Loading from Sally InsiderTrading JSONL: {json_path}")
+
     all_items = []
-    skipped = {"no_label": 0, "invalid": 0, "no_trade_message": 0}
-    
-    for idx, rollout in enumerate(raw_data):
-        metadata = rollout.get("metadata", {})
-        made_trade = metadata.get("made_trade")
-        
-        if made_trade is None:
-            skipped["no_label"] += 1
-            continue
-        
-        label = LABEL_MAP.get(made_trade.lower().strip(), -1)
-        if label == -1:
-            skipped["invalid"] += 1
-            continue
-        
-        # Get scenario from transcript
-        transcript = rollout.get("transcript", [])
-        scenario = ""
-        for msg in transcript:
-            if msg.get("role") == "system":
-                scenario = msg.get("content", "")
-                break
-        
-        # Get trade_message - this is the key content
-        trade_message = metadata.get("trade_message", "")
-        if not trade_message:
-            skipped["no_trade_message"] += 1
-            continue
-        
-        # CONSISTENCY ASSERTIONS - catch data corruption early
-        # Assert made_trade is exactly "yes" or "no" (not "invalid" or other)
-        made_trade_normalized = made_trade.lower().strip()
-        if made_trade_normalized not in {"yes", "no"}:
-            skipped["invalid"] += 1
-            logger.debug(f"insider_{idx}: skipping made_trade='{made_trade}'")
-            continue
-        
-        # Optional: check trade_message is consistent with label
-        has_trade_action = "execute_trade" in trade_message.lower() or "buy" in trade_message.lower() or "sell" in trade_message.lower()
-        if label == 1 and not has_trade_action:
-            logger.warning(f"insider_{idx}: label=deceptive but no trade action in message")
-        if label == 0 and has_trade_action:
-            logger.warning(f"insider_{idx}: label=honest but trade action found in message")
-        
-        passage = build_passage_insider(scenario, trade_message)
-        
-        all_items.append({
-            'id': f"insider_{idx}",
-            'completion': trade_message,
-            'label': label,
-            'passage': passage,
-            'metadata': {
-                'scenario': scenario,  # FULL scenario, no truncation
-                'made_trade': made_trade,
-                'source': 'raw_apollo',
-            }
-        })
-    
+    skipped = {"bad_json": 0, "bad_label": 0, "missing_fields": 0}
+
+    with open(json_path, 'r') as f:
+        for idx, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                skipped["bad_json"] += 1
+                continue
+
+            row_split = row.get("split")
+            if split in {"train", "validation", "test"} and row_split != split:
+                continue
+
+            prompt = row.get("prompt")
+            completion = row.get("completion")
+            metadata = row.get("metadata", {})
+            if not isinstance(prompt, str) or not isinstance(completion, str):
+                skipped["missing_fields"] += 1
+                continue
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+            try:
+                label = int(row.get("gold_label"))
+            except (TypeError, ValueError):
+                skipped["bad_label"] += 1
+                continue
+            if label not in {0, 1}:
+                skipped["bad_label"] += 1
+                continue
+
+            passage = f"{prompt}\n{completion}".strip()
+
+            all_items.append({
+                'id': str(metadata.get("id", f"insider_sally_{idx}")),
+                'completion': completion,
+                'label': label,
+                'passage': passage,
+                'metadata': {
+                    'scenario': metadata.get('scenario', ''),
+                    'report_label': metadata.get('report_label', ''),
+                    'source': 'sally_concat',
+                }
+            })
+
     logger.info(f"  Valid items: {len(all_items)}")
     logger.info(f"  Skipped: {skipped}")
-    
-    # Split data
-    random.seed(42)
-    random.shuffle(all_items)
-    
-    n = len(all_items)
-    train_end = int(0.6 * n)
-    val_end = int(0.8 * n)
-    
-    if split == "train":
-        return all_items[:train_end]
-    elif split == "validation":
-        return all_items[train_end:val_end]
-    elif split == "test":
-        return all_items[val_end:]
-    else:
-        return all_items
+    return all_items
 
 
 def load_from_raw_roleplaying(yaml_path: str, cached_manifest_path: Optional[str], split: str = "train") -> List[Dict[str, Any]]:
@@ -687,7 +650,7 @@ def main():
         logger.error(f"\n❌ {ending_issues} items don't end with 'Answer:'")
     
     # Create output directory
-    dataset_name = "Deception-Roleplaying" if args.dataset_type == "roleplaying" else "Deception-InsiderTrading"
+    dataset_name = "Deception-Roleplaying" if args.dataset_type == "roleplaying" else "Deception-InsiderTrading-SallyConcat"
     output_path = os.path.join(
         args.output_dir,
         args.suffix_type,

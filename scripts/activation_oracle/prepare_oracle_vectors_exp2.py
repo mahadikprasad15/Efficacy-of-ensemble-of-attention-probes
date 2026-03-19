@@ -690,7 +690,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--questions_config", type=str, default=None)
     p.add_argument("--output_root", type=str, default="artifacts")
     p.add_argument("--experiment_name", type=str, default="activation_oracle_exp2")
-    p.add_argument("--dataset_name", type=str, default="Deception-InsiderTrading")
+    p.add_argument("--dataset_name", type=str, default="Deception-InsiderTrading-SallyConcat")
     p.add_argument("--probe_set", type=str, default="roleplaying_probes")
     p.add_argument("--variant", type=str, default="locked_v1")
     p.add_argument("--split_name", type=str, default="ood_test")

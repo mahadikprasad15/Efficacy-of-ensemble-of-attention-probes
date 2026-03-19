@@ -8,8 +8,8 @@ Usage:
     python scripts/lambda_sweep_da.py \
         --train_a data/activations/.../Deception-Roleplaying/train \
         --val_a data/activations/.../Deception-Roleplaying/validation \
-        --train_b data/activations/.../Deception-InsiderTrading/train \
-        --val_b data/activations/.../Deception-InsiderTrading/validation \
+        --train_b data/activations/.../Deception-InsiderTrading-SallyConcat/train \
+        --val_b data/activations/.../Deception-InsiderTrading-SallyConcat/validation \
         --layer 20 --pooling max \
         --output_dir results/lambda_sweep
 """

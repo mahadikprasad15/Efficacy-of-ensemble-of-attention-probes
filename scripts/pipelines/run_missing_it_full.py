@@ -2,7 +2,7 @@
 """
 Detect missing IT-full evaluations and run them via the pairwise matrix pipeline.
 
-Default target: Deception-InsiderTrading-full
+Default target: Deception-InsiderTrading-SallyConcat-full
 Default sources: full-segment row datasets from the matrix spec.
 """
 
@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probes_root", type=str, required=True)
     parser.add_argument("--results_root", type=str, required=True)
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
-    parser.add_argument("--target", type=str, default="Deception-InsiderTrading-full")
+    parser.add_argument("--target", type=str, default="Deception-InsiderTrading-SallyConcat-full")
     parser.add_argument(
         "--sources",
         type=str,

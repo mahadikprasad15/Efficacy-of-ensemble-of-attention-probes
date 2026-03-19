@@ -27,9 +27,9 @@ cd /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes
 ```python
 !python scripts/analysis/analyze_prefix_geometry.py \
     --no_prefix_id_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/train \
-    --no_prefix_ood_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test \
+    --no_prefix_ood_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/test \
     --with_prefix_id_dir /content/drive/MyDrive/data/soft_prefix_activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/train \
-    --with_prefix_ood_dir /content/drive/MyDrive/data/soft_prefix_activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test \
+    --with_prefix_ood_dir /content/drive/MyDrive/data/soft_prefix_activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/test \
     --probes_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/probes/last \
     --probe_type vanilla \
     --pooling last \
@@ -41,9 +41,9 @@ cd /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes
 ```python
 !python scripts/analysis/analyze_prefix_geometry.py \
     --no_prefix_id_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/train \
-    --no_prefix_ood_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test \
+    --no_prefix_ood_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/test \
     --with_prefix_id_dir /content/drive/MyDrive/data/soft_prefix_activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/train \
-    --with_prefix_ood_dir /content/drive/MyDrive/data/soft_prefix_activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test \
+    --with_prefix_ood_dir /content/drive/MyDrive/data/soft_prefix_activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/test \
     --probes_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/probes_layer_agnostic/last \
     --probe_type layer_agnostic \
     --pooling last \
@@ -55,9 +55,9 @@ cd /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes
 ```python
 !python scripts/analysis/analyze_prefix_geometry.py \
     --no_prefix_id_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/train \
-    --no_prefix_ood_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test \
+    --no_prefix_ood_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/test \
     --with_prefix_id_dir /content/drive/MyDrive/data/soft_prefix_activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/train \
-    --with_prefix_ood_dir /content/drive/MyDrive/data/soft_prefix_activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test \
+    --with_prefix_ood_dir /content/drive/MyDrive/data/soft_prefix_activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/test \
     --probes_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/probes_per_token/last \
     --probe_type per_token \
     --pooling last \

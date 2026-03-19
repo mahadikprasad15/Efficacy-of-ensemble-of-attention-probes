@@ -165,7 +165,7 @@ python scripts/eval_ood.py \
 python scripts/eval_ood.py \
     --best_probe_json data/probes/.../mean/best_probe.json \
     --model meta-llama/Llama-3.2-3B-Instruct \
-    --eval_dataset Deception-InsiderTrading \
+    --eval_dataset Deception-InsiderTrading-SallyConcat \
     --eval_split test
 ```
 
@@ -179,7 +179,7 @@ python scripts/eval_ood.py \
 ```
 data/probes/.../mean/
 ├── eval_Deception-Roleplaying_test.json    (NEW - test results)
-├── eval_Deception-InsiderTrading_test.json (NEW - OOD results)
+├── eval_Deception-InsiderTrading-SallyConcat_test.json (NEW - OOD results)
 └── ...
 ```
 

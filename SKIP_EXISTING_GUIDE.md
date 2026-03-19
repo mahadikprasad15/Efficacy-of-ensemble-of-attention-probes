@@ -133,7 +133,7 @@ python scripts/train_deception_probes.py \
 # 3. Cache insider trading activations (WILL RUN - doesn't exist yet)
 python scripts/cache_deception_activations.py \
     --model meta-llama/Llama-3.2-3B-Instruct \
-    --dataset Deception-InsiderTrading \
+    --dataset Deception-InsiderTrading-SallyConcat \
     --split test \
     --output_dir /content/drive/MyDrive/activations/insider_trading
 # Output: Will generate new activations

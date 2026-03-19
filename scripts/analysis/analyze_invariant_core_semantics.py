@@ -443,7 +443,7 @@ def main():
     act_a_dir = os.path.join(args.base_data_dir, 'activations', args.model, 
                              'Deception-Roleplaying', 'validation')
     act_b_dir = os.path.join(args.base_data_dir, 'activations', args.model, 
-                             'Deception-InsiderTrading', 'validation')
+                             'Deception-InsiderTrading-SallyConcat', 'validation')
     
     X_a, y_a, raw_a = None, None, None
     X_b, y_b, raw_b = None, None, None

@@ -45,7 +45,7 @@ DEFAULT_TARGETS = [
     "Deception-InstructedDeception-completion",
     "Deception-Mask-completion",
     "Deception-AILiar-completion",
-    "Deception-InsiderTrading-completion",
+    "Deception-InsiderTrading-SallyConcat-completion",
     "Deception-Roleplaying-completion",
 ]
 

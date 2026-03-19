@@ -26,11 +26,11 @@ This guide explains how to train and evaluate probes using the Apollo Research p
 
 # Train on InsiderTrading (flipped)
 !python scripts/training/train_per_token_probes.py \
-    --train_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/train \
-    --val_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
+    --train_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/train \
+    --val_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
     --output_dir data/probes_per_token_flipped \
     --model meta-llama_Llama-3.2-3B-Instruct \
-    --dataset Deception-InsiderTrading
+    --dataset Deception-InsiderTrading-SallyConcat
 ```
 
 ---
@@ -42,8 +42,8 @@ This guide explains how to train and evaluate probes using the Apollo Research p
 !python scripts/training/train_combined_per_token_probes.py \
     --train_a data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/train \
     --val_a data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
-    --train_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/train \
-    --val_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
+    --train_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/train \
+    --val_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
     --output_dir data/probes_combined_per_token \
     --model meta-llama_Llama-3.2-3B-Instruct \
     --label_a Roleplaying \
@@ -62,7 +62,7 @@ This guide explains how to train and evaluate probes using the Apollo Research p
 # Runs all 4 aggregations (mean/max/last/vote) by default
 !python scripts/evaluation/eval_per_token_probes.py \
     --probes_dir data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying \
-    --ood_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
+    --ood_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
     --output_dir results/per_token_ood
 ```
 
@@ -74,10 +74,10 @@ This guide explains how to train and evaluate probes using the Apollo Research p
 # Is there a domain-invariant deception direction?
 !python scripts/analysis/analyze_invariant_core_per_token_probes.py \
     --probes_a data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying \
-    --probes_b data/probes_per_token_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading \
+    --probes_b data/probes_per_token_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat \
     --probes_combined data/probes_combined_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Combined \
     --val_a data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
-    --val_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
+    --val_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
     --layer 20 \
     --label_a Roleplaying \
     --label_b InsiderTrading \

@@ -166,7 +166,7 @@ def main() -> int:
     parser.add_argument("--invariant_probes_dir", required=True, help="Invariant probes dir")
     parser.add_argument("--combined_probes_dir", required=True, help="Combined probes dir (for norm stats)")
     parser.add_argument("--domain_a", default="Deception-Roleplaying")
-    parser.add_argument("--domain_b", default="Deception-InsiderTrading")
+    parser.add_argument("--domain_b", default="Deception-InsiderTrading-SallyConcat")
     parser.add_argument("--pooling", default="mean")
     parser.add_argument("--splits", default="validation,test")
     parser.add_argument("--top_k", type=int, default=3)

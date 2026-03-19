@@ -12,7 +12,7 @@ Usage:
         --model meta-llama/Llama-3.2-3B-Instruct \
         --suffix_condition suffix_deception_yesno \
         --dataset_a Deception-Roleplaying \
-        --dataset_b Deception-InsiderTrading \
+        --dataset_b Deception-InsiderTrading-SallyConcat \
         --activations_dir data/prompted_activations \
         --limit_a 100 \
         --limit_b 100
@@ -248,7 +248,7 @@ def main():
     parser.add_argument("--dataset_a", type=str, required=True,
                         help="First dataset name (e.g., Deception-Roleplaying)")
     parser.add_argument("--dataset_b", type=str, required=True,
-                        help="Second dataset name (e.g., Deception-InsiderTrading)")
+                        help="Second dataset name (e.g., Deception-InsiderTrading-SallyConcat)")
     parser.add_argument("--activations_dir", type=str, default="data/prompted_activations",
                         help="Base directory for prompted activations")
     parser.add_argument("--train_split", type=str, default="train",

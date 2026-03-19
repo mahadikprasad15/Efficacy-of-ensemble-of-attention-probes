@@ -240,7 +240,7 @@ def main() -> int:
     parser.add_argument("--probes_a_dir", required=True, help="Domain A probes dir (mean pooling)")
     parser.add_argument("--probes_b_dir", required=True, help="Domain B probes dir (mean pooling)")
     parser.add_argument("--domain_a", default="Deception-Roleplaying")
-    parser.add_argument("--domain_b", default="Deception-InsiderTrading")
+    parser.add_argument("--domain_b", default="Deception-InsiderTrading-SallyConcat")
     parser.add_argument("--pooling", default="mean",
                         help="Comma-separated list of pooling modes: mean,max,topk")
     parser.add_argument("--pooling_k", type=int, default=5, help="k for top-k pooling")

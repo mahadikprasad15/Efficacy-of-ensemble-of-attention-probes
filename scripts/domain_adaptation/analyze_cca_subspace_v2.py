@@ -11,8 +11,8 @@ Usage:
     python scripts/analyze_cca_subspace_v2.py \
         --train_a data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/train \
         --test_a data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
-        --train_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/train \
-        --test_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
+        --train_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/train \
+        --test_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
         --label_a "Roleplaying" \
         --label_b "InsiderTrading" \
         --layer 20 \

@@ -68,7 +68,7 @@ DEFAULT_DIRECTION_SOURCES = [
     "Deception-AILiar",
 ]
 DEFAULT_TARGET_DATASETS = [
-    "Deception-InsiderTrading",
+    "Deception-InsiderTrading-SallyConcat",
     "Deception-Roleplaying",
 ]
 SHORT_LABELS = {
@@ -77,7 +77,7 @@ SHORT_LABELS = {
     "Deception-InstructedDeception": "ID",
     "Deception-Mask": "Mask",
     "Deception-AILiar": "AL",
-    "Deception-InsiderTrading_self": "IT-self",
+    "Deception-InsiderTrading-SallyConcat_self": "IT-self",
     "Deception-Roleplaying_self": "RP-self",
     "completion_all6": "all6",
     "completion_id_mask": "id_mask",

@@ -34,7 +34,7 @@ def test_stage_spec_supports_custom_completion_datasets() -> None:
         "Deception-Roleplaying-completion",
         "Deception-InsiderTrading-SallyConcat-completion",
     ]
-    assert "Deception-InsiderTrading-full" in cols["full"]
+    assert "Deception-InsiderTrading-SallyConcat-full" in cols["full"]
 
 
 def test_short_name_maps_sally_insider_trading() -> None:

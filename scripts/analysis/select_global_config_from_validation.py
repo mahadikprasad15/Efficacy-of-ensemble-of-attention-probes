@@ -165,7 +165,7 @@ def stage_spec() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
             "Deception-InstructedDeception-completion",
             "Deception-Mask-completion",
             "Deception-AILiar-completion",
-            "Deception-InsiderTrading-completion",
+            "Deception-InsiderTrading-SallyConcat-completion",
             "Deception-Roleplaying-completion",
         ],
         "full": [
@@ -174,7 +174,7 @@ def stage_spec() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
             "Deception-InstructedDeception-full",
             "Deception-Mask-full",
             "Deception-AILiar-full",
-            "Deception-InsiderTrading-full",
+            "Deception-InsiderTrading-SallyConcat-full",
             "Deception-Roleplaying-full",
         ],
     }
@@ -196,7 +196,7 @@ def base_label_map() -> Dict[str, str]:
         "Deception-InstructedDeception": "InstructedDeception",
         "Deception-Mask": "Mask",
         "Deception-AILiar": "AILiar",
-        "Deception-InsiderTrading": "IT",
+        "Deception-InsiderTrading-SallyConcat": "IT",
         "Deception-Roleplaying": "Roleplaying",
     }
 

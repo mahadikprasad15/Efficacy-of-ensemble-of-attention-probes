@@ -15,8 +15,8 @@ Usage:
     python scripts/comprehensive_domain_experiment.py \
         --train_a data/activations/.../Deception-Roleplaying/train \
         --val_a data/activations/.../Deception-Roleplaying/validation \
-        --train_b data/activations/.../Deception-InsiderTrading/train \
-        --val_b data/activations/.../Deception-InsiderTrading/validation \
+        --train_b data/activations/.../Deception-InsiderTrading-SallyConcat/train \
+        --val_b data/activations/.../Deception-InsiderTrading-SallyConcat/validation \
         --layer 20 --pooling max \
         --output_dir results/comprehensive_comparison
 """

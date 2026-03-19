@@ -6,8 +6,8 @@ Example:
   python scripts/data/alias_activation_dataset.py \
     --activations_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations_fullprompt \
     --model meta-llama/Llama-3.2-1B-Instruct \
-    --src_dataset Deception-InsiderTrading \
-    --dst_dataset Deception-InsiderTrading-full
+    --src_dataset Deception-InsiderTrading-SallyConcat \
+    --dst_dataset Deception-InsiderTrading-SallyConcat-full
 """
 
 from __future__ import annotations

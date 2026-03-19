@@ -23,7 +23,7 @@ This gives us a cloud of directions per domain. We then:
 Usage:
     python scripts/analysis/analyze_effective_directions.py \
         --act_a /path/to/Deception-Roleplaying/validation \
-        --act_b /path/to/Deception-InsiderTrading/validation \
+        --act_b /path/to/Deception-InsiderTrading-SallyConcat/validation \
         --probe_a /path/to/probe_a.pt \
         --probe_b /path/to/probe_b.pt \
         --probe_combined /path/to/probe_combined.pt \

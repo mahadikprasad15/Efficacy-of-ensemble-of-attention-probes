@@ -17,7 +17,7 @@ Computes:
 Usage:
     python scripts/analysis/analyze_per_token_directions.py \
         --probe_a data/probes_per_token/.../Deception-Roleplaying/probe_layer_20.pt \
-        --probe_b data/probes_per_token_flipped/.../Deception-InsiderTrading/probe_layer_20.pt \
+        --probe_b data/probes_per_token_flipped/.../Deception-InsiderTrading-SallyConcat/probe_layer_20.pt \
         --probe_combined data/probes_combined_per_token/.../Deception-Combined/probe_layer_20.pt \
         --output_dir results/per_token_direction_analysis
 """

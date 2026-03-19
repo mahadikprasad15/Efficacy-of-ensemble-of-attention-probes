@@ -10,14 +10,14 @@ Usage:
     python scripts/eval_ood.py \
         --best_probe_json data/probes/.../mean/best_probe.json \
         --model meta-llama/Llama-3.2-3B-Instruct \
-        --eval_dataset Deception-InsiderTrading \
+        --eval_dataset Deception-InsiderTrading-SallyConcat \
         --eval_split test
 
     # Prompted-probing evaluation
     python scripts/eval_ood.py \
         --best_probe_json data/probes/.../suffix_deception_yesno/.../none/best_probe.json \
         --model meta-llama/Llama-3.2-3B-Instruct \
-        --eval_dataset Deception-InsiderTrading \
+        --eval_dataset Deception-InsiderTrading-SallyConcat \
         --suffix_condition suffix_deception_yesno \
         --activations_dir data/prompted_activations \
         --eval_split validation

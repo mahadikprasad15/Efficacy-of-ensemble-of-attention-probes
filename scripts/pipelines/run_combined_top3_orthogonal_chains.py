@@ -271,7 +271,7 @@ def main() -> int:
     parser.add_argument("--stage_a_probe_dir", type=str, default="")
 
     parser.add_argument("--train_datasets", type=str, default=",".join(DEFAULT_TRAIN_DATASETS))
-    parser.add_argument("--test_only_datasets", type=str, default="Deception-InsiderTrading")
+    parser.add_argument("--test_only_datasets", type=str, default="Deception-InsiderTrading-SallyConcat")
 
     parser.add_argument("--orth_train_split", type=str, default="train")
     parser.add_argument("--orth_val_split", type=str, default="validation")

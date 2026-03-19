@@ -17,10 +17,10 @@ This script:
 Usage:
     python scripts/analysis/analyze_invariant_core_per_token_probes.py \
         --probes_a data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying \
-        --probes_b data/probes_per_token_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading \
+        --probes_b data/probes_per_token_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat \
         --probes_combined data/probes_combined_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Combined \
         --val_a data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
-        --val_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
+        --val_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
         --layer 20 \
         --output_dir results/invariant_core_per_token
 """
