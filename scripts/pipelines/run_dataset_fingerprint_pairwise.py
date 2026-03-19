@@ -309,6 +309,26 @@ def run_subprocess(cmd: List[str], logger: logging.Logger) -> None:
         raise RuntimeError(f"Command failed with exit code {proc.returncode}: {' '.join(cmd)}")
 
 
+def copy_tree_subset(src_root: Path, dst_root: Path, subdirs: Sequence[str]) -> None:
+    dst_root.mkdir(parents=True, exist_ok=True)
+    for subdir in subdirs:
+        src = src_root / subdir
+        if not src.exists():
+            continue
+        dst = dst_root / subdir
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+
+
+def default_pairwise_pipeline_mirror_root(model_dir: str) -> Path:
+    return Path("results") / "ood_evaluation" / model_dir / "All_dataset_pairwise_results"
+
+
+def default_wrapper_mirror_root(model_dir: str) -> Path:
+    return Path("results") / "ood_evaluation" / model_dir / "dataset_fingerprint_pairwise"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run dataset-fingerprint residualized pairwise evaluation.")
     parser.add_argument("--model", type=str, required=True)
@@ -333,6 +353,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--insider_probe_train_cap", type=int, default=500)
     parser.add_argument("--insider_probe_seed", type=int, default=42)
     parser.add_argument("--pairwise_run_id", type=str, default=None)
+    parser.add_argument("--mirror_results_root", type=str, default=None)
+    parser.add_argument("--pairwise_pipeline_results_root", type=str, default=None)
     return parser.parse_args()
 
 
@@ -351,6 +373,17 @@ def main() -> int:
     model_dir = args.model.replace("/", "_")
     run_id = args.run_id or utc_run_id()
     pairwise_run_id = args.pairwise_run_id or run_id
+    mirror_results_root = (
+        Path(args.mirror_results_root)
+        if args.mirror_results_root
+        else default_wrapper_mirror_root(model_dir)
+    )
+    pairwise_pipeline_results_root = (
+        Path(args.pairwise_pipeline_results_root)
+        if args.pairwise_pipeline_results_root
+        else default_pairwise_pipeline_mirror_root(model_dir)
+    )
+    mirrored_run_root = mirror_results_root / run_id
 
     run_root = (
         Path(args.artifact_root)
@@ -403,6 +436,9 @@ def main() -> int:
                 "residualized_root": str(results_dir / "residualized_activations"),
                 "probes_root": str(results_dir / "probes"),
                 "pairwise_results_root": str(results_dir / "pairwise_matrix"),
+                "pairwise_pipeline_results_root": str(pairwise_pipeline_results_root),
+                "mirror_results_root": str(mirror_results_root),
+                "mirrored_run_root": str(mirrored_run_root),
             },
             "config": {
                 "layer": int(args.layer),
@@ -435,6 +471,16 @@ def main() -> int:
     fingerprint_metrics_path = fingerprint_dir / "fingerprint_metrics.json"
     fingerprint_index_path = fingerprint_dir / "fingerprint_sample_index.json"
     residualization_manifest_path = results_dir / "residualization_manifest.jsonl"
+    pairwise_summary_path = pairwise_pipeline_results_root / pairwise_run_id / "results" / "summary.json"
+    pairwise_internal_summary_path = (
+        pairwise_artifact_root / "runs" / "pairwise_eval_matrix" / model_dir / pairwise_run_id / "results" / "summary.json"
+    )
+    pairwise_matrix_auc_path = pairwise_pipeline_results_root / pairwise_run_id / "results" / "matrix_completion_auc.csv"
+    pairwise_matrix_accuracy_path = pairwise_pipeline_results_root / pairwise_run_id / "results" / "matrix_completion_accuracy.csv"
+    pairwise_matrix_f1_path = pairwise_pipeline_results_root / pairwise_run_id / "results" / "matrix_completion_f1.csv"
+    pairwise_matrix_long_path = pairwise_pipeline_results_root / pairwise_run_id / "results" / "matrix_completion.csv"
+    plot_index_path = results_dir / "plot_index.json"
+    plot_idx_path = results_dir / "plot_idx.json"
 
     try:
         if args.resume and fingerprint_basis_path.exists() and fingerprint_metrics_path.exists():
@@ -570,7 +616,6 @@ def main() -> int:
             progress["completed_steps"] = sorted(set(progress.get("completed_steps", [])) | {"train_residualized_probes"})
             write_json(progress_path, progress)
 
-        pairwise_summary_path = pairwise_results_root / pairwise_run_id / "results" / "summary.json"
         if args.resume and progress.get("pairwise_completed") and pairwise_summary_path.exists():
             logger.info("Resume: skipping pairwise matrix stage; summary exists at %s", pairwise_summary_path)
         else:
@@ -584,7 +629,7 @@ def main() -> int:
                 "--results_root",
                 str(pairwise_results_root),
                 "--pipeline_results_root",
-                str(pairwise_results_root),
+                str(pairwise_pipeline_results_root),
                 "--artifact_root",
                 str(pairwise_artifact_root),
                 "--model",
@@ -609,6 +654,32 @@ def main() -> int:
             progress["completed_steps"] = sorted(set(progress.get("completed_steps", [])) | {"pairwise_eval"})
             write_json(progress_path, progress)
 
+        plot_index = {
+            "run_id": run_id,
+            "pairwise_run_id": pairwise_run_id,
+            "model": args.model,
+            "model_dir": model_dir,
+            "variant": DEFAULT_VARIANT,
+            "probe_set": DEFAULT_PROBE_SET,
+            "model_variant": DEFAULT_MODEL_VARIANT,
+            "canonical_run_root": str(run_root),
+            "mirrored_run_root": str(mirrored_run_root),
+            "pairwise_pipeline_results_root": str(pairwise_pipeline_results_root),
+            "pairwise_summary_json": str(pairwise_summary_path),
+            "pairwise_internal_summary_json": str(pairwise_internal_summary_path),
+            "matrix_completion_csv": str(pairwise_matrix_long_path),
+            "matrix_completion_auc_csv": str(pairwise_matrix_auc_path),
+            "matrix_completion_accuracy_csv": str(pairwise_matrix_accuracy_path),
+            "matrix_completion_f1_csv": str(pairwise_matrix_f1_path),
+            "fingerprint_basis_npz": str(fingerprint_basis_path),
+            "fingerprint_metrics_json": str(fingerprint_metrics_path),
+            "fingerprint_sample_index_json": str(fingerprint_index_path),
+            "wrapper_results_json": str(results_dir / "results.json"),
+            "insider_subset_json": str(insider_subset_path),
+        }
+        write_json(plot_index_path, plot_index)
+        write_json(plot_idx_path, plot_index)
+
         final_summary = {
             "run_id": run_id,
             "completed_at": utc_now(),
@@ -623,11 +694,23 @@ def main() -> int:
             "probes_root": str(probes_root / model_dir),
             "insider_subset_path": str(insider_subset_path),
             "pairwise_summary_path": str(pairwise_summary_path),
+            "pairwise_internal_summary_path": str(pairwise_internal_summary_path),
+            "pairwise_pipeline_results_root": str(pairwise_pipeline_results_root),
+            "pairwise_matrix_completion_path": str(pairwise_matrix_long_path),
+            "pairwise_matrix_completion_auc_path": str(pairwise_matrix_auc_path),
+            "pairwise_matrix_completion_accuracy_path": str(pairwise_matrix_accuracy_path),
+            "pairwise_matrix_completion_f1_path": str(pairwise_matrix_f1_path),
+            "mirror_results_root": str(mirror_results_root),
+            "mirrored_run_root": str(mirrored_run_root),
+            "plot_index_path": str(plot_index_path),
+            "plot_idx_path": str(plot_idx_path),
             "progress": progress,
         }
         write_json(results_dir / "results.json", final_summary)
         update_status(status_path, "completed", "finished")
+        copy_tree_subset(run_root, mirrored_run_root, ["meta", "checkpoints", "results", "logs"])
         logger.info("Run complete. Summary written to %s", results_dir / "results.json")
+        logger.info("Mirrored wrapper results to %s", mirrored_run_root)
         return 0
     except Exception as exc:
         update_status(status_path, "failed", str(exc))
