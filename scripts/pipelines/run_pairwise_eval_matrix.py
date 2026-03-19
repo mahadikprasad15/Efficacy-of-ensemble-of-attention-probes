@@ -142,6 +142,19 @@ def split_root_and_model(root: Path, model_dir: str) -> Tuple[Path, Path]:
     return root.parent, root
 
 
+def resolve_output_root_and_model(root: Path, model_dir: str) -> Tuple[Path, Path]:
+    """
+    Resolve an output root without relying on pre-existing directories.
+
+    For new runs we want canonical writes under <root>/<model_dir> whenever the
+    caller passes the parent directory, even if that model-specific directory
+    does not exist yet.
+    """
+    if root.name == model_dir:
+        return root.parent, root
+    return root, root / model_dir
+
+
 def dataset_base(dataset_name: str) -> str:
     if dataset_name.endswith("-completion"):
         return dataset_name[: -len("-completion")]
@@ -169,6 +182,7 @@ def short_name(dataset_name: str) -> str:
         "Mask": "M",
         "AILiar": "AL",
         "InsiderTrading": "IT",
+        "InsiderTrading-SallyConcat": "ITS",
         "Roleplaying": "RP",
     }
     return f"{m.get(base, base)}-{'c' if seg == 'completion' else 'f'}"
@@ -609,6 +623,12 @@ def write_csv_rows(path: Path, rows: List[Dict[str, Any]], fieldnames: Sequence[
             writer.writerow(row)
 
 
+def parse_dataset_csv(value: Optional[str]) -> Optional[List[str]]:
+    if value is None:
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run pairwise probe train/eval matrix pipeline.")
     parser.add_argument("--activations_root", type=str, required=True)
@@ -665,6 +685,30 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Comma-separated list of segments to evaluate (completion,full).",
     )
+    parser.add_argument(
+        "--completion_rows",
+        type=str,
+        default=None,
+        help="Optional comma-separated override for completion row datasets.",
+    )
+    parser.add_argument(
+        "--completion_cols",
+        type=str,
+        default=None,
+        help="Optional comma-separated override for completion column datasets.",
+    )
+    parser.add_argument(
+        "--full_rows",
+        type=str,
+        default=None,
+        help="Optional comma-separated override for full row datasets.",
+    )
+    parser.add_argument(
+        "--full_cols",
+        type=str,
+        default=None,
+        help="Optional comma-separated override for full column datasets.",
+    )
     parser.add_argument("--artifact_root", type=str, default="artifacts")
     parser.add_argument(
         "--pipeline_results_root",
@@ -680,7 +724,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def stage_spec() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+def stage_spec(args: argparse.Namespace) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     rows = {
         "completion": [
             "Deception-ConvincingGame-completion",
@@ -719,12 +763,24 @@ def stage_spec() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
             "Deception-Roleplaying-full",
         ],
     }
+    completion_rows_override = parse_dataset_csv(args.completion_rows)
+    completion_cols_override = parse_dataset_csv(args.completion_cols)
+    full_rows_override = parse_dataset_csv(args.full_rows)
+    full_cols_override = parse_dataset_csv(args.full_cols)
+    if completion_rows_override is not None:
+        rows["completion"] = completion_rows_override
+    if completion_cols_override is not None:
+        cols["completion"] = completion_cols_override
+    if full_rows_override is not None:
+        rows["full"] = full_rows_override
+    if full_cols_override is not None:
+        cols["full"] = full_cols_override
     return rows, cols
 
 
 def build_expected_pairs(rows: Dict[str, List[str]], cols: Dict[str, List[str]]) -> List[PairJob]:
     jobs: List[PairJob] = []
-    for seg in ["completion", "full"]:
+    for seg in [seg for seg in ["completion", "full"] if seg in rows or seg in cols]:
         for src in rows.get(seg, []):
             for tgt in cols.get(seg, []):
                 if src == tgt:
@@ -766,7 +822,7 @@ def main() -> int:
     # Resolve roots (supports passing either .../<model_dir> or its parent)
     acts_base, acts_model_root = split_root_and_model(Path(args.activations_root), model_dir)
     probes_base, probes_model_root = split_root_and_model(Path(args.probes_root), model_dir)
-    results_base, results_model_root = split_root_and_model(Path(args.results_root), model_dir)
+    results_base, results_model_root = resolve_output_root_and_model(Path(args.results_root), model_dir)
     results_model_root.mkdir(parents=True, exist_ok=True)
 
     # Canonical run artifacts
@@ -855,10 +911,11 @@ def main() -> int:
         progress["updated_at"] = utc_now()
         write_json(progress_path, progress)
 
-    rows_map, cols_map = stage_spec()
+    rows_map, cols_map = stage_spec(args)
     pair_jobs = build_expected_pairs(rows_map, cols_map)
     eval_jobs = [j for j in pair_jobs if j.action == "eval_run"]
     collect_jobs: List[PairJob] = []
+    configured_segments = [seg for seg in ["completion", "full"] if rows_map.get(seg) and cols_map.get(seg)]
     if only_segments:
         eval_jobs = [j for j in eval_jobs if j.segment in only_segments]
     if only_sources:
@@ -866,9 +923,11 @@ def main() -> int:
     if only_targets:
         eval_jobs = [j for j in eval_jobs if j.target_dataset in only_targets]
 
-    active_segments = ["completion", "full"]
+    active_segments = list(configured_segments)
     if only_segments:
         active_segments = [seg for seg in active_segments if seg in only_segments]
+    if not active_segments:
+        raise ValueError("No active segments remain after applying dataset and segment filters.")
 
     train_sources: List[str] = []
     for seg in active_segments:
@@ -1259,28 +1318,31 @@ def main() -> int:
                 f1_wide[short_name(r)][col_name] = m["f1"]
         return long_rows, auc_wide, acc_wide, f1_wide
 
-    comp_long, comp_auc, comp_acc, comp_f1 = build_matrix("completion")
-    full_long, full_auc, full_acc, full_f1 = build_matrix("full")
-
-    write_csv_rows(
-        out_dir / "matrix_completion.csv",
-        comp_long,
-        ["segment", "row_dataset", "col_dataset", "row_short", "col_short", "auc", "accuracy", "f1", "status", "pooling", "layer", "source"],
-    )
-    write_csv_rows(
-        out_dir / "matrix_full.csv",
-        full_long,
-        ["segment", "row_dataset", "col_dataset", "row_short", "col_short", "auc", "accuracy", "f1", "status", "pooling", "layer", "source"],
-    )
-    write_csv_rows(out_dir / "matrix_completion_auc.csv", list(comp_auc.values()), list(list(comp_auc.values())[0].keys()))
-    write_csv_rows(out_dir / "matrix_completion_accuracy.csv", list(comp_acc.values()), list(list(comp_acc.values())[0].keys()))
-    write_csv_rows(out_dir / "matrix_completion_f1.csv", list(comp_f1.values()), list(list(comp_f1.values())[0].keys()))
-    write_csv_rows(out_dir / "matrix_full_auc.csv", list(full_auc.values()), list(list(full_auc.values())[0].keys()))
-    write_csv_rows(out_dir / "matrix_full_accuracy.csv", list(full_acc.values()), list(list(full_acc.values())[0].keys()))
-    write_csv_rows(out_dir / "matrix_full_f1.csv", list(full_f1.values()), list(list(full_f1.values())[0].keys()))
-
-    write_json(out_dir / "matrix_completion.json", {"segment": "completion", "cells": comp_long})
-    write_json(out_dir / "matrix_full.json", {"segment": "full", "cells": full_long})
+    segment_cells: Dict[str, List[Dict[str, Any]]] = {}
+    for segment in active_segments:
+        seg_long, seg_auc, seg_acc, seg_f1 = build_matrix(segment)
+        segment_cells[segment] = seg_long
+        write_csv_rows(
+            out_dir / f"matrix_{segment}.csv",
+            seg_long,
+            ["segment", "row_dataset", "col_dataset", "row_short", "col_short", "auc", "accuracy", "f1", "status", "pooling", "layer", "source"],
+        )
+        write_csv_rows(
+            out_dir / f"matrix_{segment}_auc.csv",
+            list(seg_auc.values()),
+            list(list(seg_auc.values())[0].keys()),
+        )
+        write_csv_rows(
+            out_dir / f"matrix_{segment}_accuracy.csv",
+            list(seg_acc.values()),
+            list(list(seg_acc.values())[0].keys()),
+        )
+        write_csv_rows(
+            out_dir / f"matrix_{segment}_f1.csv",
+            list(seg_f1.values()),
+            list(list(seg_f1.values())[0].keys()),
+        )
+        write_json(out_dir / f"matrix_{segment}.json", {"segment": segment, "cells": seg_long})
 
     missing_table_rows: List[Dict[str, Any]] = []
     for mr in missing_rows:
@@ -1297,6 +1359,7 @@ def main() -> int:
         "run_id": run_id,
         "completed_at": utc_now(),
         "model": args.model,
+        "active_segments": active_segments,
         "counts": {
             "train_jobs_total": len(train_jobs),
             "train_jobs_completed": len(set(progress["completed_train_jobs"])),
@@ -1312,12 +1375,13 @@ def main() -> int:
             "run_root": str(run_root),
             "external_run_root": str(external_run_root),
             "results_model_root": str(results_model_root),
-            "matrix_completion_csv": str(out_dir / "matrix_completion.csv"),
-            "matrix_full_csv": str(out_dir / "matrix_full.csv"),
             "pairs_expected_csv": str(out_dir / "pairs_expected.csv"),
             "pairs_missing_csv": str(out_dir / "pairs_missing.csv"),
         },
     }
+    for segment in active_segments:
+        summary["outputs"][f"matrix_{segment}_csv"] = str(out_dir / f"matrix_{segment}.csv")
+        summary["counts"][f"{segment}_cells"] = len(segment_cells.get(segment, []))
     write_json(out_dir / "summary.json", summary)
     mirror_pipeline_outputs()
     mark_step("stage5_aggregate")
