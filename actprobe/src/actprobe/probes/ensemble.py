@@ -5,8 +5,7 @@ Combines predictions from multiple layers.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import List, Optional
+from typing import Optional
 
 class BaseEnsemble(nn.Module):
     def forward(self, layer_outputs: torch.Tensor) -> torch.Tensor:
@@ -73,3 +72,67 @@ class GatedEnsemble(BaseEnsemble):
         # Weighted sum of logits: (B, L, 1) * (B, L, 1) -> sum
         logits = (layer_logits * weights.unsqueeze(-1)).sum(dim=1)
         return logits
+
+
+def mean_entropy(weights: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Return the mean categorical entropy across a batch of normalized weights."""
+    clipped = torch.clamp(weights, min=eps)
+    return -(clipped * torch.log(clipped)).sum(dim=-1).mean()
+
+
+class ProbeLogitGatedEnsemble(nn.Module):
+    """
+    Input-dependent gate over a frozen bank of expert logits.
+
+    The default v1 setup uses the same normalized expert-logit vector both as
+    the gating feature input and as the values being combined.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
+        temperature: float = 1.0,
+    ):
+        super().__init__()
+        if num_experts <= 0:
+            raise ValueError("num_experts must be positive")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+
+        self.num_experts = int(num_experts)
+        self.hidden_dim = int(hidden_dim)
+        self.dropout = float(dropout)
+        self.temperature = float(temperature)
+        self.gate_net = nn.Sequential(
+            nn.Linear(self.num_experts, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, self.num_experts),
+        )
+
+    def gate_scores(self, expert_features: torch.Tensor) -> torch.Tensor:
+        return self.gate_net(expert_features)
+
+    def gate_weights(self, expert_features: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(self.gate_scores(expert_features) / self.temperature, dim=-1)
+
+    def forward(
+        self,
+        expert_logits: torch.Tensor,
+        expert_features: Optional[torch.Tensor] = None,
+        return_weights: bool = False,
+    ):
+        if expert_logits.dim() != 2:
+            raise ValueError(f"expert_logits must have shape (B, E), got {tuple(expert_logits.shape)}")
+        features = expert_logits if expert_features is None else expert_features
+        if features.shape != expert_logits.shape:
+            raise ValueError(
+                f"expert_features must match expert_logits shape; got {tuple(features.shape)} vs {tuple(expert_logits.shape)}"
+            )
+        weights = self.gate_weights(features)
+        final_logits = (weights * expert_logits).sum(dim=-1, keepdim=True)
+        if return_weights:
+            return final_logits, weights
+        return final_logits
