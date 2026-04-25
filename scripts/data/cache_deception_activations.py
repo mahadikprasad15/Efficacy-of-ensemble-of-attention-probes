@@ -602,7 +602,9 @@ def main():
 
     logger.info(f"[1/6] Loading {args.dataset} ({args.split})...")
     DSClass = DATASET_MAP[args.dataset]
-    if args.dataset_file:
+    if args.dataset_file and args.dataset == "Deception-AILiar" and os.path.basename(args.dataset_file) == "paired_examples.jsonl":
+        ds = DSClass(split=args.split, limit=args.limit, paired_examples_file=args.dataset_file)
+    elif args.dataset_file:
         try:
             ds = DSClass(split=args.split, limit=args.limit, data_file=args.dataset_file)
         except TypeError:
