@@ -1067,6 +1067,50 @@ class DeceptionInstructedDeceptionDataset(DeceptionTypedMessagesDataset):
         )
 
 
+class DeceptionConvincingGameDataset(DeceptionTypedMessagesDataset):
+    """
+    ConvincingGame typed-message dataset wrapper.
+    """
+
+    def __init__(
+        self,
+        split: str = "train",
+        limit: Optional[int] = None,
+        data_file: str = "data/apollo_raw/convincing-game/convincing-game__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
+        random_seed: int = 42,
+    ):
+        super().__init__(
+            split=split,
+            limit=limit,
+            data_file=data_file,
+            random_seed=random_seed,
+            dataset_name="Deception-ConvincingGame",
+            id_prefix="convincing_game",
+        )
+
+
+class DeceptionHarmPressureChoiceDataset(DeceptionTypedMessagesDataset):
+    """
+    HarmPressureChoice typed-message dataset wrapper.
+    """
+
+    def __init__(
+        self,
+        split: str = "train",
+        limit: Optional[int] = None,
+        data_file: str = "data/apollo_raw/harm-pressure-choice/harm-pressure-choice__gemma_2_9b_it__deception_typed__messages_clean.jsonl",
+        random_seed: int = 42,
+    ):
+        super().__init__(
+            split=split,
+            limit=limit,
+            data_file=data_file,
+            random_seed=random_seed,
+            dataset_name="Deception-HarmPressureChoice",
+            id_prefix="harm_pressure_choice",
+        )
+
+
 class DeceptionClaimsDefinitionalDataset(DeceptionTypedMessagesDataset):
     def __init__(
         self,
