@@ -1,235 +1,208 @@
 # Efficacy of Ensemble of Attention Probes
 
-**Do attention-based pooling and layer ensembling improve probe generalization for deception detection?**
+Research code for studying whether pooling strategy, layer selection, and ensemble design improve the transfer of activation probes for deception detection.
 
-This project investigates whether learned pooling strategies (mean, max, last, **attention**) combined with layer ensembling (static, weighted, **gated**) can create robust probes that generalize from in-distribution to out-of-distribution scenarios.
+The project compares single-layer probes, attention-pooled probes, source-to-target transfer matrices, and gated ensembles across in-distribution and out-of-distribution deception datasets. It is built around cached transformer activations so expensive model passes can be reused across training, evaluation, and analysis runs.
 
-## Experimental Setup
+## What This Repository Supports
 
-### Datasets
+- caching hidden-state activations for deception datasets,
+- training per-layer probes with mean, max, last-token, attention, and no-pooling variants,
+- evaluating probes on held-out and out-of-distribution datasets,
+- running pairwise source-to-target probe transfer matrices,
+- training and evaluating static, weighted, and gated layer ensembles,
+- comparing pooling and ensemble strategies across datasets,
+- analyzing probe geometry, learned attention, gating behavior, and residual directions,
+- preparing plots and summary artifacts for experiment reports.
 
-| Dataset | Type | Source | Use |
-|---------|------|--------|-----|
-| **Deception-Roleplaying** | AI roleplaying deceptive characters | Custom | In-distribution (train/val) |
-| **Deception-InsiderTrading-SallyConcat** | AI hiding insider trading decisions | Apollo Research | Out-of-distribution (test) |
+Most long-running workflows support resume or skip-existing behavior. New experiment outputs should be kept under `artifacts/`, `results/`, or the configured Drive-backed roots rather than mixed into source directories.
 
-### Model
-- **Llama-3.2-3B-Instruct** (meta-llama)
-- 28 transformer layers for probing
+## Project Structure
 
-### Labeling
-- **Cerebras API** (Llama-3.1-8B) for automated deception classification
-- Labels: `honest` (0) vs `deceptive` (1)
+```text
+actprobe/src/actprobe/
+  datasets/       dataset loaders and typed deception examples
+  llm/            generation and activation extraction utilities
+  probes/         layer probes, pooling modules, and ensemble models
+  evaluation/     answer extraction and scoring helpers
+  features/       feature transforms such as dataset fingerprints and PCA projections
+scripts/
+  data/           dataset preparation and activation caching
+  training/       probe and ensemble training entrypoints
+  evaluation/     OOD, matrix, and ablation evaluators
+  pipelines/      resumable multi-stage experiment wrappers
+  analysis/       geometry, attribution, PCA, residual, and plotting analyses
+  comparison/     cross-run and cross-pooling comparison utilities
+  visualization/  figure-generation helpers
+  activation_oracle/ activation-oracle preparation and execution
+configs/          JSON configs for structured experiment families
+docs/             Colab workflows and experiment runbooks
+tests/            unit and integration tests
+```
 
----
+## Installation
 
-## Pipeline Overview
-
-### Phase 1: Activation Caching
-Extract hidden states from Llama-3.2-3B while processing deceptive/honest scenarios.
+Create an environment and install dependencies:
 
 ```bash
-python scripts/cache_deception_activations.py \
-    --model meta-llama/Llama-3.2-3B-Instruct \
-    --dataset Deception-Roleplaying \
-    --split train \
-    --limit 500 \
-    --batch_size 4 \
-    --hf_token $HF_TOKEN \
-    --cerebras_key $CEREBRAS_API_KEY
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-**Output**: `data/activations/{model}/{dataset}/{split}/shard_*.safetensors`
-
----
-
-### Phase 2: Probe Training (4 Pooling Strategies)
-
-Train per-layer probes with different token pooling methods.
+Expose the local package:
 
 ```bash
-python scripts/train_probes_all_pooling.py \
-    --model meta-llama/Llama-3.2-3B-Instruct \
-    --dataset Deception-Roleplaying \
-    --output_dir data/probes
+export PYTHONPATH=actprobe/src
 ```
 
-**Pooling strategies:**
-| Strategy | Description |
-|----------|-------------|
-| `mean` | Average all token representations |
-| `max` | Max-pool across tokens |
-| `last` | Use final token only |
-| `attn` | **Learned attention** over tokens (query vector) |
-
-**Output**: `data/probes/{model}/{dataset}/{pooling}/probe_layer_{i}.pt`
-
----
-
-### Phase 3: OOD Evaluation
-
-Evaluate trained probes on out-of-distribution data (Insider Trading).
+Set API credentials only through environment variables:
 
 ```bash
-# Cache OOD activations
-python scripts/cache_deception_activations.py \
-    --model meta-llama/Llama-3.2-3B-Instruct \
-    --dataset Deception-InsiderTrading-SallyConcat \
-    --split test \
-    --limit 200
+export HF_TOKEN=...
+export CEREBRAS_API_KEY=...
 ```
 
-Run OOD evaluation:
-```bash
-python scripts/evaluate_ood_all_pooling.py \
-    --model meta-llama/Llama-3.2-3B-Instruct \
-    --ood_dir data/activations/.../Deception-InsiderTrading-SallyConcat/test \
-    --probes_dir data/probes/.../Deception-Roleplaying
-```
+## Quick Checks
 
----
-
-### Top-5 Normalized Probes Evaluation
-
-Train and evaluate the Top-5 source→target pairs from a CSV using **train-split normalization stats** (stored under each activation split). This runs normalized training on the source, then evaluates on the target split with the same stats.
+Run the lightweight pipeline sanity check:
 
 ```bash
-python scripts/pipelines/run_normalized_top5_eval.py \
-    --top5_csv /content/drive/MyDrive/.../top5.csv \
-    --model meta-llama/Llama-3.2-1B-Instruct \
-    --activations_dir /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations_fullprompt \
-    --results_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/results/ood_evaluation \
-    --probes_root /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/probes \
-    --target_split validation
+PYTHONPATH=actprobe/src python verify_pipeline.py
 ```
 
-**Outputs**:  
-`results/ood_evaluation/<model_dir>/normalized_probes_evaluation/from-<source>_to-<target>/metrics.json` and `metrics.csv`, plus `summary.json` and `summary.csv` at the root of `normalized_probes_evaluation/`.
-
----
-
-### Phase 4: Ensemble Training & Evaluation
-
-Combine multiple layers with different ensemble strategies.
+Run the test suite:
 
 ```bash
-python scripts/evaluate_ensembles_comprehensive.py \
-    --pooling attn \
-    --val_activations_dir data/activations/.../validation \
-    --probes_dir data/probes/.../attn \
-    --output_dir results/ensembles/attn \
-    --k_values 10,20,30,40,50,60,70,80,90
+PYTHONPATH=actprobe/src pytest -q
 ```
 
-**Ensemble strategies:**
-| Strategy | Description |
-|----------|-------------|
-| `Mean` | Simple average of layer logits |
-| `Weighted` | AUC-weighted average (from validation) |
-| `Gated` | **Learned input-dependent weighting** (MLP) |
+For large experiments, first run a bounded activation cache or a dry-run pipeline where available.
 
----
+## Core Workflow
 
-### Phase 5: Mechanistic Analysis
+### 1. Cache Activations
 
-Understand what the attention pooling and gated ensemble learn.
+Cache activations for a bounded sample before launching full runs:
 
 ```bash
-python scripts/analyze_mechanisms.py
+PYTHONPATH=actprobe/src python scripts/data/cache_deception_activations.py \
+  --model meta-llama/Llama-3.2-3B-Instruct \
+  --dataset Deception-Roleplaying \
+  --split train \
+  --limit 100 \
+  --batch_size 4
 ```
 
-**Generates:**
-- Token-level attention weight visualization
-- Layer gating weight analysis
-- Attention entropy (focused vs distributed)
-- Honest vs Deceptive comparison
+Cached activations are typically stored under:
 
----
-
-## Architecture
-
-### Single-Layer Probe (LayerProbe)
-```
-Input: (Batch, Tokens, Dim) from layer L
-   ↓
-Pooling: mean/max/last/attn → (Batch, Dim)
-   ↓
-Linear: Dim → 1 (binary logit)
-   ↓
-Output: P(deceptive)
+```text
+data/activations/<model>/<dataset>/<split>/
 ```
 
-### Learned Attention Pooling
-```python
-# Learns which tokens are relevant for deception detection
-query = nn.Parameter(torch.randn(D, 1))   # Learned query vector
-scores = x @ query                         # (B, T, 1) 
-weights = softmax(scores, dim=1)           # Attention weights
-pooled = sum(x * weights, dim=1)           # (B, D)
+Drive-backed Colab workflows often use:
+
+```text
+data/activations_fullprompt/<model>/<dataset>/<split>/
 ```
 
-### Gated Ensemble
-```python
-# Learns input-dependent layer weighting
-gate_net = MLP(D → 64 → L)      # Predicts layer weights per sample
-weights = softmax(gate_net(x))   # (B, L)
-output = sum(layer_logits * weights)  # Weighted combination
+### 2. Train Layer Probes
+
+Train per-layer probes for one pooling strategy:
+
+```bash
+PYTHONPATH=actprobe/src python scripts/training/train_deception_probes.py \
+  --model meta-llama/Llama-3.2-3B-Instruct \
+  --dataset Deception-Roleplaying \
+  --pooling mean \
+  --resume
 ```
 
----
+Supported pooling modes include `mean`, `max`, `last`, `attn`, and `none`.
 
-## Directory Structure
+### 3. Evaluate Transfer
 
-```
-.
-├── actprobe/src/actprobe/      # Core library
-│   ├── datasets/               # Deception dataset loaders
-│   ├── llm/                    # LLM generation + activation extraction
-│   ├── probes/                 # Probe models (LayerProbe, GatedEnsemble)
-│   └── evaluation/             # Cerebras-based deception labeling
-├── scripts/
-│   ├── cache_deception_activations.py  # Cache activations + labels
-│   ├── train_probes_all_pooling.py     # Train per-layer probes
-│   ├── evaluate_ood_all_pooling.py     # OOD evaluation
-│   ├── evaluate_ensembles_comprehensive.py  # Ensemble K-sweep
-│   ├── compare_pooling_layerwise.py    # Cross-pooling comparison
-│   └── analyze_mechanisms.py           # Mechanistic analysis
-├── data/
-│   ├── activations/            # Cached tensors (gitignored)
-│   ├── probes/                 # Trained probe weights
-│   └── apollo_raw/             # Apollo Research insider trading data
-├── results/
-│   ├── ood_evaluation/         # OOD probe performance
-│   ├── ensembles/              # Ensemble K-sweep results
-│   └── mechanistic_analysis/   # Attention/gating visualizations
-└── README.md
+Run a resumable pairwise source-to-target matrix:
+
+```bash
+PYTHONPATH=actprobe/src python scripts/pipelines/run_pairwise_eval_matrix.py \
+  --activations_root data/activations_fullprompt \
+  --probes_root data/probes \
+  --results_root results/ood_evaluation \
+  --model meta-llama/Llama-3.2-3B-Instruct \
+  --run_id example-run \
+  --resume \
+  --dry_run
 ```
 
----
+Remove `--dry_run` after checking the planned work.
 
-## Google Colab Usage
+### 4. Evaluate Ensembles
 
-```python
-# 1. Mount Drive
-from google.colab import drive
-drive.mount('/content/drive')
+Run a source-specific gated ensemble matrix over frozen probe banks:
 
-# 2. Navigate to project
-%cd /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes
-
-# 3. Set API keys
-import os
-os.environ['HF_TOKEN'] = 'your_huggingface_token'
-os.environ['CEREBRAS_API_KEY'] = 'your_cerebras_key'
-
-# 4. Run pipeline
-!python scripts/cache_deception_activations.py --dataset Deception-Roleplaying ...
-!python scripts/train_probes_all_pooling.py ...
-!python scripts/evaluate_ensembles_comprehensive.py ...
+```bash
+PYTHONPATH=actprobe/src python scripts/pipelines/run_probe_gated_ensemble_matrix.py \
+  --model meta-llama/Llama-3.2-3B-Instruct \
+  --activations_root data/activations_fullprompt \
+  --probes_root data/probes \
+  --artifact_root artifacts \
+  --run_id example-run \
+  --resume
 ```
 
----
+For older K-sweep ensemble comparisons, use:
 
-Related work:
-- [Apollo Research: Scheming Evaluations](https://github.com/apollonetwork/scheming-evals)
-- [Burns et al.: Discovering Latent Knowledge](https://arxiv.org/abs/2212.03827)
+```bash
+PYTHONPATH=actprobe/src python scripts/evaluation/evaluate_ensembles_comprehensive.py \
+  --pooling mean \
+  --val_activations_dir data/activations/.../validation \
+  --probes_dir data/probes/.../mean \
+  --output_dir results/ensembles/mean \
+  --eval_mode validation
+```
+
+## Artifacts
+
+This repository uses several artifact roots because the workflows evolved over multiple experiment families:
+
+- `data/activations*/` for cached model activations,
+- `data/probes/` for trained probe checkpoints,
+- `results/` for evaluation summaries, matrices, plots, and comparison outputs,
+- `artifacts/runs/` for newer resumable pipeline manifests, checkpoints, and structured outputs.
+
+New resumable runs should write:
+
+```text
+artifacts/runs/<workflow>/<model>/<variant>/<run_id>/
+  meta/
+  checkpoints/
+  results/
+  logs/
+```
+
+When a script exposes `--resume`, `--dry_run`, `--force_*`, or skip-existing behavior, prefer those controls over deleting partial outputs.
+
+## Documentation
+
+Detailed runbooks and experiment notes live outside the README:
+
+- `ENSEMBLE_WORKFLOW_GUIDE.md`
+- `DECEPTION_DETECTION_GUIDE.md`
+- `POOLING_COMPARISON_GUIDE.md`
+- `PER_TOKEN_GUIDE.md`
+- `SKIP_EXISTING_GUIDE.md`
+- `docs/COLAB_CLEAN_PIPELINE.md`
+- `docs/colab_3b_principled_cross_dataset.md`
+- `docs/ACTIVATION_ORACLE_PCA_PIPELINE.md`
+- `docs/COLAB_PCA_ABLATION_DEEP_DIVE.md`
+
+Use the README as the project map and the runbooks for exact Colab or long-running experiment commands.
+
+## Development Notes
+
+- Keep generated tensors, checkpoints, and plots out of source directories.
+- Prefer bounded runs with `--limit` before full activation caching.
+- Prefer fixed `--run_id` values when coordinating resumed runs across Colab, Drive, and local machines.
+- Format Python changes with `black actprobe/src scripts`.
+- For pipeline changes, include the command run and the output artifact path in the commit or PR notes.
