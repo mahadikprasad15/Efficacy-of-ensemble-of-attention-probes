@@ -119,7 +119,7 @@ def sort_datasets(datasets: Sequence[str]) -> List[str]:
         "Deception-InstructedDeception",
         "Deception-Mask",
         "Deception-AILiar",
-        "Deception-InsiderTrading",
+        "Deception-InsiderTrading-SallyConcat",
         "Deception-Roleplaying",
     ]
     order_map = {name: i for i, name in enumerate(order)}

@@ -43,7 +43,7 @@ data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validati
 
 # Look for both datasets:
 !ls -la /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/
-!ls -la /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/
+!ls -la /content/drive/MyDrive/Efficacy-of-ensemble-of-attention-probes/data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/
 ```
 
 ### PHASE 1: Cache Activations (if needed)
@@ -67,7 +67,7 @@ If you don't have Roleplaying activations cached:
 # Evaluate all 4 pooling strategies on flipped OOD dataset
 !python scripts/evaluate_ood_all_pooling.py \
     --ood_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
-    --probes_base data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading \
+    --probes_base data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat \
     --output_dir results_flipped/ood_evaluation
 
 # This will create:
@@ -168,10 +168,10 @@ Run comprehensive ensemble evaluation for each pooling strategy:
 # Analyze gating weights with FAIR COMPARISON
 # This trains gating on OOD data and compares to single probes
 !python scripts/analyze_gating_weights.py \
-    --id_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/train \
+    --id_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/train \
     --ood_logits results_flipped/ood_evaluation/logits/attn_logits.npy \
     --ood_labels results_flipped/ood_evaluation/logits/labels.npy \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --k_pct 40 \
     --output_dir results_flipped/gating_analysis
 
@@ -187,34 +187,34 @@ Run comprehensive ensemble evaluation for each pooling strategy:
 ```python
 # Analyze attention entropy (where does attention focus?)
 !python scripts/analyze_attention_entropy.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/attention_analysis
 
 # Token-level attention visualization
 !python scripts/analyze_attention_text.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/attention_text \
     --num_samples 10
 
 # Ensemble attention visualization (per-layer attention)
 !python scripts/analyze_ensemble_attention.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/ensemble_attention
 
 # Layer-colored attention (color-coded by layer contribution)
 !python scripts/analyze_layer_colored_attention.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/layer_colored_attention
 
 # Hybrid attention analysis (compare pooling strategies)
 !python scripts/analyze_hybrid_attention.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_mean data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/mean \
-    --probes_attn data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_mean data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/mean \
+    --probes_attn data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/hybrid_attention
 ```
 
@@ -223,13 +223,13 @@ Run comprehensive ensemble evaluation for each pooling strategy:
 ```python
 # Deep dive into probe mechanisms
 !python scripts/analyze_mechanisms.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/mechanistic_analysis
 
 # Compare probe behavior across layers
 !python scripts/analyze_probes.py \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat \
     --output_dir results_flipped/probe_analysis
 ```
 
@@ -238,10 +238,10 @@ Run comprehensive ensemble evaluation for each pooling strategy:
 ```python
 # Compare all pooling strategies layer-by-layer
 !python scripts/compare_pooling_layerwise.py \
-    --mean_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/mean \
-    --max_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/max \
-    --last_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/last \
-    --attn_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --mean_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/mean \
+    --max_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/max \
+    --last_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/last \
+    --attn_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --ood_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
     --output_dir results_flipped/pooling_layerwise
 ```

@@ -16,7 +16,7 @@ Usage:
     # Evaluate on OOD dataset (all aggregations)
     python scripts/evaluation/eval_per_token_probes.py \
         --probes_dir data/probes_per_token/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying \
-        --ood_activations data/activations/.../Deception-InsiderTrading/validation \
+        --ood_activations data/activations/.../Deception-InsiderTrading-SallyConcat/validation \
         --output_dir results/per_token_ood
 
     # Evaluate with specific aggregation only

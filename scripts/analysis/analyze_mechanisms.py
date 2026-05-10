@@ -28,7 +28,7 @@ from actprobe.probes.ensemble import GatedEnsemble
 # ============================================================================
 parser = argparse.ArgumentParser(description='Mechanistic Analysis')
 parser.add_argument('--ood_dir', type=str, 
-                    default='data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/test',
+                    default='data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/test',
                     help='Path to OOD activations directory')
 parser.add_argument('--probes_base', type=str,
                     default='data/probes/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying',

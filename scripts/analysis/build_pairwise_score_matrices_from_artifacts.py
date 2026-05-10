@@ -4,6 +4,7 @@ Build pairwise score matrices from existing probe/ood artifacts (no retraining).
 
 For each segment (completion/full), this script exports:
   - 12 fixed matrices: poolings x fixed layers (default 4 x 3)
+  - Optional best-within-pooling matrices: one best layer per cell for a given pooling
   - 1 source-val-selected matrix: one (pooling, layer) per source row selected
     from source validation metrics only, then evaluated on all OOD test targets.
 
@@ -38,6 +39,7 @@ class PairLookup:
     metrics: Dict[Tuple[str, int], Dict[str, Optional[float]]] = field(default_factory=dict)
     source_file: Optional[str] = None
     errors: List[str] = field(default_factory=list)
+    searched_dirs: List[str] = field(default_factory=list)
 
 
 def utc_now() -> str:
@@ -86,6 +88,29 @@ def split_root_and_model(root: Path, model_dir: str) -> Tuple[Path, Path]:
     if candidate.exists():
         return root, candidate
     return root.parent, root
+
+
+def append_unique_path(paths: List[Path], candidate: Path) -> None:
+    candidate_str = str(candidate)
+    if all(str(existing) != candidate_str for existing in paths):
+        paths.append(candidate)
+
+
+def discover_pair_results_roots(ood_results_root: Path, model_dir: str) -> List[Path]:
+    """
+    Search both the canonical model-scoped OOD root and the legacy flat root.
+
+    Earlier pairwise runs could write directly under <ood_results_root>/from-...
+    before the model-specific directory existed. Newer runs write under
+    <ood_results_root>/<model_dir>/from-....
+    """
+    roots: List[Path] = []
+    _, ood_model_root = split_root_and_model(ood_results_root, model_dir)
+    append_unique_path(roots, ood_model_root)
+    append_unique_path(roots, ood_results_root)
+    if ood_results_root.name != model_dir:
+        append_unique_path(roots, ood_results_root / model_dir)
+    return roots
 
 
 def dataset_base(dataset_name: str) -> str:
@@ -158,7 +183,7 @@ def stage_spec() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
             "Deception-InstructedDeception-completion",
             "Deception-Mask-completion",
             "Deception-AILiar-completion",
-            "Deception-InsiderTrading-completion",
+            "Deception-InsiderTrading-SallyConcat-completion",
             "Deception-Roleplaying-completion",
         ],
         "full": [
@@ -167,7 +192,7 @@ def stage_spec() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
             "Deception-InstructedDeception-full",
             "Deception-Mask-full",
             "Deception-AILiar-full",
-            "Deception-InsiderTrading-full",
+            "Deception-InsiderTrading-SallyConcat-full",
             "Deception-Roleplaying-full",
         ],
     }
@@ -181,7 +206,7 @@ def base_label_map() -> Dict[str, str]:
         "Deception-InstructedDeception": "InstructedDeception",
         "Deception-Mask": "Mask",
         "Deception-AILiar": "AILiar",
-        "Deception-InsiderTrading": "IT",
+        "Deception-InsiderTrading-SallyConcat": "IT",
         "Deception-Roleplaying": "Roleplaying",
     }
 
@@ -217,6 +242,35 @@ def choose_source_best(rows: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any
         )
 
     return max(rows, key=key)
+
+
+def choose_best_pair_metric_for_pooling(
+    lookup: PairLookup,
+    pooling: str,
+) -> Optional[Tuple[int, Dict[str, Optional[float]]]]:
+    wanted = normalize_pooling(pooling)
+    candidates: List[Tuple[int, Dict[str, Optional[float]]]] = []
+    for (p, layer), metric in lookup.metrics.items():
+        if normalize_pooling(p) != wanted:
+            continue
+        auc = parse_float(metric.get("auc"))
+        if auc is None:
+            continue
+        candidates.append((int(layer), metric))
+
+    if not candidates:
+        return None
+
+    def key(item: Tuple[int, Dict[str, Optional[float]]]) -> Tuple[float, float, float, int]:
+        layer, metric = item
+        return (
+            float(parse_float(metric.get("auc")) or -1.0),
+            float(parse_float(metric.get("accuracy")) or -1.0),
+            float(parse_float(metric.get("f1")) or -1.0),
+            -int(layer),
+        )
+
+    return max(candidates, key=key)
 
 
 def read_source_val_rows(
@@ -349,8 +403,9 @@ def parse_eval_ood_file(path: Path) -> Dict[Tuple[str, int], Dict[str, Optional[
     return out
 
 
-def load_pair_lookup(pair_dir: Path, poolings: Sequence[str], split: str = "test") -> PairLookup:
+def load_pair_lookup_from_dir(pair_dir: Path, poolings: Sequence[str], split: str = "test") -> PairLookup:
     lookup = PairLookup()
+    lookup.searched_dirs.append(str(pair_dir))
 
     pair_summary_path = pair_dir / "pair_summary.json"
     if pair_summary_path.exists():
@@ -414,6 +469,24 @@ def load_pair_lookup(pair_dir: Path, poolings: Sequence[str], split: str = "test
     return lookup
 
 
+def load_pair_lookup(pair_dirs: Sequence[Path], poolings: Sequence[str], split: str = "test") -> PairLookup:
+    combined = PairLookup()
+    for pair_dir in pair_dirs:
+        lookup = load_pair_lookup_from_dir(pair_dir=pair_dir, poolings=poolings, split=split)
+        combined.searched_dirs.extend(lookup.searched_dirs)
+        if lookup.metrics:
+            return lookup
+        combined.errors.extend([f"{pair_dir}:{err}" for err in lookup.errors])
+        if lookup.source_file and combined.source_file is None:
+            combined.source_file = lookup.source_file
+
+    if combined.source_file is None and combined.searched_dirs:
+        combined.source_file = combined.searched_dirs[0]
+    if not combined.errors:
+        combined.errors.append("no_pair_result_roots_searched")
+    return combined
+
+
 def write_matrix_csv(
     path: Path,
     rows: Sequence[str],
@@ -443,6 +516,8 @@ def plot_matrix_heatmap(
     vmax: float,
     cmap: str,
     dpi: int,
+    cell_text: Optional[Sequence[Sequence[str]]] = None,
+    cbar_label: str = "AUROC",
 ) -> None:
     ensure_dir(output_path.parent)
     fig, ax = plt.subplots(figsize=(12.5, 8.0))
@@ -471,7 +546,7 @@ def plot_matrix_heatmap(
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
             v = matrix[i, j]
-            txt = "NA" if np.isnan(v) else f"{v:.2f}"
+            txt = cell_text[i][j] if cell_text is not None else ("NA" if np.isnan(v) else f"{v:.2f}")
             if np.isnan(v):
                 color = "#4a4a4a"
             else:
@@ -486,7 +561,7 @@ def plot_matrix_heatmap(
                 ax.add_patch(rect)
 
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("AUROC")
+    cbar.set_label(cbar_label)
     fig.tight_layout()
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
@@ -515,6 +590,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--segments", type=str, default="completion,full")
     parser.add_argument("--poolings", type=str, default="mean,max,last,attn")
+    parser.add_argument(
+        "--best_pooling_heatmaps",
+        type=str,
+        default="",
+        help="Optional poolings for best-within-pooling exports, e.g. 'mean,last'.",
+    )
     parser.add_argument("--fixed_layers", type=str, default="10,12,15")
     parser.add_argument("--vmin", type=float, default=0.5)
     parser.add_argument("--vmax", type=float, default=1.0)
@@ -537,13 +618,19 @@ def main() -> int:
     for p in poolings:
         if p not in ALL_POOLINGS:
             raise ValueError(f"Unsupported pooling '{p}'. Choose from {ALL_POOLINGS}.")
+    best_pooling_heatmaps = [normalize_pooling(p) for p in parse_csv_list(args.best_pooling_heatmaps)]
+    for p in best_pooling_heatmaps:
+        if p not in ALL_POOLINGS:
+            raise ValueError(f"Unsupported best-pooling heatmap pooling '{p}'. Choose from {ALL_POOLINGS}.")
 
     fixed_layers = parse_int_csv(args.fixed_layers)
     if not fixed_layers:
         raise ValueError("--fixed_layers must contain at least one layer.")
 
     probes_base, probes_model_root = split_root_and_model(Path(args.probes_root), model_dir)
-    ood_base, ood_model_root = split_root_and_model(Path(args.ood_results_root), model_dir)
+    ood_results_root = Path(args.ood_results_root)
+    ood_base, ood_model_root = split_root_and_model(ood_results_root, model_dir)
+    pair_results_roots = discover_pair_results_roots(ood_results_root, model_dir)
 
     if args.output_root:
         run_root = Path(args.output_root) / run_id
@@ -570,10 +657,12 @@ def main() -> int:
                 "probes_model_root": str(probes_model_root),
                 "ood_base": str(ood_base),
                 "ood_model_root": str(ood_model_root),
+                "pair_results_roots": [str(p) for p in pair_results_roots],
                 "run_root": str(run_root),
             },
             "segments": segments,
             "poolings": poolings,
+            "best_pooling_heatmaps": best_pooling_heatmaps,
             "fixed_layers": fixed_layers,
             "plot": {
                 "vmin": args.vmin,
@@ -602,6 +691,7 @@ def main() -> int:
     print(f"[start] run_id={run_id}")
     print(f"[start] probes_model_root={probes_model_root}")
     print(f"[start] ood_model_root={ood_model_root}")
+    print(f"[start] pair_results_roots={[str(p) for p in pair_results_roots]}")
 
     rows_map, cols_map = stage_spec()
     global_summary: Dict[str, Any] = {
@@ -621,13 +711,15 @@ def main() -> int:
         pair_lookup_map: Dict[Tuple[str, str], PairLookup] = {}
         for src in rows:
             for tgt in cols:
-                pair_dir = ood_model_root / f"from-{src}" / f"to-{tgt}"
-                lookup = load_pair_lookup(pair_dir=pair_dir, poolings=poolings, split="test")
+                pair_dirs = [root / f"from-{src}" / f"to-{tgt}" for root in pair_results_roots]
+                lookup = load_pair_lookup(pair_dirs=pair_dirs, poolings=poolings, split="test")
                 pair_lookup_map[(src, tgt)] = lookup
 
         missing_rows: List[Dict[str, Any]] = []
         fixed_long_rows: List[Dict[str, Any]] = []
         fixed_outputs: List[Dict[str, Any]] = []
+        best_pooling_long_rows: List[Dict[str, Any]] = []
+        best_pooling_outputs: List[Dict[str, Any]] = []
 
         # A) 12 fixed matrices
         for pooling in poolings:
@@ -732,6 +824,147 @@ def main() -> int:
                         "num_total": int(mat.size),
                     }
                 )
+
+        # A2) best-within-pooling matrices across all available layers
+        for pooling in best_pooling_heatmaps:
+            auc_mat = np.full((len(rows), len(cols)), np.nan, dtype=np.float64)
+            layer_mat = np.full((len(rows), len(cols)), np.nan, dtype=np.float64)
+            auc_layer_text = [["NA" for _ in cols] for _ in rows]
+
+            for i, src in enumerate(rows):
+                for j, tgt in enumerate(cols):
+                    lookup = pair_lookup_map[(src, tgt)]
+                    best = choose_best_pair_metric_for_pooling(lookup, pooling)
+                    if best is None:
+                        missing_rows.append(
+                            {
+                                "segment": segment,
+                                "variant": "best_within_pooling",
+                                "pooling": pooling,
+                                "layer": "",
+                                "row_dataset": src,
+                                "col_dataset": tgt,
+                                "reason": ";".join(lookup.errors) if lookup.errors else "pooling_not_found_in_pair_metrics",
+                                "pair_source_file": lookup.source_file,
+                            }
+                        )
+                        best_pooling_long_rows.append(
+                            {
+                                "segment": segment,
+                                "variant": "best_within_pooling",
+                                "row_dataset": src,
+                                "col_dataset": tgt,
+                                "pooling": pooling,
+                                "layer": "",
+                                "auc": "",
+                                "status": "missing",
+                                "pair_source_file": lookup.source_file or "",
+                            }
+                        )
+                        continue
+
+                    layer, metric = best
+                    auc = parse_float(metric.get("auc"))
+                    if auc is None:
+                        missing_rows.append(
+                            {
+                                "segment": segment,
+                                "variant": "best_within_pooling",
+                                "pooling": pooling,
+                                "layer": int(layer),
+                                "row_dataset": src,
+                                "col_dataset": tgt,
+                                "reason": "auc_missing_for_best_within_pooling",
+                                "pair_source_file": lookup.source_file,
+                            }
+                        )
+                        best_pooling_long_rows.append(
+                            {
+                                "segment": segment,
+                                "variant": "best_within_pooling",
+                                "row_dataset": src,
+                                "col_dataset": tgt,
+                                "pooling": pooling,
+                                "layer": int(layer),
+                                "auc": "",
+                                "status": "missing",
+                                "pair_source_file": lookup.source_file or "",
+                            }
+                        )
+                        continue
+
+                    auc_mat[i, j] = float(auc)
+                    layer_mat[i, j] = float(layer)
+                    auc_layer_text[i][j] = f"{float(auc):.2f}\nL{int(layer)}"
+                    best_pooling_long_rows.append(
+                        {
+                            "segment": segment,
+                            "variant": "best_within_pooling",
+                            "row_dataset": src,
+                            "col_dataset": tgt,
+                            "pooling": pooling,
+                            "layer": int(layer),
+                            "auc": float(auc),
+                            "status": "ok",
+                            "pair_source_file": lookup.source_file or "",
+                        }
+                    )
+
+            auc_csv_path = seg_out / f"matrix_best_{pooling}_auc.csv"
+            layer_csv_path = seg_out / f"matrix_best_{pooling}_layer.csv"
+            auc_layer_png_path = seg_out / f"heatmap_best_{pooling}_auc_layer.png"
+            layer_png_path = seg_out / f"heatmap_best_{pooling}_layer.png"
+
+            write_matrix_csv(auc_csv_path, rows, cols, auc_mat)
+            write_matrix_csv(layer_csv_path, rows, cols, layer_mat)
+            plot_matrix_heatmap(
+                output_path=auc_layer_png_path,
+                matrix=auc_mat,
+                rows=rows,
+                cols=cols,
+                title=f"AUROC | {segment} | best {pooling} across layers",
+                segment=segment,
+                vmin=args.vmin,
+                vmax=args.vmax,
+                cmap=args.cmap,
+                dpi=args.dpi,
+                cell_text=auc_layer_text,
+                cbar_label="AUROC",
+            )
+
+            valid_layers = layer_mat[~np.isnan(layer_mat)]
+            layer_vmin = float(valid_layers.min()) if valid_layers.size else 0.0
+            layer_vmax = float(valid_layers.max()) if valid_layers.size else 1.0
+            layer_text = [
+                [("NA" if np.isnan(layer_mat[i, j]) else f"L{int(layer_mat[i, j])}") for j in range(len(cols))]
+                for i in range(len(rows))
+            ]
+            plot_matrix_heatmap(
+                output_path=layer_png_path,
+                matrix=layer_mat,
+                rows=rows,
+                cols=cols,
+                title=f"Best layer | {segment} | {pooling} pooling",
+                segment=segment,
+                vmin=layer_vmin,
+                vmax=layer_vmax,
+                cmap="viridis",
+                dpi=args.dpi,
+                cell_text=layer_text,
+                cbar_label="Layer",
+            )
+
+            best_pooling_outputs.append(
+                {
+                    "pooling": pooling,
+                    "auc_csv": str(auc_csv_path),
+                    "layer_csv": str(layer_csv_path),
+                    "auc_layer_png": str(auc_layer_png_path),
+                    "layer_png": str(layer_png_path),
+                    "num_filled": int(np.sum(~np.isnan(auc_mat))),
+                    "num_total": int(auc_mat.size),
+                }
+            )
 
         # B) source-val-selected matrix
         selected_rows: List[Dict[str, Any]] = []
@@ -899,6 +1132,11 @@ def main() -> int:
             ["segment", "variant", "row_dataset", "col_dataset", "pooling", "layer", "auc", "status", "pair_source_file"],
         )
         write_csv_rows(
+            seg_out / "matrix_long_best_within_pooling.csv",
+            best_pooling_long_rows,
+            ["segment", "variant", "row_dataset", "col_dataset", "pooling", "layer", "auc", "status", "pair_source_file"],
+        )
+        write_csv_rows(
             seg_out / "missing_report.csv",
             missing_rows,
             ["segment", "variant", "pooling", "layer", "row_dataset", "col_dataset", "reason", "pair_source_file"],
@@ -908,6 +1146,7 @@ def main() -> int:
             "rows": rows,
             "cols": cols,
             "fixed_outputs": fixed_outputs,
+            "best_pooling_outputs": best_pooling_outputs,
             "source_val_selected": {
                 "csv": str(source_sel_csv),
                 "png": str(source_sel_png),
@@ -918,6 +1157,7 @@ def main() -> int:
                 "selected_configs_csv": str(seg_out / "source_selected_configs.csv"),
                 "fixed_long_csv": str(seg_out / "matrix_long_fixed_configs.csv"),
                 "source_val_selected_long_csv": str(seg_out / "matrix_long_source_val_selected.csv"),
+                "best_within_pooling_long_csv": str(seg_out / "matrix_long_best_within_pooling.csv"),
                 "missing_report_csv": str(seg_out / "missing_report.csv"),
             },
             "missing_count": len(missing_rows),

@@ -18,8 +18,8 @@ Usage:
     python scripts/train_domain_adversarial.py \
         --train_a data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/train \
         --val_a data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
-        --train_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/train \
-        --val_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
+        --train_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/train \
+        --val_b data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
         --layer 20 \
         --pooling max \
         --output_dir results/domain_adversarial

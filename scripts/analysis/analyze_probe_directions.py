@@ -13,7 +13,7 @@ This script:
 Usage:
     python scripts/analysis/analyze_probe_directions.py \
         --act_a /path/to/Deception-Roleplaying/validation \
-        --act_b /path/to/Deception-InsiderTrading/validation \
+        --act_b /path/to/Deception-InsiderTrading-SallyConcat/validation \
         --probe_a /path/to/probes/mean/probe_layer_20.pt \
         --probe_b /path/to/probes_flipped/mean/probe_layer_20.pt \
         --probe_combined /path/to/combined_probes/probe.pt \

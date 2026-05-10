@@ -45,7 +45,7 @@ SOURCE_DATASETS = [
     "Deception-AILiar",
     "Deception-Roleplaying",
 ]
-TARGET_ONLY_DATASET = "Deception-InsiderTrading"
+TARGET_ONLY_DATASET = "Deception-InsiderTrading-SallyConcat"
 ALL_DATASETS = SOURCE_DATASETS + [TARGET_ONLY_DATASET]
 
 SEGMENTS = ["completion", "full"]
@@ -182,7 +182,7 @@ for dataset in ALL_DATASETS:
         ]
         cmd.extend(resolve_cache_dataset_args(dataset))
 
-        if dataset == "Deception-InsiderTrading":
+        if dataset == "Deception-InsiderTrading-SallyConcat":
             cmd.append("--use_pregenerated")
         elif dataset == "Deception-Roleplaying":
             cmd.append("--use_gold_completions")
@@ -220,7 +220,7 @@ for dataset in ALL_DATASETS:
         ]
         cmd.extend(resolve_cache_dataset_args(dataset))
 
-        if dataset == "Deception-InsiderTrading":
+        if dataset == "Deception-InsiderTrading-SallyConcat":
             cmd.append("--use_pregenerated")
         elif dataset == "Deception-Roleplaying":
             cmd.append("--use_gold_completions")
@@ -303,6 +303,9 @@ This pipeline now also writes same-dataset diagonal `test` summaries under:
 - `results/ood_evaluation/<model_dir>/from-<dataset>/to-<dataset>/pair_logits.safetensors`
 - `results/ood_evaluation/<model_dir>/from-<dataset>/to-<dataset>/pair_logits_manifest.json`
 
+The phase-4 writer now always treats `--results_root` as a parent root and writes
+into the canonical model-scoped directory `results/ood_evaluation/<model_dir>/...`.
+
 That matters for the principled matrix build: the diagonal cell is then filled the same way as every off-diagonal cell, namely by choosing `(pooling, layer)` on source validation and reading the selected config's AUROC from the dataset's own `test` pair artifact.
 
 When `--save_pair_logits` is enabled, phase 4 also persists the full per-sample logit vectors for every `(source dataset, target dataset, pooling, layer)` combination. If a pair summary exists but the pair-logit artifact is missing, rerunning phase 4 with `--resume --save_pair_logits` will recompute only that pair.
@@ -338,6 +341,11 @@ else:
     ]
     run_stream(label, cmd)
 ```
+
+The matrix builder searches both the canonical model-scoped OOD root and the
+legacy flat root. That means an older phase-4 run that wrote
+`results/ood_evaluation/from-.../to-...` is still usable without rerunning
+phase 4.
 
 ## Cell 9: Phase 6, Principled Mahalanobis Probe Angles
 
@@ -428,7 +436,7 @@ print("mahal summary:", mahal_summary)
 
 ## Replace Only InsiderTrading With Report-Label Data
 
-Use this recovery flow if the existing `Deception-InsiderTrading-*` activations were cached from the raw Apollo loader using `made_trade`, and you want to replace only the InsiderTrading target with the Sally-concat/report-label prepared data.
+Use this recovery flow if the existing `Deception-InsiderTrading-SallyConcat-*` activations came from an older pre-Sally cache and you want to replace only the InsiderTrading target with the Sally-concat/report-label prepared data.
 
 ### Step A: Prepare Sally-Concat Report-Label JSONL
 
@@ -463,7 +471,7 @@ from shutil import rmtree
 
 for segment in ["completion", "full"]:
     for split in ["train", "validation", "test"]:
-        p = ACTS_ROOT / MODEL_DIR / f"Deception-InsiderTrading-{segment}" / split
+        p = ACTS_ROOT / MODEL_DIR / f"Deception-InsiderTrading-SallyConcat-{segment}" / split
         if p.exists():
             print("[remove]", p)
             rmtree(p)
@@ -483,7 +491,7 @@ for split in ["train", "validation", "test"]:
         "--model", MODEL,
         "--dataset", "Deception-InsiderTrading-SallyConcat",
         "--dataset_file", str(IT_SALLY_EXAMPLES),
-        "--dataset_output_name", "Deception-InsiderTrading-full",
+        "--dataset_output_name", "Deception-InsiderTrading-SallyConcat-full",
         "--split", split,
         "--include_prompt_tokens",
         "--use_pregenerated",
@@ -508,7 +516,7 @@ for split in ["train", "validation", "test"]:
         "--model", MODEL,
         "--dataset", "Deception-InsiderTrading-SallyConcat",
         "--dataset_file", str(IT_SALLY_EXAMPLES),
-        "--dataset_output_name", "Deception-InsiderTrading-completion",
+        "--dataset_output_name", "Deception-InsiderTrading-SallyConcat-completion",
         "--split", split,
         "--use_pregenerated",
         "--output_dir", str(ACTS_ROOT),
@@ -528,7 +536,7 @@ This deletes just the source->InsiderTrading pair outputs. It leaves all non-Ins
 from shutil import rmtree
 
 for segment in ["completion", "full"]:
-    target = f"to-Deception-InsiderTrading-{segment}"
+    target = f"to-Deception-InsiderTrading-SallyConcat-{segment}"
     for source in SOURCE_DATASETS:
         pair_dir = OOD_ROOT / MODEL_DIR / f"from-{source}-{segment}" / target
         if pair_dir.exists():
@@ -556,7 +564,7 @@ cmd = [
     "--poolings", ",".join(POOLINGS),
     "--eval_batch_size", str(EVAL_BATCH_SIZE),
     "--save_pair_logits",
-    "--only_targets", "Deception-InsiderTrading-completion,Deception-InsiderTrading-full",
+    "--only_targets", "Deception-InsiderTrading-SallyConcat-completion,Deception-InsiderTrading-SallyConcat-full",
     "--force_reeval",
     "--resume",
     "--skip_training",

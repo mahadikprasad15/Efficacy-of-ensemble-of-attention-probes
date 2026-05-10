@@ -8,7 +8,7 @@ Usage:
     python scripts/analyze_error_examples.py \
         --ood_dir data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/test \
         --apollo_data data/apollo_raw/roleplaying/dataset.yaml \
-        --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading \
+        --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat \
         --pooling last \
         --layer 18 \
         --output_dir results_flipped/error_analysis

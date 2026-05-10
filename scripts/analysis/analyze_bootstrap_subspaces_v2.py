@@ -12,7 +12,7 @@ Fixes from v1:
 Usage:
     python scripts/analysis/analyze_bootstrap_subspaces_v2.py \
         --act_a /path/to/Deception-Roleplaying/train \
-        --act_b /path/to/Deception-InsiderTrading/train \
+        --act_b /path/to/Deception-InsiderTrading-SallyConcat/train \
         --layers 12,14,16,18,20 \
         --pooling mean \
         --n_probes 15 \

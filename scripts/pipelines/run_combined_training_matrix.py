@@ -45,7 +45,7 @@ SOURCE_BASES = [
     "Deception-AILiar",
     "Deception-Roleplaying",
 ]
-TARGET_ONLY_BASE = "Deception-InsiderTrading"
+TARGET_ONLY_BASE = "Deception-InsiderTrading-SallyConcat"
 ALL_TARGET_BASES = SOURCE_BASES + [TARGET_ONLY_BASE]
 
 COMBO_REGISTRY: Mapping[str, Mapping[str, Sequence[str]]] = {
@@ -89,14 +89,14 @@ SHORT_LABELS = {
     "Deception-InstructedDeception-completion": "ID-c",
     "Deception-Mask-completion": "M-c",
     "Deception-AILiar-completion": "AL-c",
-    "Deception-InsiderTrading-completion": "IT-c",
+    "Deception-InsiderTrading-SallyConcat-completion": "IT-c",
     "Deception-Roleplaying-completion": "RP-c",
     "Deception-ConvincingGame-full": "CG-f",
     "Deception-HarmPressureChoice-full": "HPC-f",
     "Deception-InstructedDeception-full": "ID-f",
     "Deception-Mask-full": "M-f",
     "Deception-AILiar-full": "AL-f",
-    "Deception-InsiderTrading-full": "IT-f",
+    "Deception-InsiderTrading-SallyConcat-full": "IT-f",
     "Deception-Roleplaying-full": "RP-f",
 }
 

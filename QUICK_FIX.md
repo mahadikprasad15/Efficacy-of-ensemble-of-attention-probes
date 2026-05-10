@@ -27,7 +27,7 @@ Your evaluation should now work. Try running:
 # Then run the evaluation
 !python scripts/evaluate_ood_all_pooling.py \
     --ood_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
-    --probes_base data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading \
+    --probes_base data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat \
     --output_dir results_flipped/ood_evaluation
 ```
 
@@ -95,7 +95,7 @@ Once the first command works, follow these steps:
 ```python
 !python scripts/evaluate_ood_all_pooling.py \
     --ood_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
-    --probes_base data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading \
+    --probes_base data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat \
     --output_dir results_flipped/ood_evaluation
 ```
 
@@ -135,10 +135,10 @@ Run for each pooling strategy:
 
 ```python
 !python scripts/analyze_gating_weights.py \
-    --id_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/train \
+    --id_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/train \
     --ood_logits results_flipped/ood_evaluation/logits/attn_logits.npy \
     --ood_labels results_flipped/ood_evaluation/logits/labels.npy \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --k_pct 40 \
     --output_dir results_flipped/gating_analysis
 ```
@@ -148,14 +148,14 @@ Run for each pooling strategy:
 ```python
 # Attention analysis
 !python scripts/analyze_attention_entropy.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/attention_analysis
 
 # Token-level attention
 !python scripts/analyze_attention_text.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/attention_text \
     --num_samples 10
 

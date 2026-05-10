@@ -61,7 +61,7 @@ SHORT_LABELS = {
     "Deception-InstructedDeception": "ID",
     "Deception-Mask": "Mask",
     "Deception-AILiar": "AL",
-    "Deception-InsiderTrading": "IT",
+    "Deception-InsiderTrading-SallyConcat": "IT",
     "Deception-Roleplaying": "RP",
     "Deception-ClaimsDefinitional": "ClaimsDef",
     "Deception-ClaimsEvidential": "ClaimsEvid",

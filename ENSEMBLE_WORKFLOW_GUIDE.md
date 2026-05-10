@@ -87,7 +87,7 @@ probes/{pooling}/
 ```bash
 python scripts/cache_deception_activations.py \
     --model meta-llama/Llama-3.2-3B-Instruct \
-    --dataset Deception-InsiderTrading \  # You'll need to add this dataset loader
+    --dataset Deception-InsiderTrading-SallyConcat \  # You'll need to add this dataset loader
     --split test \
     --output_dir /content/drive/MyDrive/activations/insider_trading
 ```

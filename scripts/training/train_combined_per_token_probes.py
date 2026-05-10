@@ -11,8 +11,8 @@ Usage:
     python scripts/training/train_combined_per_token_probes.py \
         --train_a data/activations/.../Deception-Roleplaying/train \
         --val_a data/activations/.../Deception-Roleplaying/validation \
-        --train_b data/activations/.../Deception-InsiderTrading/train \
-        --val_b data/activations/.../Deception-InsiderTrading/validation \
+        --train_b data/activations/.../Deception-InsiderTrading-SallyConcat/train \
+        --val_b data/activations/.../Deception-InsiderTrading-SallyConcat/validation \
         --output_dir data/probes_combined_per_token \
         --model meta-llama_Llama-3.2-3B-Instruct
 """

@@ -493,9 +493,9 @@ def main():
                         help='Number of OOD samples (None = all)')
     parser.add_argument('--domain_a', type=str, default='Deception-Roleplaying',
                         help='Domain A (ID probe source)')
-    parser.add_argument('--domain_b', type=str, default='Deception-InsiderTrading',
+    parser.add_argument('--domain_b', type=str, default='Deception-InsiderTrading-SallyConcat',
                         help='Domain B (ID probe source / OOD target)')
-    parser.add_argument('--ood_domain', type=str, default='Deception-InsiderTrading',
+    parser.add_argument('--ood_domain', type=str, default='Deception-InsiderTrading-SallyConcat',
                         help='OOD evaluation domain')
     parser.add_argument('--ood_split', type=str, default='test',
                         help='OOD split (test or validation)')

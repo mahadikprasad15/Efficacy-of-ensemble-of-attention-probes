@@ -15,7 +15,7 @@ Usage:
     python scripts/domain_adaptation/train_single_domain_all_pooling.py \
         --train_dir /path/to/Deception-Roleplaying/train \
         --val_id /path/to/Deception-Roleplaying/validation \
-        --val_ood /path/to/Deception-InsiderTrading/validation \
+        --val_ood /path/to/Deception-InsiderTrading-SallyConcat/validation \
         --label_id Roleplaying --label_ood InsiderTrading \
         --output_dir results/single_domain_roleplaying
 """

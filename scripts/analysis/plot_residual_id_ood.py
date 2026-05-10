@@ -109,7 +109,7 @@ def main() -> int:
     parser.add_argument("--pooling", default="all",
                         help="Pooling type (mean/max/last/attn) or 'all'")
     parser.add_argument("--id_domain", default="Deception-Roleplaying")
-    parser.add_argument("--ood_domain", default="Deception-InsiderTrading")
+    parser.add_argument("--ood_domain", default="Deception-InsiderTrading-SallyConcat")
     parser.add_argument("--id_split", default="validation")
     parser.add_argument("--ood_split", default="test")
     parser.add_argument("--min_layer", type=int, default=1)

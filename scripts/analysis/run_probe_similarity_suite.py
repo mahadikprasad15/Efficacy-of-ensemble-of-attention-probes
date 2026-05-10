@@ -45,7 +45,7 @@ SOURCE_COLOR_MAP = {
     "Deception-InstructedDeception": "#54a24b",
     "Deception-Mask": "#e45756",
     "Deception-AILiar": "#72b7b2",
-    "Deception-InsiderTrading": "#b279a2",
+    "Deception-InsiderTrading-SallyConcat": "#b279a2",
     "Deception-Roleplaying": "#ff9da6",
 }
 POOLING_MARKER_MAP = {
@@ -195,7 +195,7 @@ def stage_spec() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
             "Deception-InstructedDeception-completion",
             "Deception-Mask-completion",
             "Deception-AILiar-completion",
-            "Deception-InsiderTrading-completion",
+            "Deception-InsiderTrading-SallyConcat-completion",
             "Deception-Roleplaying-completion",
         ],
         "full": [
@@ -204,7 +204,7 @@ def stage_spec() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
             "Deception-InstructedDeception-full",
             "Deception-Mask-full",
             "Deception-AILiar-full",
-            "Deception-InsiderTrading-full",
+            "Deception-InsiderTrading-SallyConcat-full",
             "Deception-Roleplaying-full",
         ],
     }

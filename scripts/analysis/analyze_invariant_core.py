@@ -22,7 +22,7 @@ Usage:
         --probes_b /path/to/data/probes_flipped \
         --probes_combined /path/to/data/probes_combined \
         --val_a /path/to/Deception-Roleplaying/validation \
-        --val_b /path/to/Deception-InsiderTrading/validation \
+        --val_b /path/to/Deception-InsiderTrading-SallyConcat/validation \
         --model meta-llama_Llama-3.2-3B-Instruct \
         --output_dir results/invariant_core_analysis
 """

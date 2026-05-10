@@ -26,7 +26,7 @@
 # Evaluate all 4 pooling strategies on flipped OOD dataset
 !python scripts/evaluate_ood_all_pooling.py \
     --ood_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
-    --probes_base data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading \
+    --probes_base data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat \
     --output_dir results_flipped/ood_evaluation
 ```
 
@@ -47,7 +47,7 @@
 ```python
 !python scripts/evaluate_ensembles_comprehensive.py \
     --pooling mean \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/mean \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/mean \
     --ood_logits_path results_flipped/ood_evaluation/logits/mean_logits.npy \
     --ood_labels_path results_flipped/ood_evaluation/logits/labels.npy \
     --eval_mode ood \
@@ -59,7 +59,7 @@
 ```python
 !python scripts/evaluate_ensembles_comprehensive.py \
     --pooling max \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/max \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/max \
     --ood_logits_path results_flipped/ood_evaluation/logits/max_logits.npy \
     --ood_labels_path results_flipped/ood_evaluation/logits/labels.npy \
     --eval_mode ood \
@@ -71,7 +71,7 @@
 ```python
 !python scripts/evaluate_ensembles_comprehensive.py \
     --pooling last \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/last \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/last \
     --ood_logits_path results_flipped/ood_evaluation/logits/last_logits.npy \
     --ood_labels_path results_flipped/ood_evaluation/logits/labels.npy \
     --eval_mode ood \
@@ -83,7 +83,7 @@
 ```python
 !python scripts/evaluate_ensembles_comprehensive.py \
     --pooling attn \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --ood_logits_path results_flipped/ood_evaluation/logits/attn_logits.npy \
     --ood_labels_path results_flipped/ood_evaluation/logits/labels.npy \
     --eval_mode ood \
@@ -166,10 +166,10 @@ results_flipped/ensembles/
 
 ```python
 !python scripts/analyze_gating_weights.py \
-    --id_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/train \
+    --id_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/train \
     --ood_logits results_flipped/ood_evaluation/logits/attn_logits.npy \
     --ood_labels results_flipped/ood_evaluation/logits/labels.npy \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --k_pct 40 \
     --output_dir results_flipped/gating_analysis
 ```
@@ -186,8 +186,8 @@ results_flipped/ensembles/
 
 ```python
 !python scripts/analyze_attention_entropy.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/attention_analysis
 ```
 
@@ -195,8 +195,8 @@ results_flipped/ensembles/
 
 ```python
 !python scripts/analyze_attention_text.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/attention_text \
     --num_samples 10
 ```
@@ -205,8 +205,8 @@ results_flipped/ensembles/
 
 ```python
 !python scripts/analyze_ensemble_attention.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/ensemble_attention
 ```
 
@@ -214,8 +214,8 @@ results_flipped/ensembles/
 
 ```python
 !python scripts/analyze_layer_colored_attention.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/layer_colored_attention
 ```
 
@@ -223,9 +223,9 @@ results_flipped/ensembles/
 
 ```python
 !python scripts/analyze_hybrid_attention.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_mean data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/mean \
-    --probes_attn data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_mean data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/mean \
+    --probes_attn data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/hybrid_attention
 ```
 
@@ -236,13 +236,13 @@ results_flipped/ensembles/
 ```python
 # Deep mechanistic analysis
 !python scripts/analyze_mechanisms.py \
-    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/validation \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/validation \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --output_dir results_flipped/mechanistic_analysis
 
 # Probe analysis
 !python scripts/analyze_probes.py \
-    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading \
+    --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat \
     --output_dir results_flipped/probe_analysis
 ```
 
@@ -252,10 +252,10 @@ results_flipped/ensembles/
 
 ```python
 !python scripts/compare_pooling_layerwise.py \
-    --mean_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/mean \
-    --max_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/max \
-    --last_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/last \
-    --attn_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/attn \
+    --mean_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/mean \
+    --max_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/max \
+    --last_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/last \
+    --attn_probes data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/attn \
     --ood_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
     --output_dir results_flipped/pooling_layerwise
 ```
@@ -287,7 +287,7 @@ set -e
 echo "=== PHASE 1: OOD Evaluation ==="
 python scripts/evaluate_ood_all_pooling.py \
     --ood_activations data/activations/meta-llama_Llama-3.2-3B-Instruct/Deception-Roleplaying/validation \
-    --probes_base data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading \
+    --probes_base data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat \
     --output_dir results_flipped/ood_evaluation
 
 echo "=== PHASE 2: Ensemble K-Sweep ==="
@@ -295,7 +295,7 @@ for pooling in mean max last attn; do
     echo "Processing $pooling..."
     python scripts/evaluate_ensembles_comprehensive.py \
         --pooling $pooling \
-        --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading/$pooling \
+        --probes_dir data/probes_flipped/meta-llama_Llama-3.2-3B-Instruct/Deception-InsiderTrading-SallyConcat/$pooling \
         --ood_logits_path results_flipped/ood_evaluation/logits/${pooling}_logits.npy \
         --ood_labels_path results_flipped/ood_evaluation/logits/labels.npy \
         --eval_mode ood \

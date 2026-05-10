@@ -301,7 +301,7 @@ def main() -> int:
     parser.add_argument("--sweep_results", type=str, required=True, help="Path to sweep_results.json")
     parser.add_argument("--model", type=str, default="meta-llama_Llama-3.2-3B-Instruct", help="Model name")
     parser.add_argument("--domain_a", type=str, default="Deception-Roleplaying", help="Domain A")
-    parser.add_argument("--domain_b", type=str, default="Deception-InsiderTrading", help="Domain B")
+    parser.add_argument("--domain_b", type=str, default="Deception-InsiderTrading-SallyConcat", help="Domain B")
     parser.add_argument("--output_dir", type=str, default="results/invariant_core_sweep/plots", help="Output directory")
     parser.add_argument("--signed", action="store_true", help="Plot signed cosine similarities (default: abs)")
     parser.add_argument("--no_auc_panel", action="store_true", help="Skip AUC+cosine side-by-side panels")

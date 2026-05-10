@@ -10,7 +10,7 @@ Cluster and visualize activations from both domains to understand:
 Usage:
     python scripts/visualization/visualize_combined_domains.py \
         --act_a /path/to/Deception-Roleplaying/train \
-        --act_b /path/to/Deception-InsiderTrading/train \
+        --act_b /path/to/Deception-InsiderTrading-SallyConcat/train \
         --layer 20 --pooling mean \
         --output_dir results/domain_clustering
 """

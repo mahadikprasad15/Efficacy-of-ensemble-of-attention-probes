@@ -178,7 +178,7 @@ def main() -> int:
     parser.add_argument("--base_data_dir", required=True, help="Base activations dir (contains model subdir)")
     parser.add_argument("--model", required=True, help="Model name used in activations path")
     parser.add_argument("--domain_a", default="Deception-Roleplaying")
-    parser.add_argument("--domain_b", default="Deception-InsiderTrading")
+    parser.add_argument("--domain_b", default="Deception-InsiderTrading-SallyConcat")
     parser.add_argument("--split", default="test", choices=["train", "validation", "test"])
     parser.add_argument("--pooling", default="mean", choices=["mean", "max", "last"])
     parser.add_argument("--max_samples", type=int, default=500)
